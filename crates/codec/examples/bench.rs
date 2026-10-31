@@ -1,4 +1,4 @@
-//! Mede a conversão de cor e a codificação de um quadro 1080p.
+//! Measures color conversion and 1080p frame encoding latency.
 //!
 //! `cargo run --release -p omegadesk-codec --example bench`
 
@@ -22,7 +22,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             height as usize,
         ));
     }
-    tracing_line("conversão BGRA→I420", start.elapsed() / 10);
+    tracing_line("BGRA->I420 conversion", start.elapsed() / 10);
 
     let mut encoder = OpenH264Encoder::new(EncoderSettings::default())?;
     for round in 0..5 {
@@ -35,7 +35,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         })?;
         tracing_line(
             &format!(
-                "codificação #{round} ({} bytes)",
+                "software encode #{round} ({} bytes)",
                 frame.iter().map(|f| f.data.len()).sum::<usize>()
             ),
             start.elapsed(),
@@ -62,7 +62,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             })?;
             tracing_line(
                 &format!(
-                    "hardware #{round} ({} quadros, {} bytes)",
+                    "hardware #{round} ({} frames, {} bytes)",
                     frames.len(),
                     frames.iter().map(|f| f.data.len()).sum::<usize>()
                 ),

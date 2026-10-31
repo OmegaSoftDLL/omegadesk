@@ -1,20 +1,20 @@
-//! Ajustes do sistema operacional para o agente rodar com baixa latência.
+//! Operating system process and thread priority tuning for low-latency capture.
 
-/// Pede ao sistema para não rebaixar o agente.
+/// Requests that the operating system not throttle the agent process.
 ///
-/// No Windows 11, processos sem janela em primeiro plano entram em
-/// "power throttling" (`EcoQoS`) e vão para os núcleos econômicos. Num Intel
-/// Core Ultra 5 135U isso deixou a codificação 17 vezes mais lenta (de ~40 ms
-/// para ~680 ms por quadro 1080p). Nenhuma das referências desliga o `EcoQoS`;
-/// o Sunshine só sobe a classe de prioridade (`HIGH_PRIORITY_CLASS`), o que
-/// também fazemos.
+/// On Windows 11, background processes without a foreground window are placed
+/// under power throttling (`EcoQoS`) and scheduled onto efficiency cores. On
+/// an Intel Core Ultra 5 135U that slowed 1080p encoding by 17x (from ~40 ms
+/// to ~680 ms per frame). We disable `EcoQoS` execution-speed and timer
+/// throttling in addition to raising the process priority class
+/// (`HIGH_PRIORITY_CLASS`, as Sunshine does).
 pub(crate) fn prefer_performance() {
     #[cfg(windows)]
     windows_impl::prefer_performance();
 }
 
-/// Sobe a prioridade da thread atual (captura e codificação), como o Sunshine
-/// faz na thread de vídeo (`src/platform/windows/misc.cpp`).
+/// Raises the priority of the calling thread (capture and encoding), matching
+/// Sunshine's video thread (`src/platform/windows/misc.cpp`).
 pub(crate) fn boost_current_thread() {
     #[cfg(windows)]
     windows_impl::boost_current_thread();
@@ -22,7 +22,7 @@ pub(crate) fn boost_current_thread() {
 
 #[cfg(windows)]
 mod windows_impl {
-    #![allow(unsafe_code, reason = "APIs Win32 de processo")]
+    #![allow(unsafe_code, reason = "Win32 process and thread priority APIs")]
 
     use std::ffi::c_void;
 
@@ -38,20 +38,20 @@ mod windows_impl {
     pub(super) fn prefer_performance() {
         let state = PROCESS_POWER_THROTTLING_STATE {
             Version: PROCESS_POWER_THROTTLING_CURRENT_VERSION,
-            // Controla velocidade de execução e resolução de timer, pedindo
-            // "sem throttling" (0) para as duas.
+            // Control both execution speed and timer resolution, clearing the
+            // state mask (0) to disable throttling for both.
             ControlMask: PROCESS_POWER_THROTTLING_EXECUTION_SPEED
                 | PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION,
             StateMask: 0,
         };
         let size = u32::try_from(size_of::<PROCESS_POWER_THROTTLING_STATE>()).unwrap_or(0);
-        // SAFETY: sem argumentos; devolve o pseudo-handle do próprio processo,
-        // que não precisa ser fechado.
+        // SAFETY: takes no arguments and returns a pseudo-handle to the current
+        // process that does not need to be closed.
         let process = unsafe { GetCurrentProcess() };
-        // SAFETY: `process` é o pseudo-handle do processo atual; para
-        // ProcessPowerThrottling a API espera um PROCESS_POWER_THROTTLING_STATE,
-        // e `state` é exatamente isso, vivo na pilha durante a chamada, com
-        // `size` igual ao seu tamanho. A API só lê o buffer.
+        // SAFETY: `process` is the current process pseudo-handle; for
+        // `ProcessPowerThrottling` the API expects a
+        // `PROCESS_POWER_THROTTLING_STATE` buffer of `size` bytes, which
+        // `state` provides on the stack for the duration of the call.
         let throttling = unsafe {
             SetProcessInformation(
                 process,
@@ -61,24 +61,24 @@ mod windows_impl {
             )
         };
         if let Err(error) = throttling {
-            warn!("não foi possível desligar o power throttling: {error}");
+            warn!("failed to disable process power throttling: {error}");
         }
-        // SAFETY: `process` é o pseudo-handle do processo atual (com todos os
-        // direitos) e HIGH_PRIORITY_CLASS é uma classe válida.
+        // SAFETY: `process` is the current process pseudo-handle and
+        // `HIGH_PRIORITY_CLASS` is a valid priority class constant.
         match unsafe { SetPriorityClass(process, HIGH_PRIORITY_CLASS) } {
-            Ok(()) => info!("agente em prioridade alta e sem power throttling"),
-            Err(error) => warn!("não foi possível subir a prioridade: {error}"),
+            Ok(()) => info!("agent running at high priority with power throttling disabled"),
+            Err(error) => warn!("failed to raise process priority class: {error}"),
         }
     }
 
     pub(super) fn boost_current_thread() {
-        // SAFETY: sem argumentos; devolve o pseudo-handle da thread atual, que
-        // não precisa ser fechado.
+        // SAFETY: takes no arguments and returns a pseudo-handle to the calling
+        // thread that does not need to be closed.
         let thread = unsafe { GetCurrentThread() };
-        // SAFETY: `thread` é o pseudo-handle da thread atual e
-        // THREAD_PRIORITY_HIGHEST é um nível de prioridade válido.
+        // SAFETY: `thread` is the calling thread pseudo-handle and
+        // `THREAD_PRIORITY_HIGHEST` is a valid thread priority level.
         if let Err(error) = unsafe { SetThreadPriority(thread, THREAD_PRIORITY_HIGHEST) } {
-            warn!("não foi possível subir a prioridade da thread: {error}");
+            warn!("failed to raise capture thread priority: {error}");
         }
     }
 }

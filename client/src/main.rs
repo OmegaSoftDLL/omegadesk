@@ -1,13 +1,13 @@
-//! Cliente do OmegaDesk: mostra a tela do agente e envia teclado e mouse.
+//! OmegaDesk client: renders the agent's screen and forwards keyboard and mouse input.
 //!
-//! Uso (Fase 1, rede local):
+//! Usage (Phase 1, local network):
 //!
 //! ```text
-//! omegadesk-client 192.168.0.10:7070 --fingerprint ab:cd:… --password <senha>
+//! omegadesk-client 192.168.0.10:7070 --fingerprint ab:cd:… --password <password>
 //! ```
 //!
-//! A barra de título mostra a latência: tempo no host, rede (metade do ping),
-//! decodificação e desenho.
+//! The window title bar displays a live latency breakdown: host processing,
+//! network (half RTT), decoding, and drawing.
 
 mod keymap;
 mod network;
@@ -21,20 +21,20 @@ use clap::Parser;
 use winit::event_loop::EventLoop;
 
 #[derive(Debug, Parser)]
-#[command(version, about = "Cliente do OmegaDesk")]
+#[command(version, about = "OmegaDesk remote desktop client")]
 struct Args {
-    /// Endereço do agente, por exemplo `192.168.0.10:7070`.
+    /// Agent socket address, e.g. `192.168.0.10:7070`.
     address: SocketAddr,
 
-    /// Impressão digital mostrada pelo agente ao iniciar.
+    /// Certificate fingerprint printed by the agent on startup.
     #[arg(long)]
     fingerprint: String,
 
-    /// Senha de acesso mostrada pelo agente ao iniciar.
+    /// Access password printed by the agent on startup.
     #[arg(long, env = "OMEGADESK_PASSWORD")]
     password: String,
 
-    /// Só assiste: não envia teclado nem mouse.
+    /// Watch only; do not send keyboard or mouse events.
     #[arg(long)]
     view_only: bool,
 }
@@ -51,12 +51,12 @@ fn main() -> anyhow::Result<()> {
 
     let event_loop = EventLoop::<window::UserEvent>::with_user_event()
         .build()
-        .context("não foi possível criar a janela")?;
-    let store = omegadesk_identity::default_store("client")
-        .context("não foi possível abrir o cofre de chaves")?;
+        .context("failed to create window event loop")?;
+    let store =
+        omegadesk_identity::default_store("client").context("failed to open device key store")?;
     let identity = omegadesk_identity::DeviceIdentity::load_or_create(store.as_ref())
-        .context("não foi possível carregar a identidade do dispositivo")?;
-    tracing::info!("ID deste dispositivo: {}", identity.id());
+        .context("failed to load or create device identity")?;
+    tracing::info!("device ID: {}", identity.id());
     let shared = stats::Shared::default();
     let input = network::start(
         network::Target {

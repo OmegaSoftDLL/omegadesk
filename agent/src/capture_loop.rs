@@ -1,4 +1,4 @@
-//! Laço de captura e codificação, numa thread própria (as APIs são bloqueantes).
+//! Blocking screen capture and video encoding loop running on a dedicated thread.
 
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -14,20 +14,20 @@ use tracing::{debug, info, warn};
 
 use crate::session::SessionState;
 
-/// Quanto esperar por um quadro novo antes de checar se a sessão acabou.
+/// Maximum wait for a new frame before checking whether the session has stopped.
 const POLL: Duration = Duration::from_millis(100);
 
-/// Pausa antes de reabrir a captura depois de um erro.
+/// Backoff delay before reopening screen capture or the encoder after an error.
 const RETRY: Duration = Duration::from_millis(200);
 
-/// Qual encoder usar.
+/// Video encoder selection policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub(crate) enum EncoderChoice {
-    /// Hardware se houver; senão, software.
+    /// Use hardware encoding when available, falling back to software.
     Auto,
-    /// Só hardware (falha se não houver).
+    /// Require hardware encoding (fail if unavailable).
     Hardware,
-    /// Só software (OpenH264).
+    /// Use software encoding only (OpenH264).
     Software,
 }
 
@@ -42,7 +42,7 @@ fn open_capturer(monitor: u32, state: &SessionState) -> Option<Box<dyn Capturer>
         Ok(capturer) => {
             let bounds = capturer.bounds();
             info!(
-                "capturando o monitor {monitor}: {}x{} em ({}, {})",
+                "capturing monitor {monitor}: {}x{} at ({}, {})",
                 bounds.width, bounds.height, bounds.x, bounds.y
             );
             state.set_target(TargetDisplay {
@@ -54,13 +54,13 @@ fn open_capturer(monitor: u32, state: &SessionState) -> Option<Box<dyn Capturer>
             Some(capturer)
         }
         Err(error) => {
-            debug!("captura indisponível: {error}");
+            debug!("capture unavailable: {error}");
             None
         }
     }
 }
 
-/// Cria o encoder para quadros de `width`x`height`.
+/// Opens a video encoder for `width`x`height` frames.
 fn open_encoder(
     choice: EncoderChoice,
     width: u32,
@@ -71,11 +71,11 @@ fn open_encoder(
     if choice != EncoderChoice::Software {
         match omegadesk_codec::MediaFoundationEncoder::new(width, height, settings) {
             Ok(encoder) => {
-                info!("encoder de hardware: {}", encoder.name());
+                info!("hardware encoder: {}", encoder.name());
                 return Ok(Box::new(encoder));
             }
             Err(error) if choice == EncoderChoice::Hardware => return Err(error),
-            Err(error) => warn!("sem encoder de hardware ({error}); usando software"),
+            Err(error) => warn!("no hardware encoder ({error}); falling back to software"),
         }
     }
     #[cfg(not(windows))]
@@ -83,20 +83,20 @@ fn open_encoder(
         return Err(CodecError::HardwareUnavailable);
     }
     let _ = (width, height);
-    info!("encoder de software: OpenH264");
+    info!("software encoder: OpenH264");
     Ok(Box::new(OpenH264Encoder::new(settings)?))
 }
 
-/// Encoder atual e o tamanho de quadro para o qual foi criado.
+/// Active encoder paired with the frame dimensions it was configured for.
 struct ActiveEncoder {
     encoder: Box<dyn VideoEncoder>,
     size: (u32, u32),
 }
 
-/// Captura, codifica e envia quadros até a sessão acabar ou o canal fechar.
+/// Captures, encodes, and queues frames until the session stops or the channel closes.
 #[allow(
     clippy::too_many_lines,
-    reason = "laço principal com os casos de erro em sequência"
+    reason = "main capture loop handling sequential recovery states"
 )]
 pub(crate) fn run(
     monitor: u32,
@@ -126,32 +126,32 @@ pub(crate) fn run(
 
         let frame = match active.next_frame(POLL) {
             Ok(Some(frame)) => frame,
-            // Tela parada: só reenvia se o cliente pediu keyframe.
+            // Static screen: only re-encode the last frame if the client requested a keyframe.
             Ok(None) => match (&last, force_keyframe) {
                 (Some(previous), true) => {
                     let mut resend = previous.clone();
-                    // Tempo de agora: o quadro antigo não ficou "processando".
+                    // Refresh timestamp so the cached frame does not report stale host delay.
                     resend.captured_at = Instant::now();
                     resend
                 }
                 (None, true) => {
-                    // Ainda não há imagem: guarda o pedido para o próximo quadro.
+                    // No frame captured yet: preserve the keyframe request for the first frame.
                     state.keyframe_requested.store(true, Ordering::Relaxed);
                     continue;
                 }
                 (_, false) => continue,
             },
             Err(CaptureError::AccessLost) => {
-                debug!("acesso à tela perdido; reabrindo");
+                debug!("display access lost; reopening capturer");
                 capturer = None;
-                // Nunca reenviar a imagem de antes do bloqueio ou do UAC
-                // (privacidade; o CrossDesk faz o mesmo).
+                // Never resend a pre-lock or pre-UAC frame after losing access
+                // (privacy protection, matching CrossDesk).
                 last = None;
                 state.keyframe_requested.store(true, Ordering::Relaxed);
                 continue;
             }
             Err(error) => {
-                warn!("erro de captura: {error}");
+                warn!("capture error: {error}");
                 capturer = None;
                 last = None;
                 std::thread::sleep(RETRY);
@@ -159,7 +159,7 @@ pub(crate) fn run(
             }
         };
 
-        // (Re)cria o encoder quando a resolução muda.
+        // Recreate the encoder whenever the display resolution changes.
         if encoder.as_ref().map(|e| e.size) != Some((frame.width, frame.height)) {
             match open_encoder(choice, frame.width, frame.height, settings) {
                 Ok(new_encoder) => {
@@ -169,7 +169,7 @@ pub(crate) fn run(
                     });
                 }
                 Err(error) => {
-                    warn!("encoder indisponível: {error}");
+                    warn!("encoder unavailable: {error}");
                     std::thread::sleep(RETRY);
                     continue;
                 }
@@ -192,9 +192,9 @@ pub(crate) fn run(
         let encoded = match encoded {
             Ok(encoded) => encoded,
             Err(error) => {
-                // Falha do driver em plena sessão: cai para o software, como o
-                // RustDesk (`set_fallback` em `scrap/src/common/codec.rs`).
-                warn!("erro de codificação: {error}; trocando para software");
+                // Mid-session hardware driver failure: fall back to software encoding
+                // like RustDesk (`set_fallback` in `scrap/src/common/codec.rs`).
+                warn!("encoding error: {error}; falling back to software encoder");
                 choice = EncoderChoice::Software;
                 encoder = None;
                 state.keyframe_requested.store(true, Ordering::Relaxed);
@@ -226,9 +226,9 @@ pub(crate) fn run(
             };
             match frames.try_send(video_frame) {
                 Ok(()) => {}
-                // Rede mais lenta que a captura: descarta em vez de acumular
-                // atraso, e pede keyframe porque os próximos P-frames dependem
-                // deste (Selkies e Moonlight fazem o mesmo).
+                // Network is slower than capture: drop the frame instead of
+                // accumulating latency, and request a keyframe because subsequent
+                // P-frames depend on the dropped one (matching Selkies and Moonlight).
                 Err(TrySendError::Full(_)) => {
                     timing.dropped += 1;
                     state.keyframe_requested.store(true, Ordering::Relaxed);
@@ -241,7 +241,7 @@ pub(crate) fn run(
     }
 }
 
-/// Tempos por etapa, registrados no log a cada [`TIMING_PERIOD`].
+/// Per-stage timing accumulator logged every [`TIMING_PERIOD`].
 #[derive(Debug, Default)]
 struct Timing {
     frames: u32,
@@ -251,7 +251,7 @@ struct Timing {
     since: Option<Instant>,
 }
 
-/// Intervalo entre os registros de tempo no log.
+/// Interval between periodic pipeline timing log lines.
 const TIMING_PERIOD: Duration = Duration::from_secs(5);
 
 impl Timing {
@@ -264,7 +264,7 @@ impl Timing {
         if elapsed >= TIMING_PERIOD {
             let ms = |d: Duration| d.as_secs_f64() * 1000.0 / f64::from(self.frames);
             info!(
-                "{:.1} quadros/s · cópia da tela {:.1} ms · codificação {:.1} ms · descartados {}",
+                "{:.1} fps · screen copy {:.1} ms · encode {:.1} ms · dropped {}",
                 f64::from(self.frames) / elapsed.as_secs_f64(),
                 ms(self.capture),
                 ms(self.encode),

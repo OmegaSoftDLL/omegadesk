@@ -1,9 +1,10 @@
-//! Transporte QUIC do OmegaDesk.
+//! QUIC transport for OmegaDesk.
 //!
-//! Nesta fase o agente gera um certificado autoassinado e mostra a impressão
-//! digital (SHA-256) dele. O cliente só aceita a conexão se o certificado
-//! tiver exatamente essa impressão digital. Na Fase 2 a identidade passa a
-//! vir das chaves do dispositivo (`omegadesk-identity`) e do coordenador.
+//! In Phase 1 the agent generates a fresh self-signed TLS certificate on
+//! startup and displays its SHA-256 fingerprint. The client only accepts a
+//! connection whose server certificate matches that exact fingerprint. In
+//! Phase 2 peer authentication is bound to `omegadesk-identity` device keys
+//! and the coordination server.
 
 mod pinned;
 
@@ -20,49 +21,49 @@ use sha2::{Digest, Sha256};
 
 pub use quinn::{Connection, Endpoint, RecvStream, SendStream};
 
-/// Protocolo anunciado no ALPN.
+/// Application-Layer Protocol Negotiation identifier.
 pub const ALPN: &[u8] = b"omegadesk/1";
 
-/// Porta padrão do agente.
+/// Default UDP port used by the agent.
 pub const DEFAULT_PORT: u16 = 7070;
 
-/// Erros de transporte.
+/// Transport errors.
 #[derive(Debug, thiserror::Error)]
 pub enum TransportError {
-    /// Falha ao gerar o certificado.
-    #[error("certificado: {0}")]
+    /// Failed to generate the self-signed certificate.
+    #[error("certificate: {0}")]
     Certificate(#[from] rcgen::Error),
-    /// Configuração TLS inválida.
+    /// Invalid TLS configuration or handshake error.
     #[error("TLS: {0}")]
     Tls(#[from] rustls::Error),
-    /// Configuração QUIC inválida.
+    /// Invalid QUIC configuration.
     #[error("QUIC: {0}")]
     QuicConfig(String),
-    /// Falha de E/S ao abrir o socket.
+    /// Socket I/O error.
     #[error("socket: {0}")]
     Io(#[from] std::io::Error),
-    /// Falha ao iniciar a conexão.
-    #[error("conexão: {0}")]
+    /// Failed to initiate the QUIC connection.
+    #[error("connect: {0}")]
     Connect(#[from] quinn::ConnectError),
-    /// A conexão caiu ou foi recusada.
-    #[error("conexão: {0}")]
+    /// The connection was lost or rejected.
+    #[error("connection: {0}")]
     Connection(#[from] quinn::ConnectionError),
-    /// Falha ao escrever no stream.
-    #[error("envio: {0}")]
+    /// Failed to write to a QUIC stream.
+    #[error("write: {0}")]
     Write(#[from] quinn::WriteError),
-    /// Falha ao ler do stream.
-    #[error("recebimento: {0}")]
+    /// Failed to read from a QUIC stream.
+    #[error("read: {0}")]
     Read(#[from] quinn::ReadError),
-    /// Mensagem malformada.
+    /// Malformed protocol frame.
     #[error(transparent)]
     Framing(#[from] FramingError),
-    /// A impressão digital informada não é válida.
-    #[error("impressão digital inválida")]
+    /// The provided certificate fingerprint string is malformed.
+    #[error("invalid certificate fingerprint")]
     InvalidFingerprint,
 }
 
-/// Impressão digital SHA-256 de um certificado, em hexadecimal minúsculo
-/// com `:` a cada byte (o formato que o agente mostra).
+/// Formats the SHA-256 digest of a DER certificate as colon-separated lowercase
+/// hex bytes (the format printed by the agent).
 #[must_use]
 pub fn fingerprint(certificate: &[u8]) -> String {
     let digest = Sha256::digest(certificate);
@@ -96,26 +97,26 @@ fn crypto_provider() -> Arc<rustls::crypto::CryptoProvider> {
 fn transport_config() -> quinn::TransportConfig {
     let mut config = quinn::TransportConfig::default();
     config.keep_alive_interval(Some(Duration::from_secs(2)));
-    // 30 s, o padrão do quinn: com 10 s, perdas em rajada derrubavam a conexão.
+    // Keep Quinn's 30 s default idle timeout so bursty packet loss does not tear down the session.
     if let Ok(timeout) = Duration::from_secs(30).try_into() {
         config.max_idle_timeout(Some(timeout));
     }
-    // Janelas pequenas de propósito: o que não cabe aqui fica no agente, que
-    // descarta quadros e pede keyframe, em vez de acumular segundos de vídeo
-    // atrasado no buffer do QUIC. 4 MiB cabem um keyframe 4K.
+    // Intentionally small flow-control windows: backpressure stays in the agent,
+    // which drops stale frames and requests a fresh keyframe instead of queueing
+    // seconds of delayed video inside QUIC buffers. 4 MiB fits a 4K keyframe.
     config.stream_receive_window(quinn::VarInt::from_u32(4 * 1024 * 1024));
     config.receive_window(quinn::VarInt::from_u32(8 * 1024 * 1024));
     config.send_window(4 * 1024 * 1024);
     config
 }
 
-/// Endpoint do agente com um certificado autoassinado novo.
+/// Creates a server QUIC endpoint bound to `bind` with a fresh self-signed certificate.
 ///
-/// Devolve o endpoint e a impressão digital que o cliente precisa informar.
+/// Returns the endpoint and the certificate fingerprint that the client must pin.
 ///
 /// # Errors
 ///
-/// Retorna erro se o certificado não puder ser gerado ou o socket aberto.
+/// Returns an error if certificate generation fails or the UDP socket cannot be bound.
 pub fn server_endpoint(bind: SocketAddr) -> Result<(Endpoint, String), TransportError> {
     let certified = rcgen::generate_simple_self_signed(vec!["omegadesk".to_owned()])?;
     let certificate: CertificateDer<'static> = certified.cert.der().clone();
@@ -138,13 +139,13 @@ pub fn server_endpoint(bind: SocketAddr) -> Result<(Endpoint, String), Transport
     Ok((Endpoint::server(config, bind)?, fingerprint))
 }
 
-/// Conecta ao agente em `address`, aceitando só o certificado com a
-/// impressão digital `expected_fingerprint`.
+/// Connects to the agent at `address`, accepting only a server certificate
+/// whose SHA-256 fingerprint matches `expected_fingerprint`.
 ///
 /// # Errors
 ///
-/// Retorna erro se a impressão digital for inválida, se a conexão falhar ou
-/// se o certificado do agente não bater.
+/// Returns an error if the fingerprint is malformed, the connection fails, or
+/// the server's certificate does not match `expected_fingerprint`.
 pub async fn connect(
     address: SocketAddr,
     expected_fingerprint: &str,
@@ -175,11 +176,11 @@ pub async fn connect(
     Ok((endpoint, connection))
 }
 
-/// Envia um `Envelope` enquadrado num stream.
+/// Writes a length-prefixed `Envelope` to `stream`.
 ///
 /// # Errors
 ///
-/// Retorna erro se a mensagem for grande demais ou o stream fechar.
+/// Returns an error if the message exceeds the maximum frame size or the stream closes.
 pub async fn send_envelope(
     stream: &mut SendStream,
     envelope: &Envelope,
@@ -190,7 +191,7 @@ pub async fn send_envelope(
     Ok(())
 }
 
-/// Lê `Envelope`s enquadrados de um stream.
+/// Reads length-prefixed `Envelope` frames from a QUIC receive stream.
 #[derive(Debug)]
 pub struct EnvelopeReader {
     stream: RecvStream,
@@ -199,7 +200,7 @@ pub struct EnvelopeReader {
 }
 
 impl EnvelopeReader {
-    /// Cria o leitor sobre um stream de recebimento.
+    /// Wraps a QUIC receive stream in a framed `Envelope` reader.
     #[must_use]
     pub fn new(stream: RecvStream) -> Self {
         Self {
@@ -209,11 +210,11 @@ impl EnvelopeReader {
         }
     }
 
-    /// Próximo `Envelope`, ou `None` quando o outro lado fecha o stream.
+    /// Reads the next `Envelope`, or returns `None` when the peer cleanly finishes the stream.
     ///
     /// # Errors
     ///
-    /// Retorna erro se a leitura falhar ou a mensagem for inválida.
+    /// Returns an error if reading from the stream fails or the frame is malformed.
     pub async fn next(&mut self) -> Result<Option<Envelope>, TransportError> {
         loop {
             if let Some(envelope) = self.decoder.next_frame()? {
@@ -266,7 +267,7 @@ mod tests {
 
         let mut reader = EnvelopeReader::new(recv);
         assert_eq!(reader.next().await.unwrap(), Some(ping));
-        connection.close(0u32.into(), b"fim");
+        connection.close(0u32.into(), b"done");
         accept.await.unwrap();
     }
 

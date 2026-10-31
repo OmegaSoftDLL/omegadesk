@@ -12,7 +12,7 @@ Thank you for your interest in OmegaDesk! This guide explains how changes get in
 
 The `main` branch is protected. Every change, including the maintainer's own, goes through a pull request that must:
 
-1. pass all CI checks: formatting, Clippy, tests on Windows, Linux and macOS, the license and advisory policy, and CodeQL;
+1. pass all CI checks: formatting, spelling (`typos`), Clippy, tests on Windows, Linux and macOS, the license and advisory policy, and CodeQL;
 2. be **reviewed and approved by the maintainer** (see [CODEOWNERS](.github/CODEOWNERS));
 3. have every review conversation resolved;
 4. be up to date with `main`.
@@ -51,6 +51,7 @@ cargo fmt --all --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
 cargo deny check            # cargo install cargo-deny
+typos                       # cargo install typos-cli
 ```
 
 To try the agent and the client locally, see the [quick start](README.md#quick-start).

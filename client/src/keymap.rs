@@ -1,13 +1,13 @@
-//! Tecla física do winit → código de uso USB HID (página 0x07).
+//! Translates physical `winit` keycodes into USB HID keyboard usage codes (page `0x07`).
 
 use winit::keyboard::KeyCode;
 
-/// Converte a tecla física em código HID. Devolve `None` para teclas que o
-/// agente ainda não sabe injetar.
+/// Converts a physical `KeyCode` into its USB HID usage code. Returns `None`
+/// for keys that the agent does not yet inject.
 #[allow(
     clippy::too_many_lines,
     clippy::wildcard_enum_match_arm,
-    reason = "tabela fixa; o winit tem dezenas de teclas sem equivalente HID"
+    reason = "fixed lookup table; winit defines dozens of media/browser keys without a keyboard HID usage"
 )]
 pub(crate) fn keycode_to_hid(code: KeyCode) -> Option<u32> {
     let usage = match code {
@@ -131,7 +131,7 @@ mod tests {
 
     use super::keycode_to_hid;
 
-    /// Toda tecla mapeada aqui precisa ter scancode no agente.
+    /// Every key mapped here must have a corresponding scancode in `omegadesk-input`.
     #[test]
     fn every_mapped_key_has_a_scancode() {
         let keys = [
@@ -150,7 +150,10 @@ mod tests {
         ];
         for key in keys {
             let usage = keycode_to_hid(key).unwrap();
-            assert!(hid_to_scancode(usage).is_some(), "{key:?} sem scancode");
+            assert!(
+                hid_to_scancode(usage).is_some(),
+                "{key:?} is missing a scancode"
+            );
         }
     }
 }

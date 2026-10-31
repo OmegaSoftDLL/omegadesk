@@ -1,7 +1,7 @@
-//! Gera o código Rust a partir dos arquivos `.proto`.
+//! Generates Rust types from the `.proto` definitions.
 //!
-//! Usa o `protox` (compilador de protobuf em Rust puro), então não é preciso
-//! instalar o `protoc` para compilar o projeto.
+//! Uses `protox` (a pure-Rust protobuf compiler), so building the workspace
+//! does not require an external `protoc` installation.
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let protos = ["proto/omegadesk/v1/session.proto"];
