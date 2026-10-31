@@ -1,0 +1,55 @@
+name: Fuzz
+
+# Weekly property-guided fuzzing of protocol framing and device identity
+# (modeled after IronRDP's fuzz.yml and Firezone's fuzz-nightly.yml).
+on:
+  schedule:
+    - cron: "23 3 * * 0"
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: "Fuzzing duration per target in seconds"
+        required: false
+        type: string
+        default: "60"
+
+permissions: {}
+
+concurrency:
+  group: fuzz-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fuzz:
+    name: Fuzz (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [frame_decoder, identity_secret]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install nightly --profile minimal --component llvm-tools-preview
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: fuzz -> fuzz/target
+      - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
+        with:
+          tool: cargo-fuzz
+      - name: Run fuzzer
+        env:
+          TARGET: ${{ matrix.target }}
+          SECONDS: ${{ inputs.seconds || '300' }}
+        run: |
+          if ! [[ "$SECONDS" =~ ^[0-9]+$ ]]; then
+            echo "::error::seconds must be an integer"
+            exit 1
+          fi
+          cargo +nightly fuzz run "$TARGET" -- -max_total_time="$SECONDS"

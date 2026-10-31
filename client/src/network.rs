@@ -38,6 +38,8 @@ fn unix_micros() -> u64 {
 /// Dados para conectar ao agente.
 #[derive(Debug, Clone)]
 pub(crate) struct Target {
+    /// Chave pública de assinatura deste dispositivo, enviada no `Hello`.
+    pub(crate) device_public_key: [u8; 32],
     pub(crate) address: SocketAddr,
     pub(crate) fingerprint: String,
     pub(crate) password: String,
@@ -141,7 +143,7 @@ async fn session(
         &Envelope {
             payload: Some(Payload::Hello(Hello {
                 protocol_version: PROTOCOL_VERSION,
-                device_public_key: Vec::new().into(),
+                device_public_key: target.device_public_key.to_vec().into(),
                 device_name: "omegadesk-client".to_owned(),
                 capabilities: Some(Capabilities {
                     decoders: vec![VideoCodec::H264 as i32],
@@ -162,7 +164,11 @@ async fn session(
         }) => bail!("o agente recusou: {}", error.message),
         _ => bail!("resposta inesperada do agente"),
     };
-    info!("conectado a \"{}\"", ack.device_name);
+    let agent_id = <[u8; 32]>::try_from(ack.device_public_key.as_ref()).map_or_else(
+        |_| "sem identidade".to_owned(),
+        |key| omegadesk_identity::DeviceId::from_signing_key(&key).to_string(),
+    );
+    info!("conectado a \"{}\" (ID {agent_id})", ack.device_name);
     shared.set_status(format!("conectado a {}", ack.device_name));
     let _ = proxy.send_event(UserEvent::Status);
 

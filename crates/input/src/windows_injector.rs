@@ -46,6 +46,9 @@ fn send(inputs: &[INPUT]) -> Result<(), InputError> {
         return Ok(());
     }
     let size = i32::try_from(size_of::<INPUT>()).map_err(|_| InputError::Rejected)?;
+    // SAFETY: `inputs` é um slice vivo de INPUTs totalmente inicializados (o
+    // tamanho vai junto, pelo windows-rs) e `size` é o `size_of::<INPUT>()`
+    // que a API exige; o SendInput só lê o slice.
     let sent = unsafe { SendInput(inputs, size) };
     if sent as usize == inputs.len() {
         Ok(())
@@ -103,14 +106,14 @@ fn keyboard(usage: u32, pressed: bool) -> Option<INPUT> {
 /// coordenadas absolutas da área de trabalho virtual que o `SendInput` usa com
 /// `MOUSEEVENTF_VIRTUALDESK` (0..=65535 sobre todos os monitores).
 fn virtual_desk_position(target: TargetDisplay, x: u32, y: u32) -> (i32, i32) {
-    let (left, top, width, height) = unsafe {
-        (
-            GetSystemMetrics(SM_XVIRTUALSCREEN),
-            GetSystemMetrics(SM_YVIRTUALSCREEN),
-            GetSystemMetrics(SM_CXVIRTUALSCREEN).max(1),
-            GetSystemMetrics(SM_CYVIRTUALSCREEN).max(1),
-        )
-    };
+    // SAFETY: índice SM_XVIRTUALSCREEN válido, sem ponteiros; erro devolve 0.
+    let left = unsafe { GetSystemMetrics(SM_XVIRTUALSCREEN) };
+    // SAFETY: índice SM_YVIRTUALSCREEN válido, sem ponteiros.
+    let top = unsafe { GetSystemMetrics(SM_YVIRTUALSCREEN) };
+    // SAFETY: índice SM_CXVIRTUALSCREEN válido, sem ponteiros.
+    let width = unsafe { GetSystemMetrics(SM_CXVIRTUALSCREEN) }.max(1);
+    // SAFETY: índice SM_CYVIRTUALSCREEN válido, sem ponteiros.
+    let height = unsafe { GetSystemMetrics(SM_CYVIRTUALSCREEN) }.max(1);
     let axis = |normalized: u32, origin: i32, extent: u32, desk_origin: i32, desk_extent: i32| {
         let pixel =
             i64::from(origin) + i64::from(normalized.min(65_535)) * i64::from(extent) / 65_536;
@@ -249,6 +252,8 @@ mod tests {
     #[test]
     fn pause_uses_virtual_key() {
         let input = keyboard(0x48, true).unwrap();
+        // SAFETY: `keyboard` monta um INPUT_KEYBOARD escrevendo o campo `ki`
+        // da união, então é ele que está inicializado.
         let key = unsafe { input.Anonymous.ki };
         assert_eq!(key.wVk.0, 0x13);
         assert_eq!(key.wScan, 0);
@@ -257,6 +262,8 @@ mod tests {
     #[test]
     fn letters_use_scancode() {
         let input = keyboard(0x04, false).unwrap();
+        // SAFETY: `keyboard` monta um INPUT_KEYBOARD escrevendo o campo `ki`
+        // da união, então é ele que está inicializado.
         let key = unsafe { input.Anonymous.ki };
         assert_eq!(key.wScan, 0x1E);
         assert_ne!(key.dwFlags.0 & 0x2, 0, "KEYEVENTF_KEYUP");

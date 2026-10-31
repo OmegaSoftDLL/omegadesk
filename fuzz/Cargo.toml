@@ -1,0 +1,35 @@
+[package]
+name = "omegadesk-fuzz"
+version = "0.0.0"
+edition = "2024"
+license = "AGPL-3.0-only"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+[dependencies]
+bytes = "1"
+libfuzzer-sys = "0.4"
+omegadesk-identity = { path = "../crates/identity" }
+omegadesk-protocol = { path = "../crates/protocol" }
+
+[[bin]]
+name = "frame_decoder"
+path = "fuzz_targets/frame_decoder.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "identity_secret"
+path = "fuzz_targets/identity_secret.rs"
+test = false
+doc = false
+bench = false

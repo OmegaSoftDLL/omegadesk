@@ -41,6 +41,8 @@ mod close_code {
 #[derive(Debug, Clone)]
 pub(crate) struct SessionConfig {
     pub(crate) name: String,
+    /// Chave pública de assinatura deste dispositivo, enviada no `HelloAck`.
+    pub(crate) device_public_key: [u8; 32],
     pub(crate) password: String,
     pub(crate) monitor: u32,
     pub(crate) encoder: EncoderChoice,
@@ -199,8 +201,9 @@ async fn handshake(
         bail!("nenhum codec em comum com o cliente");
     };
     info!(
-        "cliente \"{}\" autorizado, usando {codec:?}",
-        hello.device_name
+        "cliente \"{}\" ({}) autorizado, usando {codec:?}",
+        hello.device_name,
+        describe_device(&hello.device_public_key),
     );
 
     send_envelope(
@@ -208,7 +211,7 @@ async fn handshake(
         &Envelope {
             payload: Some(Payload::HelloAck(HelloAck {
                 protocol_version: PROTOCOL_VERSION,
-                device_public_key: Vec::new().into(),
+                device_public_key: config.device_public_key.to_vec().into(),
                 device_name: config.name.clone(),
                 capabilities: Some(Capabilities {
                     decoders: Vec::new(),
@@ -289,4 +292,18 @@ async fn reject(stream: &mut SendStream, code: ErrorCode, message: &str) {
         })),
     };
     let _ = send_envelope(stream, &envelope).await;
+}
+
+/// ID do dispositivo a partir da chave pública recebida, para os logs. Na
+/// Fase 2 o coordenador passa a autorizar por essa identidade.
+fn describe_device(public_key: &[u8]) -> String {
+    <[u8; 32]>::try_from(public_key).map_or_else(
+        |_| "sem identidade".to_owned(),
+        |key| {
+            format!(
+                "ID {}",
+                omegadesk_identity::DeviceId::from_signing_key(&key)
+            )
+        },
+    )
 }

@@ -21,7 +21,7 @@ use sha2::{Digest, Sha256};
 use x25519_dalek::{PublicKey as ExchangePublicKey, StaticSecret};
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
-pub use store::{KeyStore, KeyringStore, MemoryStore, StoreError};
+pub use store::{FileStore, KeyStore, KeyringStore, MemoryStore, StoreError, default_store};
 
 /// Tamanho do segredo serializado: 32 bytes de assinatura + 32 de troca.
 const SECRET_LEN: usize = 64;
