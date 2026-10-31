@@ -17,5 +17,8 @@ thiserror.workspace = true
 prost-build.workspace = true
 protox.workspace = true
 
+[dev-dependencies]
+proptest.workspace = true
+
 [lints]
 workspace = true

@@ -52,9 +52,15 @@ fn main() -> anyhow::Result<()> {
     let event_loop = EventLoop::<window::UserEvent>::with_user_event()
         .build()
         .context("não foi possível criar a janela")?;
+    let store = omegadesk_identity::default_store("client")
+        .context("não foi possível abrir o cofre de chaves")?;
+    let identity = omegadesk_identity::DeviceIdentity::load_or_create(store.as_ref())
+        .context("não foi possível carregar a identidade do dispositivo")?;
+    tracing::info!("ID deste dispositivo: {}", identity.id());
     let shared = stats::Shared::default();
     let input = network::start(
         network::Target {
+            device_public_key: identity.public().signing_key_bytes(),
             address: args.address,
             fingerprint: args.fingerprint,
             password: args.password,

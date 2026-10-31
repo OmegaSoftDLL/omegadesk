@@ -23,10 +23,11 @@ bytes = "1"
 clap = { version = "4", features = ["derive", "env"] }
 data-encoding = "2"
 ed25519-dalek = { version = "2", features = ["rand_core", "zeroize"] }
-keyring = { version = "3", features = ["apple-native", "windows-native", "linux-native"] }
+keyring = { version = "3", features = ["apple-native", "windows-native"] }
 openh264 = "0.9"
 prost = "0.13"
 prost-build = "0.13"
+proptest = "1"
 protox = "0.7"
 quinn = { version = "0.11", default-features = false, features = ["log", "runtime-tokio", "rustls-ring"] }
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring"] }
@@ -58,7 +59,12 @@ dbg_macro = "deny"
 todo = "deny"
 print_stdout = "deny"
 print_stderr = "deny"
+undocumented_unsafe_blocks = "deny"
+multiple_unsafe_ops_per_block = "deny"
 similar_names = "allow"
+
+[profile.test.package.proptest]
+opt-level = 3
 
 [profile.release]
 lto = "thin"

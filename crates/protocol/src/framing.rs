@@ -160,4 +160,126 @@ mod tests {
         decoder.extend(&[0xFF; 10]);
         assert!(matches!(decoder.next_frame(), Err(FramingError::Decode(_))));
     }
+
+    mod proptests {
+        use bytes::BytesMut;
+        use proptest::prelude::*;
+
+        use super::{Envelope, FrameDecoder, Payload, Ping, encode_frame};
+        use crate::v1::{KeyEvent, PointerEvent, VideoFrame};
+
+        fn arbitrary_envelope() -> impl Strategy<Value = Envelope> {
+            prop_oneof![
+                (any::<u64>(), any::<u64>()).prop_map(|(sequence, sent_at_micros)| Envelope {
+                    payload: Some(Payload::Ping(Ping {
+                        sequence,
+                        sent_at_micros,
+                    })),
+                }),
+                (any::<u32>(), any::<u32>(), any::<bool>(), any::<u32>()).prop_map(
+                    |(hid_usage, keysym, pressed, modifiers)| Envelope {
+                        payload: Some(Payload::KeyEvent(KeyEvent {
+                            hid_usage,
+                            keysym,
+                            pressed,
+                            modifiers,
+                        })),
+                    },
+                ),
+                (
+                    any::<u32>(),
+                    any::<u32>(),
+                    any::<u32>(),
+                    any::<i32>(),
+                    any::<i32>(),
+                    any::<u32>(),
+                )
+                    .prop_map(
+                        |(x, y, buttons, wheel_x, wheel_y, display_index)| Envelope {
+                            payload: Some(Payload::PointerEvent(PointerEvent {
+                                x,
+                                y,
+                                buttons,
+                                wheel_x,
+                                wheel_y,
+                                display_index,
+                            })),
+                        },
+                    ),
+                (
+                    any::<u64>(),
+                    any::<u64>(),
+                    any::<bool>(),
+                    any::<u32>(),
+                    any::<u32>(),
+                    proptest::collection::vec(any::<u8>(), 0..512),
+                )
+                    .prop_map(
+                        |(sequence, captured_at_micros, keyframe, width, height, data)| Envelope {
+                            payload: Some(Payload::VideoFrame(VideoFrame {
+                                sequence,
+                                captured_at_micros,
+                                host_processing_micros: 0,
+                                codec: 1,
+                                keyframe,
+                                width,
+                                height,
+                                display_index: 0,
+                                data: data.into(),
+                            })),
+                        },
+                    ),
+            ]
+        }
+
+        proptest! {
+            #[test]
+            fn round_trip_with_arbitrary_chunk_boundaries(
+                frames in proptest::collection::vec(arbitrary_envelope(), 0..16),
+                chunk_sizes in proptest::collection::vec(1usize..128, 1..32),
+            ) {
+                let mut wire = BytesMut::new();
+                for frame in &frames {
+                    encode_frame(frame, &mut wire).unwrap();
+                }
+
+                let mut decoder = FrameDecoder::new();
+                let mut decoded = Vec::new();
+                let mut offset = 0;
+                let mut chunk_index = 0;
+                while offset < wire.len() {
+                    let size = chunk_sizes[chunk_index % chunk_sizes.len()]
+                        .min(wire.len() - offset);
+                    decoder.extend(&wire[offset..offset + size]);
+                    offset += size;
+                    chunk_index += 1;
+                    while let Some(envelope) = decoder.next_frame().unwrap() {
+                        decoded.push(envelope);
+                    }
+                }
+                prop_assert_eq!(decoded, frames);
+                prop_assert_eq!(decoder.next_frame().unwrap(), None);
+            }
+
+            #[test]
+            fn arbitrary_bytes_never_panic(
+                chunks in proptest::collection::vec(
+                    proptest::collection::vec(any::<u8>(), 0..256),
+                    0..16,
+                ),
+            ) {
+                let mut decoder = FrameDecoder::new();
+                'stream: for chunk in &chunks {
+                    decoder.extend(chunk);
+                    loop {
+                        match decoder.next_frame() {
+                            Ok(Some(_)) => {}
+                            Ok(None) => break,
+                            Err(_) => break 'stream,
+                        }
+                    }
+                }
+            }
+        }
+    }
 }

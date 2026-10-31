@@ -80,7 +80,15 @@ async fn main() -> anyhow::Result<()> {
         Some(_) => anyhow::bail!("a senha precisa ter pelo menos 8 caracteres"),
         None => password::generate(),
     };
+    // Identidade persistente do dispositivo: o mesmo ID a cada início.
+    let store = omegadesk_identity::default_store("agent")
+        .context("não foi possível abrir o cofre de chaves")?;
+    let identity = omegadesk_identity::DeviceIdentity::load_or_create(store.as_ref())
+        .context("não foi possível carregar a identidade do dispositivo")?;
+    info!("ID do dispositivo: {}", identity.id());
+
     let config = Arc::new(SessionConfig {
+        device_public_key: identity.public().signing_key_bytes(),
         name: args.name,
         password,
         monitor: args.display,

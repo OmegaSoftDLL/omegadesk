@@ -45,28 +45,40 @@ mod windows_impl {
             StateMask: 0,
         };
         let size = u32::try_from(size_of::<PROCESS_POWER_THROTTLING_STATE>()).unwrap_or(0);
-        unsafe {
-            let process = GetCurrentProcess();
-            if let Err(error) = SetProcessInformation(
+        // SAFETY: sem argumentos; devolve o pseudo-handle do próprio processo,
+        // que não precisa ser fechado.
+        let process = unsafe { GetCurrentProcess() };
+        // SAFETY: `process` é o pseudo-handle do processo atual; para
+        // ProcessPowerThrottling a API espera um PROCESS_POWER_THROTTLING_STATE,
+        // e `state` é exatamente isso, vivo na pilha durante a chamada, com
+        // `size` igual ao seu tamanho. A API só lê o buffer.
+        let throttling = unsafe {
+            SetProcessInformation(
                 process,
                 ProcessPowerThrottling,
                 (&raw const state).cast::<c_void>(),
                 size,
-            ) {
-                warn!("não foi possível desligar o power throttling: {error}");
-            }
-            match SetPriorityClass(process, HIGH_PRIORITY_CLASS) {
-                Ok(()) => info!("agente em prioridade alta e sem power throttling"),
-                Err(error) => warn!("não foi possível subir a prioridade: {error}"),
-            }
+            )
+        };
+        if let Err(error) = throttling {
+            warn!("não foi possível desligar o power throttling: {error}");
+        }
+        // SAFETY: `process` é o pseudo-handle do processo atual (com todos os
+        // direitos) e HIGH_PRIORITY_CLASS é uma classe válida.
+        match unsafe { SetPriorityClass(process, HIGH_PRIORITY_CLASS) } {
+            Ok(()) => info!("agente em prioridade alta e sem power throttling"),
+            Err(error) => warn!("não foi possível subir a prioridade: {error}"),
         }
     }
 
     pub(super) fn boost_current_thread() {
-        unsafe {
-            if let Err(error) = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST) {
-                warn!("não foi possível subir a prioridade da thread: {error}");
-            }
+        // SAFETY: sem argumentos; devolve o pseudo-handle da thread atual, que
+        // não precisa ser fechado.
+        let thread = unsafe { GetCurrentThread() };
+        // SAFETY: `thread` é o pseudo-handle da thread atual e
+        // THREAD_PRIORITY_HIGHEST é um nível de prioridade válido.
+        if let Err(error) = unsafe { SetThreadPriority(thread, THREAD_PRIORITY_HIGHEST) } {
+            warn!("não foi possível subir a prioridade da thread: {error}");
         }
     }
 }

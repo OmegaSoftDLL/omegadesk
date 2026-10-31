@@ -13,6 +13,7 @@ anyhow.workspace = true
 clap.workspace = true
 omegadesk-capture.workspace = true
 omegadesk-codec.workspace = true
+omegadesk-identity.workspace = true
 omegadesk-input.workspace = true
 omegadesk-protocol.workspace = true
 omegadesk-transport.workspace = true
