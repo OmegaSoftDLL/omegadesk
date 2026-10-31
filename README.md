@@ -25,8 +25,8 @@ OmegaDesk is a remote desktop you run on your own infrastructure, as an alternat
 
 What works today:
 
-- **Screen capture** with DXGI Desktop Duplication on Windows.
-- **Hardware H.264 encoding** through Media Foundation (Intel Quick Sync, NVIDIA NVENC, AMD AMF), with automatic fallback to OpenH264 in software.
+- **Screen capture** with DXGI Desktop Duplication on Windows, including hardware cursor compositing and rotated monitor support (`90°`, `180°`, `270°`).
+- **Hardware H.264 encoding** through Media Foundation (Intel Quick Sync, NVIDIA NVENC, AMD AMF) with a zero-copy D3D11 GPU texture pipeline (`ID3D11VideoProcessor` + `MFCreateDXGISurfaceBuffer`), plus automatic fallback to OpenH264 in software.
 - **QUIC transport** (TLS 1.3) with certificate pinning and a mandatory access password.
 - **Remote keyboard and mouse** using physical scancodes, so any keyboard layout works (ABNT2 included). Multi-monitor aware.
 - **Native client** that shows a live latency breakdown in the title bar.
@@ -90,7 +90,7 @@ The full design, from the WireGuard mesh to the web client, is in [docs/plan.md]
 | Phase | Deliverable | Status |
 |---|---|---|
 | 0 | Foundation: workspace, CI on three platforms, license policy, protocol, identity | ✅ Done |
-| 1 | First image on screen: capture, hardware encoding, QUIC, input, ≤ 30 ms on LAN | 🚧 In progress |
+| 1 | First image on screen: capture, hardware encoding, QUIC, input, ≤ 30 ms on LAN | ✅ Done |
 | 2 | Mesh network and coordination server: NAT traversal, relay, internal DNS | Planned |
 | 3 | Remote access product: Windows service, login/UAC screens, clipboard, files, audio | Planned |
 | 4 | Web dashboard and browser client | Planned |

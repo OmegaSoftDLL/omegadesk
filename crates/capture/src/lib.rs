@@ -1,14 +1,17 @@
 //! Screen capture for OmegaDesk.
 //!
-//! Currently implements DXGI Desktop Duplication on Windows, copying each
-//! captured frame to CPU memory in tightly packed BGRA. The zero-copy GPU path
-//! (passing the D3D11 texture directly to the hardware encoder) will be added
-//! alongside the GPU texture pipeline.
+//! Implements DXGI Desktop Duplication on Windows, including hardware cursor
+//! compositing (`GetFramePointerShape`), rotated monitor support (`90°`, `180°`,
+//! `270°`), and a GPU-resident D3D11 texture path (`GpuTexture`) so hardware
+//! encoders can convert and encode directly on the GPU without copying full
+//! frames through CPU memory.
 
 use std::time::{Duration, Instant};
 
+pub mod cursor;
 #[cfg(windows)]
 mod dxgi;
+pub mod rotate;
 
 /// Screen capture errors.
 #[derive(Debug, thiserror::Error)]
@@ -28,17 +31,43 @@ pub enum CaptureError {
     Os(String),
 }
 
-/// A captured video frame in 8-bit-per-channel BGRA.
+/// GPU-resident Direct3D 11 texture for zero-copy hardware video encoding on Windows.
+#[cfg(windows)]
+#[derive(Debug, Clone)]
+pub struct GpuTexture {
+    /// Direct3D 11 device that owns [`Self::texture`].
+    pub device: windows::Win32::Graphics::Direct3D11::ID3D11Device,
+    /// Immediate context of [`Self::device`].
+    pub context: windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext,
+    /// `DXGI_FORMAT_B8G8R8A8_UNORM` 2D texture in VRAM.
+    pub texture: windows::Win32::Graphics::Direct3D11::ID3D11Texture2D,
+}
+
+#[cfg(windows)]
+#[allow(
+    unsafe_code,
+    reason = "Send impl for multithread-protected D3D11 COM objects"
+)]
+// SAFETY: `DxgiCapturer` enables `ID3D11Multithread::SetMultithreadProtected(true)`
+// on `device` at creation time, and `GpuTexture` is consumed sequentially on the
+// dedicated capture/encode thread.
+unsafe impl Send for GpuTexture {}
+
+/// A captured video frame in 8-bit-per-channel BGRA, optionally backed by a
+/// Direct3D 11 texture in VRAM on Windows.
 #[derive(Debug, Clone)]
 pub struct Frame {
-    /// Width in pixels.
+    /// Width in pixels (upright desktop orientation).
     pub width: u32,
-    /// Height in pixels.
+    /// Height in pixels (upright desktop orientation).
     pub height: u32,
     /// Tightly packed BGRA pixels, row by row (`width * 4` bytes per row).
     pub bgra: Vec<u8>,
     /// Monotonic instant when the frame was acquired.
     pub captured_at: Instant,
+    /// Optional GPU-resident Direct3D 11 texture for zero-copy hardware encoding.
+    #[cfg(windows)]
+    pub gpu_texture: Option<GpuTexture>,
 }
 
 /// Position and size of a monitor in virtual desktop pixel coordinates.
@@ -60,7 +89,7 @@ pub struct DisplayBounds {
 pub trait Capturer: Send {
     /// Waits up to `timeout` for the next frame.
     ///
-    /// Returns `None` if the screen did not change before `timeout` elapsed.
+    /// Returns `None` if the screen and cursor did not change before `timeout` elapsed.
     ///
     /// # Errors
     ///
@@ -74,6 +103,13 @@ pub trait Capturer: Send {
     /// Position of the captured monitor within the virtual desktop so remote
     /// pointer events land on the right monitor.
     fn bounds(&self) -> DisplayBounds;
+
+    /// Returns the underlying Direct3D 11 device on Windows so a hardware
+    /// encoder can bind an `IMFDXGIDeviceManager` to the same GPU adapter.
+    #[cfg(windows)]
+    fn d3d11_device(&self) -> Option<&windows::Win32::Graphics::Direct3D11::ID3D11Device> {
+        None
+    }
 }
 
 /// Opens a capturer for monitor `index` (`0` is the primary monitor).

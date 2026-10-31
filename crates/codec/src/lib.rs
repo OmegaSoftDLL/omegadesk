@@ -45,7 +45,20 @@ pub enum CodecError {
     Platform(String),
 }
 
-/// Uncompressed input frame for an encoder, in tightly packed BGRA.
+/// Borrowed Direct3D 11 BGRA texture and device for zero-copy hardware encoding.
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy)]
+pub struct D3d11Texture<'a> {
+    /// Direct3D 11 device that owns [`Self::texture`].
+    pub device: &'a windows::Win32::Graphics::Direct3D11::ID3D11Device,
+    /// Immediate context of [`Self::device`].
+    pub context: &'a windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext,
+    /// Captured `DXGI_FORMAT_B8G8R8A8_UNORM` 2D texture in VRAM.
+    pub texture: &'a windows::Win32::Graphics::Direct3D11::ID3D11Texture2D,
+}
+
+/// Uncompressed input frame for an encoder, in tightly packed BGRA and
+/// optionally backed by a Direct3D 11 texture in VRAM on Windows.
 #[derive(Debug, Clone, Copy)]
 pub struct RawFrame<'a> {
     /// Width in pixels.
@@ -54,6 +67,23 @@ pub struct RawFrame<'a> {
     pub height: u32,
     /// `width * height * 4` bytes of BGRA pixel data.
     pub bgra: &'a [u8],
+    /// Optional GPU-resident Direct3D 11 texture for zero-copy hardware encoding.
+    #[cfg(windows)]
+    pub d3d11_texture: Option<D3d11Texture<'a>>,
+}
+
+impl<'a> RawFrame<'a> {
+    /// Constructs a [`RawFrame`] backed by CPU BGRA pixels only.
+    #[must_use]
+    pub const fn from_bgra(width: u32, height: u32, bgra: &'a [u8]) -> Self {
+        Self {
+            width,
+            height,
+            bgra,
+            #[cfg(windows)]
+            d3d11_texture: None,
+        }
+    }
 }
 
 /// Encoded video frame.
@@ -148,11 +178,7 @@ mod tests {
         let mut encoder = OpenH264Encoder::new(EncoderSettings::default()).unwrap();
         let mut decoder = OpenH264Decoder::new().unwrap();
 
-        let frame = RawFrame {
-            width,
-            height,
-            bgra: &bgra,
-        };
+        let frame = RawFrame::from_bgra(width, height, &bgra);
         let bitstream = encoder.encode(frame).unwrap().remove(0);
         assert!(bitstream.keyframe);
 
