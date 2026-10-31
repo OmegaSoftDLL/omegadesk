@@ -1,4 +1,4 @@
-//! H.264 por software com OpenH264, compilado a partir do código-fonte.
+//! Software H.264 codec backed by OpenH264 compiled from source.
 
 use openh264::OpenH264API;
 use openh264::decoder::{Decoder, DecoderConfig};
@@ -13,10 +13,10 @@ use crate::{
     bgra_to_i420,
 };
 
-/// Maior lado aceito, para não estourar memória com dimensões absurdas.
+/// Maximum accepted dimension along either axis to prevent excessive memory allocation.
 const MAX_DIMENSION: u32 = 8192;
 
-/// Encoder H.264 por software, ajustado para tela em tempo real.
+/// Real-time screen-content H.264 software encoder.
 pub struct OpenH264Encoder {
     encoder: Encoder,
 }
@@ -28,20 +28,20 @@ impl std::fmt::Debug for OpenH264Encoder {
 }
 
 impl OpenH264Encoder {
-    /// Cria o encoder.
+    /// Creates a new software H.264 encoder.
     ///
     /// # Errors
     ///
-    /// Retorna erro se o OpenH264 não inicializar.
+    /// Returns an error if OpenH264 initialization fails.
     pub fn new(settings: EncoderSettings) -> Result<Self, CodecError> {
         let config = EncoderConfig::new()
             .usage_type(UsageType::ScreenContentRealTime)
             .rate_control_mode(RateControlMode::Bitrate)
             .bitrate(BitRate::from_bps(settings.bitrate_bps))
             .max_frame_rate(FrameRate::from_hz(settings.max_fps))
-            // Sem pular quadros: latência previsível vale mais que bitrate exato.
+            // Never skip frames: predictable latency matters more than strict bitrate.
             .skip_frames(false)
-            // GOP longo; keyframes só quando pedidos (cliente novo ou perda).
+            // Long GOP; keyframes are emitted on demand (new client or packet loss).
             .intra_frame_period(IntraFramePeriod::from_num_frames(0));
         let encoder = Encoder::with_api_config(OpenH264API::from_source(), config)?;
         Ok(Self { encoder })
@@ -69,7 +69,7 @@ impl VideoEncoder for OpenH264Encoder {
             });
         }
 
-        // H.264 4:2:0 precisa de dimensões pares: descarta a última coluna/linha.
+        // H.264 4:2:0 requires even dimensions: drop any trailing odd column/row.
         let width = source_width & !1;
         let height = frame.height as usize & !1;
         let (y, u, v) = bgra_to_i420(frame.bgra, source_width, width, height);
@@ -97,7 +97,7 @@ impl VideoEncoder for OpenH264Encoder {
     }
 }
 
-/// Decoder H.264 por software.
+/// Software H.264 decoder.
 pub struct OpenH264Decoder {
     decoder: Decoder,
     rgba: Vec<u8>,
@@ -110,11 +110,11 @@ impl std::fmt::Debug for OpenH264Decoder {
 }
 
 impl OpenH264Decoder {
-    /// Cria o decoder.
+    /// Creates a new software H.264 decoder.
     ///
     /// # Errors
     ///
-    /// Retorna erro se o OpenH264 não inicializar.
+    /// Returns an error if OpenH264 initialization fails.
     pub fn new() -> Result<Self, CodecError> {
         let decoder = Decoder::with_api_config(OpenH264API::from_source(), DecoderConfig::new())?;
         Ok(Self {

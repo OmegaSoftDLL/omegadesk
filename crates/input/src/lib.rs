@@ -1,9 +1,9 @@
-//! Injeção de teclado e mouse do OmegaDesk.
+//! Keyboard and mouse injection for OmegaDesk.
 //!
-//! As teclas chegam como código de uso USB HID (independente do layout) e são
-//! convertidas em scancode do teclado físico na máquina remota. Assim o
-//! layout configurado lá (ABNT2, US, …) decide o caractere, como num teclado
-//! de verdade.
+//! Keys arrive as layout-independent USB HID usage codes and are translated
+//! into physical keyboard scancodes on the remote machine. The layout configured
+//! on the remote machine (ABNT2, US, …) determines the produced character,
+//! matching a physical keyboard attached to that machine.
 
 mod hid;
 #[cfg(windows)]
@@ -12,78 +12,78 @@ mod windows_injector;
 pub use hid::{Scancode, hid_to_scancode};
 use omegadesk_protocol::v1::{KeyEvent, PointerEvent};
 
-/// Botões do ponteiro, como bits de `PointerEvent::buttons`.
+/// Pointer button bitflags used in `PointerEvent::buttons`.
 pub mod buttons {
-    /// Botão esquerdo.
+    /// Primary (left) mouse button.
     pub const LEFT: u32 = 1;
-    /// Botão direito.
+    /// Secondary (right) mouse button.
     pub const RIGHT: u32 = 1 << 1;
-    /// Botão do meio.
+    /// Middle (wheel) mouse button.
     pub const MIDDLE: u32 = 1 << 2;
-    /// Botão lateral "voltar".
+    /// Side "back" mouse button (`XBUTTON1`).
     pub const BACK: u32 = 1 << 3;
-    /// Botão lateral "avançar".
+    /// Side "forward" mouse button (`XBUTTON2`).
     pub const FORWARD: u32 = 1 << 4;
 }
 
-/// Uma unidade de rolagem (um "clique" da roda), igual ao `WHEEL_DELTA` do Windows.
+/// One discrete scroll wheel notch, matching Windows `WHEEL_DELTA`.
 pub const WHEEL_STEP: i32 = 120;
 
-/// Monitor que recebe o mouse, em pixels da área de trabalho virtual.
+/// Target monitor receiving pointer events, in virtual desktop pixel coordinates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TargetDisplay {
-    /// Coordenada x do canto superior esquerdo.
+    /// Top-left x coordinate.
     pub x: i32,
-    /// Coordenada y do canto superior esquerdo.
+    /// Top-left y coordinate.
     pub y: i32,
-    /// Largura em pixels.
+    /// Width in pixels.
     pub width: u32,
-    /// Altura em pixels.
+    /// Height in pixels.
     pub height: u32,
 }
 
-/// Erros de injeção.
+/// Input injection errors.
 #[derive(Debug, thiserror::Error)]
 pub enum InputError {
-    /// Não há injeção para este sistema operacional.
-    #[error("injeção de entrada ainda não suportada neste sistema")]
+    /// Input injection is not implemented for this operating system yet.
+    #[error("input injection is not yet supported on this operating system")]
     Unsupported,
-    /// O `SendInput` falhou, por exemplo porque a área de trabalho de entrada
-    /// mudou (UAC, bloqueio). Janelas elevadas bloqueadas pelo UIPI não geram
-    /// erro: os eventos são descartados em silêncio.
-    #[error("o sistema recusou o evento de entrada")]
+    /// `SendInput` rejected the event (for instance because the input desktop
+    /// switched to UAC or the lock screen). Note that UIPI blocks against
+    /// elevated windows are dropped silently by Windows without returning an error.
+    #[error("the operating system rejected the input event")]
     Rejected,
 }
 
-/// Injeta eventos de entrada na sessão local.
+/// Injects remote keyboard and pointer events into the local desktop session.
 pub trait InputInjector: Send {
-    /// Define o monitor que recebe o mouse (o mesmo que está sendo capturado).
-    /// Sem isso, o mouse vai para o monitor principal.
+    /// Sets the target monitor for absolute pointer coordinates (matching the
+    /// captured monitor). When unset, pointer coordinates map to the primary monitor.
     fn set_target(&mut self, target: TargetDisplay);
 
-    /// Pressiona ou solta uma tecla.
+    /// Presses or releases a key.
     ///
     /// # Errors
     ///
-    /// Retorna erro se o sistema recusar o evento.
+    /// Returns an error if the operating system rejects the event.
     fn key(&mut self, event: &KeyEvent) -> Result<(), InputError>;
 
-    /// Move o ponteiro, aperta/solta botões e rola.
+    /// Moves the pointer, presses/releases mouse buttons, and scrolls the wheel.
     ///
     /// # Errors
     ///
-    /// Retorna erro se o sistema recusar o evento.
+    /// Returns an error if the operating system rejects the event.
     fn pointer(&mut self, event: &PointerEvent) -> Result<(), InputError>;
 
-    /// Solta todas as teclas e botões apertados por este injetor.
+    /// Releases all keys and mouse buttons currently held down by this injector.
     fn release_all(&mut self);
 }
 
-/// Abre o injetor do sistema operacional atual.
+/// Opens the input injector for the current operating system.
 ///
 /// # Errors
 ///
-/// Retorna [`InputError::Unsupported`] fora do Windows, por enquanto.
+/// Returns [`InputError::Unsupported`] on non-Windows platforms for now.
 pub fn open() -> Result<Box<dyn InputInjector>, InputError> {
     #[cfg(windows)]
     {

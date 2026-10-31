@@ -1,12 +1,12 @@
-//! Tabela de códigos USB HID (página 0x07, teclado) para scancodes do
-//! conjunto 1 (PC/AT), que é o que o Windows usa em `SendInput`.
+//! USB HID keyboard usage page (`0x07`) to PC/AT Set 1 scancode translation
+//! table used by Windows `SendInput`.
 
-/// Scancode do conjunto 1.
+/// PC/AT Set 1 scancode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Scancode {
-    /// Código sem o prefixo `0xE0`.
+    /// Scancode byte without the `0xE0` prefix.
     pub code: u16,
-    /// Tecla estendida (prefixo `0xE0`): setas, Insert, Ctrl/Alt direitos…
+    /// Extended key (`0xE0` prefix): arrow keys, Insert, right Ctrl/Alt…
     pub extended: bool,
 }
 
@@ -24,12 +24,13 @@ const fn extended(code: u16) -> Scancode {
     }
 }
 
-/// Converte um código HID de teclado em scancode. Devolve `None` para teclas
-/// sem equivalente (como Pause, que exige uma sequência especial).
+/// Translates a USB HID keyboard usage code into a Set 1 scancode. Returns
+/// `None` for keys without a single Set 1 scancode (such as Pause, which uses
+/// a multi-byte sequence).
 #[must_use]
 pub const fn hid_to_scancode(usage: u32) -> Option<Scancode> {
     let scancode = match usage {
-        // Letras A–Z.
+        // Letters A–Z.
         0x04 => plain(0x1E),
         0x05 => plain(0x30),
         0x06 => plain(0x2E),
@@ -56,28 +57,28 @@ pub const fn hid_to_scancode(usage: u32) -> Option<Scancode> {
         0x1B => plain(0x2D),
         0x1C => plain(0x15),
         0x1D => plain(0x2C),
-        // Números 1–9 e 0 (0x1E..=0x27 → 0x02..=0x0B).
-        #[allow(clippy::cast_possible_truncation, reason = "faixa limitada a 0x27")]
+        // Digits 1–9 and 0 (0x1E..=0x27 -> 0x02..=0x0B).
+        #[allow(clippy::cast_possible_truncation, reason = "range bounded by 0x27")]
         0x1E..=0x27 => plain((usage - 0x1E + 0x02) as u16),
         0x28 => plain(0x1C),        // Enter
-        0x29 => plain(0x01),        // Esc
+        0x29 => plain(0x01),        // Escape
         0x2A => plain(0x0E),        // Backspace
         0x2B => plain(0x0F),        // Tab
-        0x2C => plain(0x39),        // Espaço
+        0x2C => plain(0x39),        // Space
         0x2D => plain(0x0C),        // - _
         0x2E => plain(0x0D),        // = +
-        0x2F => plain(0x1A),        // [ {   (no ABNT2: ´ `)
-        0x30 => plain(0x1B),        // ] }   (no ABNT2: [ {)
-        0x31 | 0x32 => plain(0x2B), // \ |  e # ~ de teclados ISO (no ABNT2: ] })
-        0x33 => plain(0x27),        // ; :   (no ABNT2: ç)
-        0x34 => plain(0x28),        // ' "   (no ABNT2: ~ ^)
-        0x35 => plain(0x29),        // ` ~   (no ABNT2: ' ")
+        0x2F => plain(0x1A),        // [ {   (on ABNT2: ´ `)
+        0x30 => plain(0x1B),        // ] }   (on ABNT2: [ {)
+        0x31 | 0x32 => plain(0x2B), // \ | and ISO # ~ (on ABNT2: ] })
+        0x33 => plain(0x27),        // ; :   (on ABNT2: ç)
+        0x34 => plain(0x28),        // ' "   (on ABNT2: ~ ^)
+        0x35 => plain(0x29),        // ` ~   (on ABNT2: ' ")
         0x36 => plain(0x33),        // , <
         0x37 => plain(0x34),        // . >
-        0x38 => plain(0x35),        // / ?   (no ABNT2: ; :)
+        0x38 => plain(0x35),        // / ?   (on ABNT2: ; :)
         0x39 => plain(0x3A),        // Caps Lock
-        // F1–F10 (0x3A..=0x43 → 0x3B..=0x44), F11, F12.
-        #[allow(clippy::cast_possible_truncation, reason = "faixa limitada a 0x43")]
+        // F1–F10 (0x3A..=0x43 -> 0x3B..=0x44), F11, F12.
+        #[allow(clippy::cast_possible_truncation, reason = "range bounded by 0x43")]
         0x3A..=0x43 => plain((usage - 0x3A + 0x3B) as u16),
         0x44 => plain(0x57),
         0x45 => plain(0x58),
@@ -89,10 +90,10 @@ pub const fn hid_to_scancode(usage: u32) -> Option<Scancode> {
         0x4C => extended(0x53), // Delete
         0x4D => extended(0x4F), // End
         0x4E => extended(0x51), // Page Down
-        0x4F => extended(0x4D), // →
-        0x50 => extended(0x4B), // ←
-        0x51 => extended(0x50), // ↓
-        0x52 => extended(0x48), // ↑
+        0x4F => extended(0x4D), // Right Arrow
+        0x50 => extended(0x4B), // Left Arrow
+        0x51 => extended(0x50), // Down Arrow
+        0x52 => extended(0x48), // Up Arrow
         0x53 => plain(0x45),    // Num Lock
         0x54 => extended(0x35), // Numpad /
         0x55 => plain(0x37),    // Numpad *
@@ -109,21 +110,21 @@ pub const fn hid_to_scancode(usage: u32) -> Option<Scancode> {
         0x60 => plain(0x48),    // Numpad 8
         0x61 => plain(0x49),    // Numpad 9
         0x62 => plain(0x52),    // Numpad 0
-        0x63 => plain(0x53),    // Numpad . (ou , no ABNT2)
-        0x64 => plain(0x56),    // \ | de teclados ISO (ABNT2, ao lado do Shift esquerdo)
-        0x65 => extended(0x5D), // Menu de contexto
-        0x85 => plain(0x7E),    // Numpad . do ABNT2
-        0x87 => plain(0x73),    // / ? do ABNT2 (ao lado do Shift direito)
+        0x63 => plain(0x53),    // Numpad . (or , on ABNT2)
+        0x64 => plain(0x56),    // ISO \ | (ABNT2 key next to Left Shift)
+        0x65 => extended(0x5D), // Context Menu
+        0x85 => plain(0x7E),    // ABNT2 Numpad .
+        0x87 => plain(0x73),    // ABNT2 / ? (key next to Right Shift)
         0x88 => plain(0x70),    // Kana
         0x89 => plain(0x7D),    // Yen
-        0xE0 => plain(0x1D),    // Ctrl esquerdo
-        0xE1 => plain(0x2A),    // Shift esquerdo
-        0xE2 => plain(0x38),    // Alt esquerdo
-        0xE3 => extended(0x5B), // Windows esquerdo
-        0xE4 => extended(0x1D), // Ctrl direito
-        0xE5 => plain(0x36),    // Shift direito
-        0xE6 => extended(0x38), // Alt direito (AltGr)
-        0xE7 => extended(0x5C), // Windows direito
+        0xE0 => plain(0x1D),    // Left Ctrl
+        0xE1 => plain(0x2A),    // Left Shift
+        0xE2 => plain(0x38),    // Left Alt
+        0xE3 => extended(0x5B), // Left Super / Windows
+        0xE4 => extended(0x1D), // Right Ctrl
+        0xE5 => plain(0x36),    // Right Shift
+        0xE6 => extended(0x38), // Right Alt (AltGr)
+        0xE7 => extended(0x5C), // Right Super / Windows
         _ => return None,
     };
     Some(scancode)

@@ -1,15 +1,17 @@
-//! H.264 por hardware com Media Foundation (Windows): Intel Quick Sync,
-//! NVIDIA NVENC e AMD AMF, pelo MFT de hardware que o driver registra.
+//! Hardware H.264 encoder via Windows Media Foundation: Intel Quick Sync,
+//! NVIDIA NVENC, and AMD AMF, using the hardware MFT registered by the GPU driver.
 //!
-//! MFTs de hardware são assíncronos: avisam por eventos quando querem um
-//! quadro (`METransformNeedInput`) e quando há saída (`METransformHaveOutput`).
-//! Referências usadas:
-//! - `IronRDP` (`ironrdp-rdpecam-native` e `ironrdp-egfx-native`, MIT/Apache-2.0):
-//!   tipos de mídia, `ProcessOutput`, cabeçalho SPS/PPS, `STREAM_CHANGE`;
-//! - Sunshine (`src/nvenc/nvenc_base.cpp`): CBR com buffer de um quadro, sem
-//!   B-frames, cor sinalizada na VUI.
+//! Hardware MFTs are asynchronous: they signal via events when they accept an
+//! input frame (`METransformNeedInput`) and when encoded output is ready
+//! (`METransformHaveOutput`).
+//!
+//! References:
+//! - `IronRDP` (`ironrdp-rdpecam-native` and `ironrdp-egfx-native`, MIT/Apache-2.0):
+//!   media types, `ProcessOutput`, SPS/PPS sequence header, `STREAM_CHANGE`;
+//! - Sunshine (`src/nvenc/nvenc_base.cpp`): single-frame VBV buffer CBR, zero
+//!   B-frames, color space signaled in the VUI.
 
-#![allow(unsafe_code, reason = "APIs COM da Media Foundation")]
+#![allow(unsafe_code, reason = "Media Foundation COM APIs")]
 
 use std::collections::VecDeque;
 use std::sync::OnceLock;
@@ -41,14 +43,14 @@ use windows::core::{GUID, Interface};
 
 use crate::{CodecError, EncodedFrame, EncoderSettings, RawFrame, VideoEncoder, bgra_to_nv12};
 
-/// Prazo para o MFT pedir um quadro ou devolver a saída. Um driver travado
-/// (TDR, GPU removida) vira erro em vez de travar a captura para sempre.
+/// Deadline for the MFT to request input or produce output. A wedged driver
+/// (TDR or GPU removal) becomes an error instead of hanging capture forever.
 const EVENT_DEADLINE: Duration = Duration::from_millis(250);
 
-/// Pausa entre consultas de eventos enquanto espera.
+/// Sleep interval between non-blocking event polls while waiting.
 const POLL_INTERVAL: Duration = Duration::from_micros(250);
 
-/// GOP longo: keyframes só quando pedidos.
+/// Long GOP: keyframes are generated when explicitly requested.
 const GOP_SIZE: u32 = 0xFFFF;
 
 fn mf_error(context: &str, error: &windows::core::Error) -> CodecError {
@@ -59,9 +61,9 @@ fn startup() -> Result<(), CodecError> {
     static STARTED: OnceLock<Result<(), String>> = OnceLock::new();
     STARTED
         .get_or_init(|| {
-            // SAFETY: sem ponteiros; o OnceLock garante uma única chamada por
-            // processo, e a Media Foundation fica ligada até o processo sair
-            // (MFShutdown nunca é chamado, então nada a desfazer).
+            // SAFETY: takes no pointers; `OnceLock` guarantees a single call
+            // per process, and Media Foundation remains initialized until
+            // process exit (`MFShutdown` is never called).
             unsafe { MFStartup(MF_VERSION, MFSTARTUP_FULL) }.map_err(|e| format!("MFStartup: {e}"))
         })
         .clone()
@@ -72,7 +74,7 @@ const fn join_u64(high: u32, low: u32) -> u64 {
     ((high as u64) << 32) | low as u64
 }
 
-/// Lista os encoders H.264 de hardware, do preferido ao menos preferido.
+/// Lists available hardware H.264 encoders in priority order.
 fn hardware_encoders() -> Result<Vec<IMFActivate>, CodecError> {
     let input = MFT_REGISTER_TYPE_INFO {
         guidMajorType: MFMediaType_Video,
@@ -84,9 +86,9 @@ fn hardware_encoders() -> Result<Vec<IMFActivate>, CodecError> {
     };
     let mut array: *mut Option<IMFActivate> = std::ptr::null_mut();
     let mut count = 0u32;
-    // SAFETY: `input` e `output` são structs locais vivas durante a chamada;
-    // `array` e `count` são variáveis locais onde a função escreve o vetor
-    // alocado com CoTaskMemAlloc e o número de elementos.
+    // SAFETY: `input` and `output` are local structs alive for the call, and
+    // `array`/`count` are local out-parameters receiving the `CoTaskMemAlloc`
+    // buffer and element count.
     unsafe {
         MFTEnumEx(
             MFT_CATEGORY_VIDEO_ENCODER,
@@ -101,15 +103,15 @@ fn hardware_encoders() -> Result<Vec<IMFActivate>, CodecError> {
     if array.is_null() {
         return Ok(Vec::new());
     }
-    // SAFETY: com sucesso e ponteiro não nulo, `array` aponta para `count`
-    // ponteiros IMFActivate (`Option<IMFActivate>` tem o mesmo layout de um
-    // ponteiro anulável), alocados para nós e sem outro dono. `take` move
-    // cada referência para o Vec, deixando None no lugar, então liberar o
-    // vetor depois não solta nenhum objeto duas vezes.
+    // SAFETY: on success with a non-null pointer, `array` points to `count`
+    // `IMFActivate` pointers (`Option<IMFActivate>` has the same layout as a
+    // nullable interface pointer) owned by us. `Option::take` moves each COM
+    // reference into the `Vec` leaving `None` in place, so freeing the array
+    // afterwards does not double-release any interface.
     let entries = unsafe { std::slice::from_raw_parts_mut(array, count as usize) };
     let activates = entries.iter_mut().filter_map(Option::take).collect();
-    // SAFETY: o vetor foi alocado pelo MFTEnumEx com CoTaskMemAlloc, é
-    // liberado uma única vez e `entries` não é mais usado.
+    // SAFETY: `array` was allocated by `MFTEnumEx` via `CoTaskMemAlloc`, is
+    // freed exactly once here, and `entries` is not used afterwards.
     unsafe { CoTaskMemFree(Some(array.cast_const().cast())) };
     Ok(activates)
 }
@@ -117,9 +119,8 @@ fn hardware_encoders() -> Result<Vec<IMFActivate>, CodecError> {
 fn friendly_name(activate: &IMFActivate) -> String {
     let mut buffer = [0u16; 256];
     let mut length = 0u32;
-    // SAFETY: `activate` é um IMFActivate válido; o windows-rs passa ponteiro
-    // e tamanho de `buffer` juntos, então a função não escreve além dele (se
-    // o nome não couber, devolve erro), e `length` é uma variável local.
+    // SAFETY: `activate` is a valid `IMFActivate`; `windows-rs` passes both the
+    // pointer and length of `buffer`, and `length` is a local out-parameter.
     let result = unsafe {
         activate.GetString(
             &MFT_FRIENDLY_NAME_Attribute,
@@ -130,40 +131,40 @@ fn friendly_name(activate: &IMFActivate) -> String {
     if result.is_ok() {
         String::from_utf16_lossy(&buffer[..length as usize])
     } else {
-        "encoder de hardware".to_owned()
+        "hardware encoder".to_owned()
     }
 }
 
-/// Atributos comuns aos tipos de entrada e saída.
+/// Sets attributes shared by both input and output media types.
 fn set_video_attributes(
     media_type: &IMFMediaType,
     frame_size: u64,
     frame_rate: u64,
 ) -> windows::core::Result<()> {
-    // SAFETY: `media_type` é um IMFMediaType válido; chave estática e valor copiado.
+    // SAFETY: `media_type` is a valid `IMFMediaType`; static GUID key and value copied by value.
     unsafe { media_type.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video) }?;
-    // SAFETY: `media_type` é um IMFMediaType válido; chave estática e valor copiado.
+    // SAFETY: `media_type` is a valid `IMFMediaType`; static GUID key and value copied by value.
     unsafe { media_type.SetUINT64(&MF_MT_FRAME_SIZE, frame_size) }?;
-    // SAFETY: `media_type` é um IMFMediaType válido; chave estática e valor copiado.
+    // SAFETY: `media_type` is a valid `IMFMediaType`; static GUID key and value copied by value.
     unsafe { media_type.SetUINT64(&MF_MT_FRAME_RATE, frame_rate) }?;
-    // SAFETY: `media_type` é um IMFMediaType válido; chave estática e valor copiado.
+    // SAFETY: `media_type` is a valid `IMFMediaType`; static GUID key and value copied by value.
     unsafe { media_type.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, join_u64(1, 1)) }?;
-    // SAFETY: `media_type` é um IMFMediaType válido; chave estática e valor copiado.
+    // SAFETY: `media_type` is a valid `IMFMediaType`; static GUID key and value copied by value.
     unsafe {
         media_type.SetUINT32(
             &MF_MT_INTERLACE_MODE,
             MFVideoInterlace_Progressive.0.cast_unsigned(),
         )
     }?;
-    // Cor sinalizada na VUI: BT.601 faixa limitada, igual à conversão.
-    // SAFETY: `media_type` é um IMFMediaType válido; chave estática e valor copiado.
+    // Signal BT.601 limited range in the VUI to match our BGRA → NV12 conversion.
+    // SAFETY: `media_type` is a valid `IMFMediaType`; static GUID key and value copied by value.
     unsafe {
         media_type.SetUINT32(
             &MF_MT_YUV_MATRIX,
             MFVideoTransferMatrix_BT601.0.cast_unsigned(),
         )
     }?;
-    // SAFETY: `media_type` é um IMFMediaType válido; chave estática e valor copiado.
+    // SAFETY: `media_type` is a valid `IMFMediaType`; static GUID key and value copied by value.
     unsafe {
         media_type.SetUINT32(
             &MF_MT_VIDEO_NOMINAL_RANGE,
@@ -173,7 +174,7 @@ fn set_video_attributes(
     Ok(())
 }
 
-/// Encoder H.264 por hardware via Media Foundation.
+/// Hardware H.264 encoder backed by Windows Media Foundation.
 pub struct MediaFoundationEncoder {
     activate: IMFActivate,
     transform: IMFTransform,
@@ -189,12 +190,12 @@ pub struct MediaFoundationEncoder {
     ready: VecDeque<EncodedFrame>,
 }
 
-// SAFETY: todo uso passa por `&mut self`, então nunca há duas threads no MFT
-// ao mesmo tempo. O construtor entra no apartamento multithread (MTA), e os
-// MFTs de hardware assíncronos e os objetos de atributos/amostras da Media
-// Foundation são free-threaded; enquanto alguma thread mantiver o MTA, eles
-// podem ser chamados de outra thread do processo. Na prática o encoder é
-// criado e usado pela thread de captura.
+// SAFETY: all access goes through `&mut self`, so two threads never call into
+// the MFT concurrently. `new` initializes the multithreaded COM apartment
+// (MTA), and asynchronous hardware MFTs and Media Foundation attribute/sample
+// objects are free-threaded; as long as the MTA remains active in the process,
+// they may be invoked from another thread. In practice the encoder is created
+// and used on the dedicated capture thread.
 unsafe impl Send for MediaFoundationEncoder {}
 
 impl std::fmt::Debug for MediaFoundationEncoder {
@@ -208,24 +209,24 @@ impl std::fmt::Debug for MediaFoundationEncoder {
 }
 
 impl MediaFoundationEncoder {
-    /// Abre o primeiro encoder H.264 de hardware disponível para quadros de
-    /// `width`x`height`. Dimensões ímpares perdem a última coluna/linha.
+    /// Opens the first available hardware H.264 encoder for `width`x`height`
+    /// frames. Odd dimensions drop their trailing column/row.
     ///
-    /// Precisa ser criado na thread que vai codificar.
+    /// Should be constructed on the thread that will encode frames.
     ///
     /// # Errors
     ///
-    /// Retorna [`CodecError::HardwareUnavailable`] se não houver encoder de
-    /// hardware, ou outro erro se a configuração falhar.
+    /// Returns [`CodecError::HardwareUnavailable`] if no hardware encoder is
+    /// present, or another [`CodecError`] if configuration fails.
     pub fn new(width: u32, height: u32, settings: EncoderSettings) -> Result<Self, CodecError> {
         let (even_width, even_height) = (width & !1, height & !1);
         if even_width < 2 || even_height < 2 {
             return Err(CodecError::InvalidDimensions { width, height });
         }
-        // Pode já estar inicializado nesta thread; qualquer modo serve.
-        // SAFETY: o reservado é None, como a API exige; o resultado (inclusive
-        // RPC_E_CHANGED_MODE) é ignorado de propósito e o COM fica ligado até
-        // a thread terminar, então nenhum objeto sobrevive ao CoUninitialize.
+        // COM may already be initialized on this thread; any apartment mode works.
+        // SAFETY: reserved first argument is `None` as required; the return
+        // value (including `RPC_E_CHANGED_MODE`) is intentionally ignored and
+        // COM stays initialized for the lifetime of the thread.
         let _ = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
         startup()?;
 
@@ -240,7 +241,7 @@ impl MediaFoundationEncoder {
         Err(last_error)
     }
 
-    /// Nome do encoder escolhido (por exemplo, "Intel® Quick Sync Video H.264 Encoder MFT").
+    /// Friendly name of the selected hardware encoder (e.g. "Intel® Quick Sync Video H.264 Encoder MFT").
     #[must_use]
     pub fn name(&self) -> &str {
         &self.name
@@ -256,23 +257,23 @@ impl MediaFoundationEncoder {
         #[allow(
             clippy::cast_possible_truncation,
             clippy::cast_sign_loss,
-            reason = "fps entre 1 e 240"
+            reason = "fps clamped to 1..=240"
         )]
         let fps = settings.max_fps.clamp(1.0, 240.0).round() as u32;
         let frame_size = join_u64(width, height);
         let frame_rate = join_u64(fps, 1);
 
-        // SAFETY: `activate` é um IMFActivate válido devolvido pelo MFTEnumEx;
-        // o objeto criado é de nossa posse e o ShutdownObject fica no Drop.
+        // SAFETY: `activate` is a valid `IMFActivate` returned by `MFTEnumEx`;
+        // the activated object is owned by us and shut down in `Drop`.
         let transform: IMFTransform =
             unsafe { activate.ActivateObject() }.map_err(|e| mf_error("ActivateObject", &e))?;
-        // SAFETY: `transform` é o MFT recém-ativado.
+        // SAFETY: `transform` is the newly activated MFT.
         let attributes =
             unsafe { transform.GetAttributes() }.map_err(|e| mf_error("GetAttributes", &e))?;
-        // SAFETY: `attributes` é o repositório de atributos do MFT; chave estática.
+        // SAFETY: `attributes` is the MFT attribute store; static GUID key.
         unsafe { attributes.SetUINT32(&MF_TRANSFORM_ASYNC_UNLOCK, 1) }
             .map_err(|e| mf_error("ASYNC_UNLOCK", &e))?;
-        // SAFETY: mesmo repositório de atributos; chave estática.
+        // SAFETY: same attribute store; static GUID key.
         let _ = unsafe { attributes.SetUINT32(&MF_LOW_LATENCY, 1) };
         let events: IMFMediaEventGenerator = transform
             .cast()
@@ -280,45 +281,45 @@ impl MediaFoundationEncoder {
 
         let codec_api: Option<ICodecAPI> = transform.cast().ok();
         if let Some(api) = &codec_api {
-            // Ajustes opcionais: cada driver aceita um subconjunto.
-            // SAFETY: `api` é a ICodecAPI do MFT; GUID estático e VARIANT
-            // local vivo durante a chamada (o MFT só lê o valor).
+            // Optional low-latency tuning: each vendor driver accepts a subset.
+            // SAFETY: `api` is the MFT's `ICodecAPI`; static GUID and local
+            // `VARIANT` alive for the duration of the call.
             let _ = unsafe { api.SetValue(&CODECAPI_AVLowLatencyMode, &VARIANT::from(true)) };
-            // SAFETY: como acima.
+            // SAFETY: same as above.
             let _ = unsafe {
                 api.SetValue(
                     &CODECAPI_AVEncCommonRateControlMode,
                     &VARIANT::from(eAVEncCommonRateControlMode_CBR.0.cast_unsigned()),
                 )
             };
-            // Buffer de um quadro: sem picos que atrasem a rede (Sunshine).
-            // SAFETY: como acima.
+            // Single-frame VBV buffer: avoids frame-size spikes that add network queueing (Sunshine).
+            // SAFETY: same as above.
             let _ = unsafe {
                 api.SetValue(
                     &CODECAPI_AVEncCommonBufferSize,
                     &VARIANT::from(settings.bitrate_bps / fps.max(1)),
                 )
             };
-            // SAFETY: como acima.
+            // SAFETY: same as above.
             let _ = unsafe {
                 api.SetValue(&CODECAPI_AVEncMPVDefaultBPictureCount, &VARIANT::from(0u32))
             };
-            // SAFETY: como acima.
+            // SAFETY: same as above.
             let _ = unsafe { api.SetValue(&CODECAPI_AVEncMPVGOPSize, &VARIANT::from(GOP_SIZE)) };
         }
 
-        // SAFETY: sem argumentos; devolve um tipo de mídia vazio, de nossa posse.
+        // SAFETY: takes no arguments and returns a newly owned empty media type.
         let output =
             unsafe { MFCreateMediaType() }.map_err(|e| mf_error("MFCreateMediaType", &e))?;
-        let output_error = |e: windows::core::Error| mf_error("tipo de saída", &e);
+        let output_error = |e: windows::core::Error| mf_error("output media type", &e);
         set_video_attributes(&output, frame_size, frame_rate).map_err(output_error)?;
-        // SAFETY: `output` é o tipo de mídia criado acima; GUIDs estáticos.
+        // SAFETY: `output` is the media type created above; static GUIDs.
         unsafe { output.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_H264) }.map_err(output_error)?;
-        // SAFETY: mesmo tipo de mídia; chave estática e valor copiado.
+        // SAFETY: same media type; static key and value copied by value.
         unsafe { output.SetUINT32(&MF_MT_AVG_BITRATE, settings.bitrate_bps) }
             .map_err(output_error)?;
-        // Baseline: sem B-frames e decodificável pelo OpenH264 (como o IronRDP).
-        // SAFETY: mesmo tipo de mídia; chave estática e valor copiado.
+        // Baseline profile: zero B-frames and compatible with OpenH264 (like IronRDP).
+        // SAFETY: same media type; static key and value copied by value.
         unsafe {
             output.SetUINT32(
                 &MF_MT_MPEG2_PROFILE,
@@ -326,32 +327,32 @@ impl MediaFoundationEncoder {
             )
         }
         .map_err(output_error)?;
-        // SAFETY: `transform` é válido, tem um único stream de saída (id 0) e
-        // `output` é um tipo de mídia completo; o MFT guarda a própria referência.
+        // SAFETY: `transform` is valid, has a single output stream (id 0), and
+        // `output` is a complete media type; the MFT retains its own reference.
         unsafe { transform.SetOutputType(0, &output, 0) }
             .map_err(|e| mf_error("SetOutputType", &e))?;
 
-        // SAFETY: sem argumentos; devolve um tipo de mídia vazio, de nossa posse.
+        // SAFETY: takes no arguments and returns a newly owned empty media type.
         let input =
             unsafe { MFCreateMediaType() }.map_err(|e| mf_error("MFCreateMediaType", &e))?;
         set_video_attributes(&input, frame_size, frame_rate)
-            .map_err(|e| mf_error("tipo de entrada", &e))?;
-        // SAFETY: `input` é o tipo de mídia criado acima; GUIDs estáticos.
+            .map_err(|e| mf_error("input media type", &e))?;
+        // SAFETY: `input` is the media type created above; static GUIDs.
         unsafe { input.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_NV12) }
-            .map_err(|e| mf_error("tipo de entrada", &e))?;
-        // SAFETY: `transform` é válido, stream de entrada 0, `input` completo.
+            .map_err(|e| mf_error("input media type", &e))?;
+        // SAFETY: `transform` is valid, input stream 0, and `input` is complete.
         unsafe { transform.SetInputType(0, &input, 0) }
             .map_err(|e| mf_error("SetInputType", &e))?;
 
-        // SAFETY: `transform` válido com tipos de entrada e saída já definidos;
-        // a mensagem não usa o parâmetro (0).
+        // SAFETY: `transform` is valid with both input and output types set;
+        // the message does not use its parameter (`0`).
         unsafe { transform.ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0) }
-            .map_err(|e| mf_error("início do stream", &e))?;
-        // SAFETY: como acima, depois do BEGIN_STREAMING.
+            .map_err(|e| mf_error("stream start", &e))?;
+        // SAFETY: same as above, following `BEGIN_STREAMING`.
         unsafe { transform.ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0) }
-            .map_err(|e| mf_error("início do stream", &e))?;
+            .map_err(|e| mf_error("stream start", &e))?;
 
-        // SAFETY: `transform` válido com tipo de saída definido no stream 0.
+        // SAFETY: `transform` is valid with output type configured on stream 0.
         let sequence_header = unsafe { transform.GetOutputCurrentType(0) }
             .ok()
             .and_then(|current| blob(&current, &MF_MT_MPEG_SEQUENCE_HEADER));
@@ -372,34 +373,34 @@ impl MediaFoundationEncoder {
         })
     }
 
-    /// Processa todos os eventos pendentes, sem bloquear. Saídas vão para
-    /// `self.ready`, pedidos de entrada para `self.pending_input`.
+    /// Drains all pending MFT events without blocking. Encoded frames are
+    /// pushed into `self.ready` and input requests increment `self.pending_input`.
     fn drain_events(&mut self) -> Result<(), CodecError> {
         loop {
-            // SAFETY: `events` é o gerador de eventos do MFT; com NO_WAIT a
-            // chamada não bloqueia e o evento devolvido é de nossa posse.
+            // SAFETY: `events` is the MFT event generator; with `NO_WAIT` the
+            // call does not block and returns an owned event reference.
             let event = match unsafe { self.events.GetEvent(MF_EVENT_FLAG_NO_WAIT) } {
                 Ok(event) => event,
                 Err(e) if e.code() == MF_E_NO_EVENTS_AVAILABLE => return Ok(()),
                 Err(e) => return Err(mf_error("GetEvent", &e)),
             };
-            // SAFETY: `event` é um IMFMediaEvent válido; o tipo volta por valor.
+            // SAFETY: `event` is a valid `IMFMediaEvent`; type is returned by value.
             let kind = unsafe { event.GetType() }.map_err(|e| mf_error("GetType", &e))?;
             if kind == METransformNeedInput.0.cast_unsigned() {
                 self.pending_input += 1;
             } else if kind == METransformHaveOutput.0.cast_unsigned() {
                 self.collect_output()?;
             } else if kind == MEError.0.cast_unsigned() {
-                // SAFETY: `event` é um IMFMediaEvent válido; o HRESULT volta por valor.
+                // SAFETY: `event` is a valid `IMFMediaEvent`; HRESULT is returned by value.
                 let status = unsafe { event.GetStatus() }.unwrap_or_default();
                 return Err(CodecError::Platform(format!(
-                    "o encoder de hardware reportou erro {status:?}"
+                    "hardware encoder reported error {status:?}"
                 )));
             }
         }
     }
 
-    /// Espera, com prazo, até `done` ficar verdadeiro.
+    /// Waits up to [`EVENT_DEADLINE`] until `done` returns `true`.
     fn wait_until(&mut self, done: impl Fn(&Self) -> bool) -> Result<bool, CodecError> {
         let deadline = Instant::now() + EVENT_DEADLINE;
         loop {
@@ -415,7 +416,7 @@ impl MediaFoundationEncoder {
     }
 
     fn collect_output(&mut self) -> Result<(), CodecError> {
-        // SAFETY: `transform` é válido e tem o stream de saída 0; a info volta por valor.
+        // SAFETY: `transform` is valid and has output stream 0; info is returned by value.
         let info = unsafe { self.transform.GetOutputStreamInfo(0) }
             .map_err(|e| mf_error("GetOutputStreamInfo", &e))?;
         let provides_samples =
@@ -423,13 +424,13 @@ impl MediaFoundationEncoder {
         let sample = if provides_samples {
             None
         } else {
-            // SAFETY: sem argumentos; devolve uma amostra vazia, de nossa posse.
+            // SAFETY: takes no arguments and returns an owned empty sample.
             let sample = unsafe { MFCreateSample() }.map_err(|e| mf_error("MFCreateSample", &e))?;
-            // SAFETY: só recebe o tamanho (pelo menos 1 byte); o buffer é de nossa posse.
+            // SAFETY: takes only the buffer size (at least 1 byte) and returns an owned buffer.
             let buffer = unsafe { MFCreateMemoryBuffer(info.cbSize.max(1)) }
                 .map_err(|e| mf_error("MFCreateMemoryBuffer", &e))?;
-            // SAFETY: `sample` e `buffer` são objetos válidos criados acima; a
-            // amostra guarda a própria referência ao buffer.
+            // SAFETY: `sample` and `buffer` are valid objects created above;
+            // the sample retains its own reference to the buffer.
             unsafe { sample.AddBuffer(&buffer) }.map_err(|e| mf_error("AddBuffer", &e))?;
             Some(sample)
         };
@@ -440,11 +441,11 @@ impl MediaFoundationEncoder {
             pEvents: std::mem::ManuallyDrop::new(None),
         }];
         let mut status = 0u32;
-        // SAFETY: `output` tem exatamente um elemento, para o único stream de
-        // saída, com `pSample` nulo quando o MFT fornece as amostras ou com a
-        // nossa amostra caso contrário; `status` é uma variável local. Logo
-        // abaixo `pSample` e `pEvents` são retirados dos ManuallyDrop, então a
-        // referência que o MFT escreve neles é liberada uma única vez.
+        // SAFETY: `output` has a single element for output stream 0, with
+        // `pSample` set to `None` when the MFT allocates samples or to our
+        // preallocated sample otherwise; `status` is a local out-parameter.
+        // Immediately below, `pSample` and `pEvents` are unwrapped from
+        // `ManuallyDrop` so any COM references written by the MFT are released once.
         let result = unsafe {
             self.transform
                 .ProcessOutput(0, &mut output, &raw mut status)
@@ -456,9 +457,10 @@ impl MediaFoundationEncoder {
             Ok(()) => {}
             Err(e) if e.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => return Ok(()),
             Err(e) if e.code() == MF_E_TRANSFORM_STREAM_CHANGE => {
-                // O driver ajustou o formato de saída (Quick Sync faz isso no
-                // primeiro quadro). Como no IronRDP, escolhe de novo o tipo
-                // disponível; a saída volta com um novo METransformHaveOutput.
+                // The driver renegotiated its output format (Quick Sync does
+                // this on the first frame). Select the updated available output
+                // type like IronRDP; the frame will follow on the next
+                // `METransformHaveOutput` event.
                 return self.renegotiate_output();
             }
             Err(e) => return Err(mf_error("ProcessOutput", &e)),
@@ -472,57 +474,56 @@ impl MediaFoundationEncoder {
 
     fn renegotiate_output(&mut self) -> Result<(), CodecError> {
         for index in 0u32.. {
-            // SAFETY: `transform` é válido; um índice além do último só
-            // devolve MF_E_NO_MORE_TYPES, que vira erro aqui.
+            // SAFETY: `transform` is valid; an index past the end returns
+            // `MF_E_NO_MORE_TYPES`, which terminates the loop as an error.
             let candidate = unsafe { self.transform.GetOutputAvailableType(0, index) }
                 .map_err(|e| mf_error("GetOutputAvailableType", &e))?;
-            // SAFETY: `candidate` é um tipo de mídia válido; GUID estático.
+            // SAFETY: `candidate` is a valid media type; static GUID key.
             if unsafe { candidate.GetGUID(&MF_MT_SUBTYPE) }.ok() != Some(MFVideoFormat_H264) {
                 continue;
             }
-            // SAFETY: `transform` válido, stream 0, e `candidate` é um tipo que
-            // o próprio MFT ofereceu.
+            // SAFETY: `transform` is valid, stream 0, and `candidate` was
+            // offered by the MFT itself.
             unsafe { self.transform.SetOutputType(0, &candidate, 0) }
                 .map_err(|e| mf_error("SetOutputType", &e))?;
-            // SAFETY: `transform` válido com tipo de saída recém-definido.
+            // SAFETY: `transform` is valid with output type just configured.
             self.sequence_header = unsafe { self.transform.GetOutputCurrentType(0) }
                 .ok()
                 .and_then(|current| blob(&current, &MF_MT_MPEG_SEQUENCE_HEADER));
             return Ok(());
         }
         Err(CodecError::Platform(
-            "nenhum tipo de saída H.264 após a mudança de formato".into(),
+            "no H.264 output media type after stream change".into(),
         ))
     }
 
     fn frame_from_sample(&mut self, sample: &IMFSample) -> Result<EncodedFrame, CodecError> {
-        // SAFETY: `sample` é uma amostra de saída válida do MFT; o buffer
-        // contíguo devolvido é de nossa posse.
+        // SAFETY: `sample` is a valid output sample from the MFT; returns an owned contiguous buffer.
         let buffer = unsafe { sample.ConvertToContiguousBuffer() }
             .map_err(|e| mf_error("ConvertToContiguousBuffer", &e))?;
         let mut pointer = std::ptr::null_mut();
         let mut length = 0u32;
-        // SAFETY: `buffer` é válido; `pointer` e `length` são variáveis locais
-        // que recebem o início e o tamanho atual dos dados (o máximo não é pedido).
+        // SAFETY: `buffer` is valid; `pointer` and `length` are local
+        // out-parameters receiving the start pointer and current data length.
         unsafe { buffer.Lock(&raw mut pointer, None, Some(&raw mut length)) }
             .map_err(|e| mf_error("Lock", &e))?;
         let mut data = if pointer.is_null() {
             Vec::new()
         } else {
-            // SAFETY: com o Lock bem-sucedido, `pointer` aponta para `length`
-            // bytes inicializados do buffer, que ficam válidos até o Unlock
-            // abaixo; o slice é copiado para um Vec antes disso.
+            // SAFETY: after a successful `Lock`, `pointer` points to `length`
+            // initialized bytes valid until `Unlock` below; the slice is copied
+            // into a `Vec` before unlocking.
             unsafe { std::slice::from_raw_parts(pointer, length as usize) }.to_vec()
         };
-        // SAFETY: desfaz o Lock bem-sucedido acima; nada mais aponta para os dados.
+        // SAFETY: pairs with the successful `Lock` above; no slice references the buffer anymore.
         let _ = unsafe { buffer.Unlock() };
 
-        // SAFETY: `sample` é válido; chave estática e valor devolvido por valor.
+        // SAFETY: `sample` is valid; static GUID key and value returned by value.
         let keyframe = unsafe { sample.GetUINT32(&MFSampleExtension_CleanPoint) }
             .is_ok_and(|clean| clean != 0);
         if keyframe && !contains_sps(&data) {
             if self.sequence_header.is_none() {
-                // SAFETY: `transform` válido com tipo de saída definido no stream 0.
+                // SAFETY: `transform` is valid with output type configured on stream 0.
                 self.sequence_header = unsafe { self.transform.GetOutputCurrentType(0) }
                     .ok()
                     .and_then(|current| blob(&current, &MF_MT_MPEG_SEQUENCE_HEADER));
@@ -542,7 +543,7 @@ impl MediaFoundationEncoder {
         })
     }
 
-    /// Cria a amostra NV12, convertendo direto no buffer da Media Foundation.
+    /// Creates an NV12 input sample, converting BGRA directly into the Media Foundation buffer.
     fn input_sample(&self, frame: RawFrame<'_>) -> Result<IMFSample, CodecError> {
         let (width, height) = (self.width as usize, self.height as usize);
         let nv12_len = width * height * 3 / 2;
@@ -551,37 +552,33 @@ impl MediaFoundationEncoder {
             height: self.height,
         })?;
 
-        // SAFETY: só recebe o tamanho máximo; o buffer é de nossa posse.
+        // SAFETY: takes only the maximum byte length and returns an owned buffer.
         let buffer = unsafe { MFCreateMemoryBuffer(length) }
             .map_err(|e| mf_error("MFCreateMemoryBuffer", &e))?;
         let mut pointer = std::ptr::null_mut();
-        // SAFETY: `buffer` é válido e `pointer` é uma variável local que recebe
-        // o início da memória; tamanhos não são pedidos (None).
+        // SAFETY: `buffer` is valid and `pointer` is a local out-parameter receiving the buffer start.
         unsafe { buffer.Lock(&raw mut pointer, None, None) }.map_err(|e| mf_error("Lock", &e))?;
-        // SAFETY: com o Lock bem-sucedido, `pointer` aponta para pelo menos
-        // `length` (= `nv12_len`) bytes graváveis, só nossos até o Unlock. A
-        // memória vem do alocador da Media Foundation, sem garantia de estar
-        // zerada; `bgra_to_nv12` só escreve nela (cada byte uma vez) e o slice
-        // não sobrevive ao Unlock.
+        // SAFETY: after a successful `Lock`, `pointer` points to at least
+        // `length` (`== nv12_len`) writable bytes exclusively owned by us until
+        // `Unlock`. `bgra_to_nv12` writes every byte before `Unlock`, and
+        // `destination` does not outlive `Unlock`.
         let destination = unsafe { std::slice::from_raw_parts_mut(pointer, nv12_len) };
         bgra_to_nv12(frame.bgra, frame.width as usize, width, height, destination);
-        // SAFETY: desfaz o Lock acima; `destination` não é mais usado.
+        // SAFETY: pairs with `Lock` above; `destination` is not used after this point.
         unsafe { buffer.Unlock() }.map_err(|e| mf_error("Unlock", &e))?;
-        // SAFETY: `length` é igual ao tamanho máximo do buffer e todos os bytes
-        // foram escritos pela conversão.
+        // SAFETY: `length` equals the buffer capacity and all `length` bytes were initialized above.
         unsafe { buffer.SetCurrentLength(length) }.map_err(|e| mf_error("SetCurrentLength", &e))?;
 
-        // SAFETY: sem argumentos; devolve uma amostra vazia, de nossa posse.
+        // SAFETY: takes no arguments and returns an owned empty sample.
         let sample = unsafe { MFCreateSample() }.map_err(|e| mf_error("MFCreateSample", &e))?;
-        // SAFETY: `sample` e `buffer` são válidos; a amostra guarda a própria
-        // referência ao buffer.
+        // SAFETY: `sample` and `buffer` are valid; the sample retains its own reference to `buffer`.
         unsafe { sample.AddBuffer(&buffer) }.map_err(|e| mf_error("AddBuffer", &e))?;
         let time = i64::try_from(self.started.elapsed().as_nanos() / 100).unwrap_or(i64::MAX);
-        // SAFETY: `sample` é válido; o tempo vai por valor.
-        unsafe { sample.SetSampleTime(time) }.map_err(|e| mf_error("tempo da amostra", &e))?;
-        // SAFETY: `sample` é válido; a duração vai por valor.
+        // SAFETY: `sample` is valid; timestamp passed by value.
+        unsafe { sample.SetSampleTime(time) }.map_err(|e| mf_error("sample time", &e))?;
+        // SAFETY: `sample` is valid; duration passed by value.
         unsafe { sample.SetSampleDuration(self.frame_duration_100ns) }
-            .map_err(|e| mf_error("tempo da amostra", &e))?;
+            .map_err(|e| mf_error("sample duration", &e))?;
         Ok(sample)
     }
 }
@@ -604,27 +601,27 @@ impl VideoEncoder for MediaFoundationEncoder {
 
         if !self.wait_until(|encoder| encoder.pending_input > 0)? {
             return Err(CodecError::Platform(
-                "o encoder de hardware parou de pedir quadros".into(),
+                "hardware encoder stopped requesting input frames".into(),
             ));
         }
         let sample = self.input_sample(frame)?;
-        // SAFETY: `transform` está em streaming e pediu entrada
-        // (`pending_input > 0`); `sample` é uma amostra NV12 completa, da qual
-        // o MFT guarda a própria referência.
+        // SAFETY: `transform` is streaming and requested input
+        // (`pending_input > 0`); `sample` is a complete NV12 sample and the MFT
+        // retains its own reference.
         unsafe { self.transform.ProcessInput(0, &sample, 0) }
             .map_err(|e| mf_error("ProcessInput", &e))?;
         self.pending_input -= 1;
 
-        // Espera a saída deste quadro. Se o driver segurar o quadro além do
-        // prazo, ele sai na próxima chamada, junto com o seguinte.
+        // Wait for this frame's output. If the driver holds the frame past the
+        // deadline, it will be drained on the next `encode` call.
         self.wait_until(|encoder| !encoder.ready.is_empty())?;
         Ok(self.ready.drain(..).collect())
     }
 
     fn request_keyframe(&mut self) {
         if let Some(api) = &self.codec_api {
-            // SAFETY: `api` é a ICodecAPI do MFT; GUID estático e VARIANT local
-            // vivo durante a chamada.
+            // SAFETY: `api` is the MFT's `ICodecAPI`; static GUID and local
+            // `VARIANT` alive for the duration of the call.
             let _ =
                 unsafe { api.SetValue(&CODECAPI_AVEncVideoForceKeyFrame, &VARIANT::from(1u32)) };
         }
@@ -633,36 +630,37 @@ impl VideoEncoder for MediaFoundationEncoder {
 
 impl Drop for MediaFoundationEncoder {
     fn drop(&mut self) {
-        // Libera a sessão de hardware: placas de consumo limitam quantas
-        // sessões de encoder podem existir ao mesmo tempo.
-        // SAFETY: `transform` ainda é válido; a mensagem não usa o parâmetro.
+        // Release the hardware encoding session: consumer GPUs cap how many
+        // concurrent encoder sessions can exist at the same time.
+        // SAFETY: `transform` is still valid; the message does not use its parameter.
         let _ = unsafe {
             self.transform
                 .ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0)
         };
-        // SAFETY: como acima.
+        // SAFETY: same as above.
         let _ = unsafe {
             self.transform
                 .ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING, 0)
         };
-        // SAFETY: `activate` é o objeto que criou o MFT; depois disto nenhum
-        // método do MFT é chamado, os campos só soltam suas referências.
+        // SAFETY: `activate` created the MFT; no MFT methods are called after
+        // this point, and struct fields only release their COM references.
         let _ = unsafe { self.activate.ShutdownObject() };
     }
 }
 
 fn blob(attributes: &IMFMediaType, key: &GUID) -> Option<Vec<u8>> {
-    // SAFETY: `attributes` é um tipo de mídia válido e `key` um GUID vivo.
+    // SAFETY: `attributes` is a valid media type and `key` is a valid GUID.
     let size = unsafe { attributes.GetBlobSize(key) }.ok()?;
     let mut data = vec![0u8; size as usize];
-    // SAFETY: o windows-rs passa ponteiro e tamanho de `data` juntos, e
-    // `data` tem exatamente o tamanho informado pelo GetBlobSize.
+    // SAFETY: `windows-rs` passes both the pointer and length of `data`, which
+    // matches the exact byte size returned by `GetBlobSize`.
     unsafe { attributes.GetBlob(key, &mut data, None) }.ok()?;
     Some(data)
 }
 
-/// Procura uma NAL SPS (tipo 7) no bitstream Annex B. A prevenção de emulação
-/// do H.264 impede `00 00 01` dentro de uma NAL, então a busca é segura.
+/// Checks whether an Annex B bitstream contains an SPS NAL unit (type 7).
+/// H.264 emulation prevention forbids `00 00 01` inside a NAL payload, so a
+/// byte-window scan is exact.
 fn contains_sps(data: &[u8]) -> bool {
     data.windows(4)
         .any(|w| w[..3] == [0, 0, 1] && w[3] & 0x1F == 7)
@@ -681,18 +679,19 @@ mod tests {
         assert!(!contains_sps(&[0, 0, 0, 1, 0x65, 0x88]));
     }
 
-    /// Codifica no hardware e decodifica com OpenH264: todo quadro enviado
-    /// precisa sair e ser decodificado, e a imagem precisa bater. Sem GPU
-    /// (como no CI), o teste só confere que o erro é "hardware indisponível".
+    /// Encodes on hardware and decodes with OpenH264: every submitted frame
+    /// must come out and decode cleanly. On machines without a hardware GPU
+    /// (such as CI runners), verifies that [`CodecError::HardwareUnavailable`]
+    /// is returned.
     #[test]
     fn hardware_round_trip_when_available() {
-        // 641x361: dimensões ímpares de propósito.
+        // 641x361: intentionally odd dimensions.
         let (width, height) = (641_u32, 361_u32);
         let encoder = super::MediaFoundationEncoder::new(width, height, EncoderSettings::default());
         let mut encoder = match encoder {
             Ok(encoder) => encoder,
             Err(CodecError::HardwareUnavailable) => return,
-            Err(error) => panic!("encoder de hardware falhou: {error}"),
+            Err(error) => panic!("hardware encoder failed: {error}"),
         };
         let mut decoder = OpenH264Decoder::new().unwrap();
         let mut bgra = vec![0u8; (width * height * 4) as usize];
@@ -700,7 +699,7 @@ mod tests {
         let mut decoded = 0;
         let mut last_image = None;
         for round in 0..60u32 {
-            // Uma faixa vertical que anda: todo quadro muda.
+            // Moving vertical stripe so every frame changes.
             for (index, pixel) in bgra.as_chunks_mut::<4>().0.iter_mut().enumerate() {
                 let x = u32::try_from(index).unwrap() % width;
                 let value = if (x + round * 8) % 128 < 64 { 230 } else { 30 };
@@ -724,11 +723,11 @@ mod tests {
         }
         assert!(
             decoded + 2 >= sent,
-            "só {decoded} de {sent} quadros saíram decodificados"
+            "only {decoded} of {sent} frames were decoded"
         );
         let image = last_image.unwrap();
-        // Pixel no meio de uma faixa clara ou escura: conferir que não virou cinza.
+        // Pixel inside a bright or dark stripe: verify it did not wash out to gray.
         let [_, red, _, _] = image.xrgb[(180 * 640 + 10) as usize].to_be_bytes();
-        assert!(!(60..200).contains(&red), "imagem degradada: {red}");
+        assert!(!(60..200).contains(&red), "degraded image: {red}");
     }
 }

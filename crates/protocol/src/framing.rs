@@ -1,33 +1,33 @@
-//! Enquadramento de mensagens em streams: tamanho em varint + Envelope.
+//! Stream message framing: varint length prefix followed by an `Envelope`.
 
 use bytes::{Buf, BytesMut};
 use prost::Message;
 
 use crate::v1::Envelope;
 
-/// Tamanho máximo de um quadro. Protege contra um peer que anuncia um tamanho
-/// gigante para esgotar a memória.
+/// Maximum encoded size of a single frame. Protects against a peer that
+/// advertises an oversized frame to exhaust memory.
 pub const MAX_FRAME_LEN: usize = 16 * 1024 * 1024;
 
-/// Erros de enquadramento.
+/// Framing errors.
 #[derive(Debug, thiserror::Error)]
 pub enum FramingError {
-    /// O peer anunciou um quadro maior que [`MAX_FRAME_LEN`].
-    #[error("quadro de {len} bytes excede o limite de {MAX_FRAME_LEN}")]
+    /// The peer advertised a frame larger than [`MAX_FRAME_LEN`].
+    #[error("frame of {len} bytes exceeds the {MAX_FRAME_LEN}-byte limit")]
     TooLarge {
-        /// Tamanho anunciado.
+        /// Advertised byte length.
         len: usize,
     },
-    /// O conteúdo do quadro não é um `Envelope` válido.
-    #[error("mensagem inválida: {0}")]
+    /// The frame payload is not a valid `Envelope`.
+    #[error("invalid message: {0}")]
     Decode(#[from] prost::DecodeError),
 }
 
-/// Codifica um `Envelope` com o prefixo de tamanho, pronto para o stream.
+/// Encodes an `Envelope` with its varint length prefix, ready to be written to a stream.
 ///
 /// # Errors
 ///
-/// Retorna [`FramingError::TooLarge`] se a mensagem passar de [`MAX_FRAME_LEN`].
+/// Returns [`FramingError::TooLarge`] if the encoded message exceeds [`MAX_FRAME_LEN`].
 pub fn encode_frame(envelope: &Envelope, dst: &mut BytesMut) -> Result<(), FramingError> {
     let len = envelope.encoded_len();
     if len > MAX_FRAME_LEN {
@@ -39,30 +39,30 @@ pub fn encode_frame(envelope: &Envelope, dst: &mut BytesMut) -> Result<(), Frami
         .map_err(|_| FramingError::TooLarge { len })
 }
 
-/// Acumula bytes recebidos e devolve os `Envelope`s completos.
+/// Accumulates received bytes and yields complete `Envelope` frames.
 #[derive(Debug, Default)]
 pub struct FrameDecoder {
     buffer: BytesMut,
 }
 
 impl FrameDecoder {
-    /// Cria um decodificador vazio.
+    /// Creates an empty decoder.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Adiciona bytes recebidos da rede.
+    /// Appends bytes received from the network.
     pub fn extend(&mut self, data: &[u8]) {
         self.buffer.extend_from_slice(data);
     }
 
-    /// Devolve o próximo `Envelope` completo, ou `None` se ainda faltam bytes.
+    /// Returns the next complete `Envelope`, or `None` if more bytes are needed.
     ///
     /// # Errors
     ///
-    /// Retorna erro se o tamanho anunciado passar do limite ou se o conteúdo
-    /// for inválido. Depois de um erro, a conexão deve ser encerrada.
+    /// Returns an error if the advertised length exceeds the limit or if the
+    /// payload is malformed. After an error, the connection must be closed.
     pub fn next_frame(&mut self) -> Result<Option<Envelope>, FramingError> {
         let Some((len, prefix_len)) = peek_length(&self.buffer)? else {
             return Ok(None);
@@ -76,15 +76,15 @@ impl FrameDecoder {
     }
 }
 
-/// Lê o varint de tamanho sem consumir o buffer. Devolve o tamanho e quantos
-/// bytes o próprio varint ocupa.
+/// Reads the varint length prefix without consuming the buffer. Returns the
+/// decoded payload length and the number of bytes occupied by the varint itself.
 fn peek_length(buffer: &[u8]) -> Result<Option<(usize, usize)>, FramingError> {
-    // Um varint de até 10 bytes cobre u64; esperar mais bytes se o varint
-    // ainda não terminou.
+    // A varint of up to 10 bytes covers u64; wait for more bytes if the varint
+    // is not yet terminated.
     let terminated = buffer.iter().take(10).any(|byte| byte & 0x80 == 0);
     if !terminated {
         if buffer.len() >= 10 {
-            return Err(prost::DecodeError::new("varint de tamanho inválido").into());
+            return Err(prost::DecodeError::new("invalid length varint").into());
         }
         return Ok(None);
     }

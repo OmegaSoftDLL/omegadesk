@@ -1,4 +1,4 @@
-//! Estado compartilhado entre a rede, o decoder e a janela.
+//! State shared between the network task, the decoder thread, and the window.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use omegadesk_codec::DecodedImage;
 
-/// Último quadro decodificado, com as medições de latência dele.
+/// Most recently decoded video frame along with its per-stage latency measurements.
 #[derive(Debug)]
 pub(crate) struct LatestFrame {
     pub(crate) image: DecodedImage,
@@ -22,7 +22,7 @@ struct Inner {
     status: Mutex<String>,
 }
 
-/// Estado compartilhado (barato de clonar).
+/// Cheaply cloneable handle to shared client state.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Shared(Arc<Inner>);
 
@@ -61,7 +61,7 @@ impl Shared {
     }
 }
 
-/// Média móvel simples das medições mostradas na barra de título.
+/// Sliding window accumulator for latency metrics displayed in the window title bar.
 #[derive(Debug, Default)]
 pub(crate) struct Meter {
     frames: u32,
@@ -71,7 +71,7 @@ pub(crate) struct Meter {
     window_start: Option<Instant>,
 }
 
-/// Resumo de uma janela de medição.
+/// Average latency breakdown over a measurement window.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Summary {
     pub(crate) fps: f64,
@@ -96,7 +96,7 @@ impl Meter {
         self.render += render;
     }
 
-    /// Devolve o resumo a cada `period` e zera o acumulado.
+    /// Returns the window summary once `period` has elapsed and resets the accumulator.
     pub(crate) fn summary(&mut self, period: Duration, rtt: Duration) -> Option<Summary> {
         let start = self.window_start?;
         let elapsed = start.elapsed();

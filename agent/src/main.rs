@@ -1,14 +1,15 @@
-//! Agente do OmegaDesk: captura a tela, codifica e envia ao cliente; recebe
-//! teclado e mouse e injeta na sessão local.
+//! OmegaDesk agent: captures the screen, encodes video, and streams it to the
+//! client; receives remote keyboard and pointer events and injects them into
+//! the local session.
 //!
-//! Uso (Fase 1, rede local):
+//! Usage (Phase 1, local network):
 //!
 //! ```text
 //! omegadesk-agent --listen 0.0.0.0:7070
 //! ```
 //!
-//! O agente mostra a impressão digital do certificado e a senha de acesso; o
-//! cliente precisa das duas para conectar.
+//! On startup the agent prints its TLS certificate fingerprint and access
+//! password; the client requires both to connect.
 
 mod capture_loop;
 mod password;
@@ -28,37 +29,37 @@ use crate::capture_loop::EncoderChoice;
 use crate::session::SessionConfig;
 
 #[derive(Debug, Parser)]
-#[command(version, about = "Agente do OmegaDesk")]
+#[command(version, about = "OmegaDesk remote desktop agent")]
 struct Args {
-    /// Endereço e porta em que o agente aceita conexões.
+    /// Address and UDP port on which the agent listens for connections.
     #[arg(long, default_value = "0.0.0.0:7070")]
     listen: SocketAddr,
 
-    /// Monitor a compartilhar (0 é o principal).
+    /// Monitor index to share (`0` is the primary monitor).
     #[arg(long, default_value_t = 0)]
     display: u32,
 
-    /// Encoder de vídeo.
+    /// Video encoder selection.
     #[arg(long, value_enum, default_value_t = EncoderChoice::Auto)]
     encoder: EncoderChoice,
 
-    /// Taxa de vídeo em megabits por segundo.
+    /// Target video bitrate in megabits per second.
     #[arg(long, default_value_t = 8)]
     bitrate_mbps: u32,
 
-    /// Quadros por segundo máximos.
+    /// Maximum frame rate in frames per second.
     #[arg(long, default_value_t = 60.0)]
     fps: f32,
 
-    /// Senha de acesso fixa. Sem ela, uma senha aleatória é gerada a cada início.
+    /// Fixed access password. If omitted, a random one-time password is generated on startup.
     #[arg(long, env = "OMEGADESK_PASSWORD")]
     password: Option<String>,
 
-    /// Não injeta teclado e mouse (só compartilha a tela).
+    /// Share the screen only; ignore remote keyboard and mouse input.
     #[arg(long)]
     no_input: bool,
 
-    /// Nome desta máquina mostrado ao cliente.
+    /// Machine name displayed to the connected client.
     #[arg(long, default_value = "omegadesk-agent")]
     name: String,
 }
@@ -77,15 +78,15 @@ async fn main() -> anyhow::Result<()> {
 
     let password = match args.password {
         Some(password) if password.len() >= 8 => password,
-        Some(_) => anyhow::bail!("a senha precisa ter pelo menos 8 caracteres"),
+        Some(_) => anyhow::bail!("the access password must be at least 8 characters long"),
         None => password::generate(),
     };
-    // Identidade persistente do dispositivo: o mesmo ID a cada início.
-    let store = omegadesk_identity::default_store("agent")
-        .context("não foi possível abrir o cofre de chaves")?;
+    // Persistent device identity: keeps the same DeviceId across restarts.
+    let store =
+        omegadesk_identity::default_store("agent").context("failed to open device key store")?;
     let identity = omegadesk_identity::DeviceIdentity::load_or_create(store.as_ref())
-        .context("não foi possível carregar a identidade do dispositivo")?;
-    info!("ID do dispositivo: {}", identity.id());
+        .context("failed to load or create device identity")?;
+    info!("device ID: {}", identity.id());
 
     let config = Arc::new(SessionConfig {
         device_public_key: identity.public().signing_key_bytes(),
@@ -101,25 +102,25 @@ async fn main() -> anyhow::Result<()> {
     });
 
     let (endpoint, fingerprint) =
-        server_endpoint(args.listen).context("não foi possível abrir a porta do agente")?;
-    info!("agente ouvindo em {}", endpoint.local_addr()?);
-    info!("impressão digital: {fingerprint}");
-    info!("senha de acesso: {}", config.password);
+        server_endpoint(args.listen).context("failed to bind agent QUIC endpoint")?;
+    info!("agent listening on {}", endpoint.local_addr()?);
+    info!("certificate fingerprint: {fingerprint}");
+    info!("access password: {}", config.password);
 
-    // Fase 1: uma sessão por vez. Sessões simultâneas entram com o multiplexador.
+    // Phase 1 serves one session at a time; concurrent session multiplexing lands in Phase 3.
     while let Some(incoming) = endpoint.accept().await {
         let connection = match incoming.await {
             Ok(connection) => connection,
             Err(error) => {
-                warn!("conexão recusada: {error}");
+                warn!("connection rejected: {error}");
                 continue;
             }
         };
         let remote = connection.remote_address();
-        info!("cliente conectado: {remote}");
+        info!("client connected: {remote}");
         match session::run(connection, config.clone()).await {
-            Ok(()) => info!("sessão encerrada: {remote}"),
-            Err(error) => warn!("sessão com {remote} terminou: {error:#}"),
+            Ok(()) => info!("session ended: {remote}"),
+            Err(error) => warn!("session with {remote} ended with error: {error:#}"),
         }
     }
     Ok(())

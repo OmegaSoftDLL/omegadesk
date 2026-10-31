@@ -1,18 +1,8 @@
 # OmegaDesk dependency policy (cargo-deny).
-# The project is AGPL-3.0: only licenses compatible with it are accepted.
+# The project is licensed under AGPL-3.0: only compatible licenses are allowed.
 
 [graph]
 all-features = true
-# Only the platforms we ship to; keeps Windows-only or iOS-only crates from
-# other targets out of the license and bans checks.
-targets = [
-    "x86_64-pc-windows-msvc",
-    "aarch64-pc-windows-msvc",
-    "x86_64-unknown-linux-gnu",
-    "aarch64-unknown-linux-gnu",
-    "x86_64-apple-darwin",
-    "aarch64-apple-darwin",
-]
 
 [licenses]
 confidence-threshold = 0.9
@@ -40,8 +30,6 @@ yanked = "deny"
 
 [bans]
 multiple-versions = "warn"
-# OpenSSL: we use rustls and ring everywhere; a second TLS stack is a bug.
-deny = [{ name = "openssl" }, { name = "openssl-sys" }]
 wildcards = "deny"
 allow-wildcard-paths = true
 

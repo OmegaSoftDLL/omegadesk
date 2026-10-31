@@ -1,17 +1,18 @@
-//! Protocolo de sessão do OmegaDesk.
+//! OmegaDesk session protocol.
 //!
-//! As mensagens são definidas em `proto/omegadesk/v1/session.proto` e geradas
-//! com `prost`. Este crate também define o enquadramento usado nos streams:
-//! cada [`Envelope`](v1::Envelope) é precedido do tamanho em varint.
+//! Messages are defined in `proto/omegadesk/v1/session.proto` and generated
+//! with `prost`. This crate also defines stream framing: each
+//! [`Envelope`](v1::Envelope) is prefixed by its byte length encoded as a
+//! protobuf varint.
 
 mod framing;
 
 pub use framing::{FrameDecoder, FramingError, MAX_FRAME_LEN, encode_frame};
 
-/// Versão atual do protocolo, enviada em `Hello` e `HelloAck`.
+/// Current wire protocol version sent in `Hello` and `HelloAck`.
 pub const PROTOCOL_VERSION: u32 = 1;
 
-/// Mensagens da versão 1 do protocolo.
+/// Version 1 protocol messages.
 #[allow(
     missing_docs,
     unreachable_pub,
@@ -22,8 +23,8 @@ pub mod v1 {
     include!(concat!(env!("OUT_DIR"), "/omegadesk.v1.rs"));
 }
 
-/// Escolhe o codec da sessão: o primeiro da lista de preferência do host que o
-/// cliente consegue decodificar.
+/// Selects the session codec: the first entry in the host's preference list
+/// that the client is able to decode.
 #[must_use]
 pub fn negotiate_codec(
     host_encoders: &[v1::VideoCodec],

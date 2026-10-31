@@ -1,10 +1,10 @@
-//! Injeção com `SendInput` no Windows.
+//! Windows input injection using `SendInput`.
 //!
-//! Referências: `RustDesk` (`src/server/input_service.rs`, teclas presas e
-//! `libs/enigo/src/win/win_impl.rs`, área de trabalho virtual) e Apollo
-//! (`src/platform/windows/input.cpp`, Pause via tecla virtual).
+//! References: `RustDesk` (`src/server/input_service.rs` for releasing stuck
+//! keys and `libs/enigo/src/win/win_impl.rs` for virtual desktop coordinates)
+//! and Apollo (`src/platform/windows/input.cpp` for `VK_PAUSE`).
 
-#![allow(unsafe_code, reason = "SendInput é uma API Win32")]
+#![allow(unsafe_code, reason = "SendInput is a Win32 API")]
 
 use std::collections::BTreeSet;
 
@@ -23,15 +23,15 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use crate::{InputError, InputInjector, TargetDisplay, buttons, hid_to_scancode};
 
-/// `XBUTTON1` e `XBUTTON2` do Win32.
+/// Win32 `XBUTTON1` and `XBUTTON2` values.
 const XBUTTON1: i32 = 1;
 const XBUTTON2: i32 = 2;
 
-/// Código HID da tecla Pause/Break, que não tem scancode simples.
+/// USB HID usage code for Pause/Break, which has no single Set 1 scancode.
 const HID_PAUSE: u32 = 0x48;
 
-/// Marca os eventos injetados pelo OmegaDesk, para distinguir da entrada local
-/// (o `enigo` do `RustDesk` faz o mesmo).
+/// Marks events injected by OmegaDesk so hooks can distinguish them from local
+/// hardware input (matching RustDesk's `enigo` marker).
 const INJECTED_MARKER: usize = 0x4F4D_4547; // "OMEG"
 
 #[derive(Debug, Default)]
@@ -46,9 +46,9 @@ fn send(inputs: &[INPUT]) -> Result<(), InputError> {
         return Ok(());
     }
     let size = i32::try_from(size_of::<INPUT>()).map_err(|_| InputError::Rejected)?;
-    // SAFETY: `inputs` é um slice vivo de INPUTs totalmente inicializados (o
-    // tamanho vai junto, pelo windows-rs) e `size` é o `size_of::<INPUT>()`
-    // que a API exige; o SendInput só lê o slice.
+    // SAFETY: `inputs` is a valid slice of fully initialized `INPUT` structs
+    // (`windows-rs` passes both the pointer and length) and `size` equals
+    // `size_of::<INPUT>()` as required by `SendInput`, which only reads the slice.
     let sent = unsafe { SendInput(inputs, size) };
     if sent as usize == inputs.len() {
         Ok(())
@@ -75,7 +75,7 @@ fn mouse(flags: MOUSE_EVENT_FLAGS, dx: i32, dy: i32, data: i32) -> INPUT {
 
 fn keyboard(usage: u32, pressed: bool) -> Option<INPUT> {
     let (virtual_key, scan, mut flags) = if usage == HID_PAUSE {
-        // Pause gera uma sequência E1 1D 45; pela tecla virtual o Windows a monta.
+        // Pause generates an `E1 1D 45` sequence; sending `VK_PAUSE` lets Windows synthesize it.
         (VK_PAUSE, 0, KEYBD_EVENT_FLAGS(0))
     } else {
         let scancode = hid_to_scancode(usage)?;
@@ -102,23 +102,23 @@ fn keyboard(usage: u32, pressed: bool) -> Option<INPUT> {
     })
 }
 
-/// Converte a posição normalizada (0..=65535 no monitor alvo) para as
-/// coordenadas absolutas da área de trabalho virtual que o `SendInput` usa com
-/// `MOUSEEVENTF_VIRTUALDESK` (0..=65535 sobre todos os monitores).
+/// Converts normalized monitor coordinates (`0..=65535` within `target`) into
+/// the absolute virtual desktop coordinates (`0..=65535` across all monitors)
+/// expected by `SendInput` when `MOUSEEVENTF_VIRTUALDESK` is set.
 fn virtual_desk_position(target: TargetDisplay, x: u32, y: u32) -> (i32, i32) {
-    // SAFETY: índice SM_XVIRTUALSCREEN válido, sem ponteiros; erro devolve 0.
+    // SAFETY: valid `SM_XVIRTUALSCREEN` index, no pointers; returns 0 on failure.
     let left = unsafe { GetSystemMetrics(SM_XVIRTUALSCREEN) };
-    // SAFETY: índice SM_YVIRTUALSCREEN válido, sem ponteiros.
+    // SAFETY: valid `SM_YVIRTUALSCREEN` index, no pointers.
     let top = unsafe { GetSystemMetrics(SM_YVIRTUALSCREEN) };
-    // SAFETY: índice SM_CXVIRTUALSCREEN válido, sem ponteiros.
+    // SAFETY: valid `SM_CXVIRTUALSCREEN` index, no pointers.
     let width = unsafe { GetSystemMetrics(SM_CXVIRTUALSCREEN) }.max(1);
-    // SAFETY: índice SM_CYVIRTUALSCREEN válido, sem ponteiros.
+    // SAFETY: valid `SM_CYVIRTUALSCREEN` index, no pointers.
     let height = unsafe { GetSystemMetrics(SM_CYVIRTUALSCREEN) }.max(1);
     let axis = |normalized: u32, origin: i32, extent: u32, desk_origin: i32, desk_extent: i32| {
         let pixel =
             i64::from(origin) + i64::from(normalized.min(65_535)) * i64::from(extent) / 65_536;
         let relative = (pixel - i64::from(desk_origin)).clamp(0, i64::from(desk_extent) - 1);
-        // Centro do pixel, para não cair no vizinho por arredondamento.
+        // Aim at the center of the pixel to avoid rounding into an adjacent pixel.
         let scaled = (relative * 65_535 + 32_767) / i64::from((desk_extent - 1).max(1));
         i32::try_from(scaled.clamp(0, 65_535)).unwrap_or(65_535)
     };
@@ -139,7 +139,7 @@ impl WindowsInjector {
                     dy,
                 )
             }
-            // Sem alvo definido: monitor principal, 0..=65535.
+            // No target display set: map directly to the primary monitor (0..=65535).
             None => (
                 MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE,
                 i32::try_from(x.min(65_535)).unwrap_or(65_535),
@@ -208,7 +208,7 @@ impl InputInjector for WindowsInjector {
             inputs.push(mouse(MOUSEEVENTF_HWHEEL, 0, 0, event.wheel_x));
         }
         send(&inputs)?;
-        // Só depois do envio: se falhar, a próxima tentativa refaz a transição.
+        // Update state only after `SendInput` succeeds so a rejected event can be retried.
         self.pressed_buttons = event.buttons;
         Ok(())
     }
@@ -239,8 +239,7 @@ impl InputInjector for WindowsInjector {
 
 impl Drop for WindowsInjector {
     fn drop(&mut self) {
-        // Sessão caiu com Ctrl, Shift ou botão apertado: solta tudo na máquina
-        // remota para nada ficar preso.
+        // Release any held keys or mouse buttons if the session drops while Ctrl/Shift/etc. are pressed.
         self.release_all();
     }
 }
@@ -252,8 +251,7 @@ mod tests {
     #[test]
     fn pause_uses_virtual_key() {
         let input = keyboard(0x48, true).unwrap();
-        // SAFETY: `keyboard` monta um INPUT_KEYBOARD escrevendo o campo `ki`
-        // da união, então é ele que está inicializado.
+        // SAFETY: `keyboard` builds an `INPUT_KEYBOARD` by initializing the `ki` union variant.
         let key = unsafe { input.Anonymous.ki };
         assert_eq!(key.wVk.0, 0x13);
         assert_eq!(key.wScan, 0);
@@ -262,8 +260,7 @@ mod tests {
     #[test]
     fn letters_use_scancode() {
         let input = keyboard(0x04, false).unwrap();
-        // SAFETY: `keyboard` monta um INPUT_KEYBOARD escrevendo o campo `ki`
-        // da união, então é ele que está inicializado.
+        // SAFETY: `keyboard` builds an `INPUT_KEYBOARD` by initializing the `ki` union variant.
         let key = unsafe { input.Anonymous.ki };
         assert_eq!(key.wScan, 0x1E);
         assert_ne!(key.dwFlags.0 & 0x2, 0, "KEYEVENTF_KEYUP");

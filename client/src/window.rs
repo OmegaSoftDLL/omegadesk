@@ -1,4 +1,4 @@
-//! Janela do cliente: desenha o quadro mais recente e captura teclado e mouse.
+//! Client window: presents the latest decoded frame and captures keyboard and pointer input.
 
 use std::num::NonZeroU32;
 use std::rc::Rc;
@@ -20,17 +20,17 @@ use winit::window::{Window, WindowId};
 use crate::keymap::keycode_to_hid;
 use crate::stats::{LatestFrame, Meter, Shared};
 
-/// Intervalo de atualização da barra de título.
+/// Title bar latency summary refresh interval.
 const TITLE_PERIOD: Duration = Duration::from_millis(500);
 
-/// Eventos enviados à janela pelas outras threads.
+/// Custom events sent to the window event loop by background threads.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum UserEvent {
-    /// Há um quadro novo para desenhar.
+    /// A newly decoded frame is ready to be drawn.
     Frame,
-    /// O texto de status mudou.
+    /// The connection status string changed.
     Status,
-    /// A conexão terminou.
+    /// The session ended.
     Disconnected,
 }
 
@@ -109,7 +109,7 @@ impl App {
         }
         let normalize = |position: f64, extent: u32| -> u32 {
             let ratio = (position / f64::from(extent)).clamp(0.0, 1.0);
-            // 0.0..=1.0 vezes 65535 cabe em u32 sem perda de sinal.
+            // `0.0..=1.0 * 65535.0` fits in `u32` without sign or precision loss.
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             let scaled = (ratio * 65_535.0).round() as u32;
             scaled
@@ -147,19 +147,19 @@ impl App {
             return;
         };
         if let Err(error) = graphics.surface.resize(width, height) {
-            warn!("não foi possível redimensionar a superfície: {error}");
+            warn!("failed to resize window surface: {error}");
             return;
         }
         let mut buffer = match graphics.surface.buffer_mut() {
             Ok(buffer) => buffer,
             Err(error) => {
-                warn!("superfície indisponível: {error}");
+                warn!("window surface buffer unavailable: {error}");
                 return;
             }
         };
         scale_nearest(&frame.image, &mut buffer, size.width, size.height);
         if let Err(error) = buffer.present() {
-            warn!("falha ao apresentar o quadro: {error}");
+            warn!("failed to present frame: {error}");
             return;
         }
 
@@ -172,7 +172,7 @@ impl App {
             let ms = |d: Duration| d.as_secs_f64() * 1000.0;
             let image = &frame.image;
             self.update_title(&format!(
-                " — {}x{} {:.0} fps — host {:.1} ms · rede {:.1} ms · decod {:.1} ms · desenho {:.1} ms · total {:.1} ms",
+                " — {}x{} {:.0} fps — host {:.1} ms · net {:.1} ms · decode {:.1} ms · draw {:.1} ms · total {:.1} ms",
                 image.width,
                 image.height,
                 summary.fps,
@@ -186,7 +186,7 @@ impl App {
     }
 }
 
-/// Redimensiona a imagem para o tamanho da janela (vizinho mais próximo).
+/// Nearest-neighbor scaling of `image` into the `width`x`height` window buffer.
 fn scale_nearest(
     image: &omegadesk_codec::DecodedImage,
     target: &mut [u32],
@@ -232,13 +232,13 @@ impl ApplicationHandler<UserEvent> for App {
             .with_inner_size(LogicalSize::new(1280.0, 720.0));
         let created = event_loop
             .create_window(attributes)
-            .map_err(|e| anyhow!("janela: {e}"))
+            .map_err(|e| anyhow!("window: {e}"))
             .and_then(|window| {
                 let window = Rc::new(window);
                 let context =
-                    Context::new(window.clone()).map_err(|e| anyhow!("superfície: {e}"))?;
-                let surface = Surface::new(&context, window.clone())
-                    .map_err(|e| anyhow!("superfície: {e}"))?;
+                    Context::new(window.clone()).map_err(|e| anyhow!("surface context: {e}"))?;
+                let surface =
+                    Surface::new(&context, window.clone()).map_err(|e| anyhow!("surface: {e}"))?;
                 Ok(Graphics { window, surface })
             });
         match created {
@@ -263,7 +263,7 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::Status => self.update_title(""),
             UserEvent::Disconnected => {
                 let status = self.shared.status();
-                if status.starts_with("erro") {
+                if status.starts_with("error") {
                     self.error = Some(anyhow!(status));
                 }
                 event_loop.exit();
@@ -273,7 +273,7 @@ impl ApplicationHandler<UserEvent> for App {
 
     #[allow(
         clippy::wildcard_enum_match_arm,
-        reason = "a janela recebe dezenas de eventos que não interessam"
+        reason = "winit emits dozens of window events that the client does not handle"
     )]
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         match event {
@@ -300,7 +300,7 @@ impl ApplicationHandler<UserEvent> for App {
                 #[allow(
                     clippy::cast_possible_truncation,
                     clippy::cast_precision_loss,
-                    reason = "deltas de rolagem são pequenos"
+                    reason = "scroll deltas are small"
                 )]
                 let (x, y) = match delta {
                     MouseScrollDelta::LineDelta(x, y) => (
@@ -337,9 +337,9 @@ impl ApplicationHandler<UserEvent> for App {
                     modifiers: 0,
                 }));
             }
-            // Ao perder o foco (Alt+Tab, clique fora), solta tudo que estava
-            // apertado, como o `raiseAllKeys` do Moonlight: senão Alt ou Ctrl
-            // ficariam presos na máquina remota.
+            // When the window loses focus (Alt+Tab or clicking outside), release
+            // every held key and button (matching Moonlight's `raiseAllKeys`) so
+            // modifiers like Alt or Ctrl never get stuck on the remote machine.
             WindowEvent::Focused(false) => self.release_all(),
             _ => {}
         }

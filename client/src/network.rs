@@ -1,5 +1,5 @@
-//! Conexão com o agente, numa thread com runtime tokio, e decodificação numa
-//! thread própria.
+//! Background QUIC session task (running on its own Tokio runtime) and
+//! dedicated video decoder thread.
 
 use std::net::SocketAddr;
 use std::sync::mpsc as std_mpsc;
@@ -19,14 +19,15 @@ use winit::event_loop::EventLoopProxy;
 use crate::stats::{LatestFrame, Shared};
 use crate::window::UserEvent;
 
-/// Intervalo entre pings de medição de latência.
+/// Interval between round-trip latency probes.
 const PING_INTERVAL: Duration = Duration::from_millis(500);
 
-/// Quadros esperando o decoder. Mais que isso vira atraso: descarta e pede
-/// keyframe (o Moonlight usa uma fila de 3, `pacer.cpp`).
+/// Maximum encoded frames queued for the decoder. Anything beyond this adds
+/// latency, so we drop and request a keyframe (Moonlight uses a 3-frame queue
+/// in `pacer.cpp`).
 const DECODE_QUEUE: usize = 3;
 
-/// Intervalo mínimo entre pedidos de keyframe, para não inundar o agente.
+/// Minimum interval between keyframe requests to avoid flooding the agent.
 const KEYFRAME_REQUEST_INTERVAL: Duration = Duration::from_millis(250);
 
 fn unix_micros() -> u64 {
@@ -35,18 +36,18 @@ fn unix_micros() -> u64 {
         .map_or(0, |d| u64::try_from(d.as_micros()).unwrap_or(u64::MAX))
 }
 
-/// Dados para conectar ao agente.
+/// Connection parameters for reaching the remote agent.
 #[derive(Debug, Clone)]
 pub(crate) struct Target {
-    /// Chave pública de assinatura deste dispositivo, enviada no `Hello`.
+    /// Ed25519 signing public key of this client device, sent in `Hello`.
     pub(crate) device_public_key: [u8; 32],
     pub(crate) address: SocketAddr,
     pub(crate) fingerprint: String,
     pub(crate) password: String,
 }
 
-/// Inicia a conexão em segundo plano. Devolve o canal para enviar mensagens
-/// de controle (teclado, mouse) ao agente.
+/// Spawns the background network thread and returns the channel used to send
+/// control messages (keyboard, pointer, keyframe requests) to the agent.
 pub(crate) fn start(
     target: Target,
     shared: Shared,
@@ -62,7 +63,7 @@ pub(crate) fn start(
         {
             Ok(runtime) => runtime,
             Err(error) => {
-                shared.set_status(format!("erro: {error}"));
+                shared.set_status(format!("error: {error}"));
                 let _ = proxy.send_event(UserEvent::Disconnected);
                 return;
             }
@@ -75,8 +76,8 @@ pub(crate) fn start(
             requests,
         ));
         let status = match result {
-            Ok(()) => "desconectado".to_owned(),
-            Err(error) => format!("erro: {error:#}"),
+            Ok(()) => "disconnected".to_owned(),
+            Err(error) => format!("error: {error:#}"),
         };
         warn!("{status}");
         shared.set_status(status);
@@ -92,11 +93,11 @@ async fn run(
     mut control_rx: mpsc::UnboundedReceiver<Envelope>,
     requests: mpsc::UnboundedSender<Envelope>,
 ) -> anyhow::Result<()> {
-    shared.set_status(format!("conectando a {}…", target.address));
+    shared.set_status(format!("connecting to {}…", target.address));
     let _ = proxy.send_event(UserEvent::Status);
     let (_endpoint, connection) = connect(target.address, &target.fingerprint)
         .await
-        .context("não foi possível conectar ao agente")?;
+        .context("failed to connect to agent")?;
 
     let result = session(
         &connection,
@@ -107,19 +108,19 @@ async fn run(
         requests,
     )
     .await;
-    connection.close(0u32.into(), b"fim");
+    connection.close(0u32.into(), b"done");
     log_connection(&connection);
     result
 }
 
-/// Registra por que a conexão terminou e como estava a rede.
+/// Logs the connection close reason and final QUIC path statistics.
 fn log_connection(connection: &Connection) {
     if let Some(reason) = connection.close_reason() {
-        info!("conexão encerrada: {reason}");
+        info!("connection closed: {reason}");
     }
     let stats = connection.stats();
     info!(
-        "rede: rtt {:?}, {} pacotes perdidos de {}, {} eventos de congestionamento, MTU {}",
+        "network: rtt {:?}, {} lost packets out of {}, {} congestion events, MTU {}",
         stats.path.rtt,
         stats.path.lost_packets,
         stats.path.sent_packets,
@@ -161,15 +162,15 @@ async fn session(
         }) => ack,
         Some(Envelope {
             payload: Some(Payload::Error(error)),
-        }) => bail!("o agente recusou: {}", error.message),
-        _ => bail!("resposta inesperada do agente"),
+        }) => bail!("agent rejected session: {}", error.message),
+        _ => bail!("unexpected response from agent"),
     };
     let agent_id = <[u8; 32]>::try_from(ack.device_public_key.as_ref()).map_or_else(
-        |_| "sem identidade".to_owned(),
+        |_| "no identity".to_owned(),
         |key| omegadesk_identity::DeviceId::from_signing_key(&key).to_string(),
     );
-    info!("conectado a \"{}\" (ID {agent_id})", ack.device_name);
-    shared.set_status(format!("conectado a {}", ack.device_name));
+    info!("connected to {:?} (ID {agent_id})", ack.device_name);
+    shared.set_status(format!("connected to {}", ack.device_name));
     let _ = proxy.send_event(UserEvent::Status);
 
     let video_recv = connection.accept_uni().await?;
@@ -183,16 +184,16 @@ async fn session(
                     if let Some(Payload::VideoFrame(frame)) = envelope.payload
                         && !decoder.submit(frame)
                     {
-                        warn!("decoder parou; encerrando o vídeo");
+                        warn!("decoder stopped; ending video stream");
                         break;
                     }
                 }
                 Ok(None) => {
-                    warn!("o agente encerrou o stream de vídeo");
+                    warn!("agent closed the video stream");
                     break;
                 }
                 Err(error) => {
-                    warn!("erro no stream de vídeo: {error}");
+                    warn!("video stream error: {error}");
                     break;
                 }
             }
@@ -206,7 +207,7 @@ async fn session(
     }
 }
 
-/// Envia pings e as mensagens de controle; recebe os pongs.
+/// Sends periodic pings and outgoing control messages, and processes incoming pongs.
 async fn control_loop(
     send: &mut SendStream,
     control: &mut EnvelopeReader,
@@ -249,7 +250,7 @@ async fn control_loop(
     }
 }
 
-/// Fila curta até a thread de decodificação.
+/// Bounded queue feeding the dedicated decoder thread.
 struct Decoder {
     queue: std_mpsc::SyncSender<VideoFrame>,
     requests: mpsc::UnboundedSender<Envelope>,
@@ -267,13 +268,13 @@ impl Decoder {
         Self { queue, requests }
     }
 
-    /// Entrega um quadro ao decoder. Com a fila cheia, descarta e pede
-    /// keyframe. Devolve `false` se o decoder parou.
+    /// Submits a frame to the decoder. If the queue is full, drops the frame
+    /// and requests a keyframe. Returns `false` if the decoder thread exited.
     fn submit(&self, frame: VideoFrame) -> bool {
         match self.queue.try_send(frame) {
             Ok(()) => true,
             Err(std_mpsc::TrySendError::Full(_)) => {
-                // O decoder vai pular os P-frames até o keyframe pedido aqui.
+                // The decoder will skip P-frames until the requested keyframe arrives.
                 let _ = self.requests.send(keyframe_request());
                 true
             }
@@ -288,9 +289,10 @@ fn keyframe_request() -> Envelope {
     }
 }
 
-/// Decodifica e publica só o quadro mais recente. Enquanto não houver um
-/// keyframe válido (início, quadro perdido ou erro), pula os P-frames e pede
-/// keyframe, como o Moonlight (`ffmpeg.cpp`) e o `RustDesk` (`refresh_video`).
+/// Decodes frames and publishes only the latest image. While waiting for a
+/// valid keyframe (at startup, after a sequence gap, or after a decode error),
+/// skips P-frames and requests a fresh keyframe, matching Moonlight
+/// (`ffmpeg.cpp`) and RustDesk (`refresh_video`).
 fn decode_loop(
     rx: &std_mpsc::Receiver<VideoFrame>,
     shared: &Shared,
@@ -300,7 +302,7 @@ fn decode_loop(
     let mut decoder = match OpenH264Decoder::new() {
         Ok(decoder) => decoder,
         Err(error) => {
-            shared.set_status(format!("decoder indisponível: {error}"));
+            shared.set_status(format!("decoder unavailable: {error}"));
             return;
         }
     };
@@ -309,7 +311,7 @@ fn decode_loop(
     let mut last_request: Option<Instant> = None;
     let mut request_keyframe = |reason: &str| {
         if last_request.is_none_or(|at| at.elapsed() >= KEYFRAME_REQUEST_INTERVAL) {
-            info!("pedindo keyframe: {reason}");
+            info!("requesting keyframe: {reason}");
             let _ = requests.send(keyframe_request());
             last_request = Some(Instant::now());
         }
@@ -317,7 +319,7 @@ fn decode_loop(
     let mut logged_clock_skew = false;
 
     while let Ok(frame) = rx.recv() {
-        // Buraco na sequência: algum quadro foi descartado no caminho.
+        // Sequence gap: at least one frame was dropped in transit or in the queue.
         if expected_sequence.is_some_and(|expected| frame.sequence != expected) && !frame.keyframe {
             waiting_keyframe = true;
         }
@@ -325,7 +327,7 @@ fn decode_loop(
         if frame.keyframe {
             waiting_keyframe = false;
         } else if waiting_keyframe {
-            request_keyframe("aguardando keyframe");
+            request_keyframe("waiting for keyframe");
             continue;
         }
 
@@ -344,17 +346,14 @@ fn decode_loop(
             }
             Ok(None) => {}
             Err(error) => {
-                warn!("quadro {} não decodificado: {error}", frame.sequence);
+                warn!("frame {} failed to decode: {error}", frame.sequence);
                 waiting_keyframe = true;
-                request_keyframe("erro de decodificação");
+                request_keyframe("decode error");
             }
         }
         if !logged_clock_skew {
             let skew = unix_micros().abs_diff(frame.captured_at_micros);
-            info!(
-                "diferença de relógio host/cliente + rede: {} ms",
-                skew / 1000
-            );
+            info!("host/client clock offset + network: {} ms", skew / 1000);
             logged_clock_skew = true;
         }
     }

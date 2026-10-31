@@ -1,15 +1,15 @@
-//! Identidade criptográfica de um dispositivo OmegaDesk.
+//! Cryptographic identity of an OmegaDesk device.
 //!
-//! Cada dispositivo tem dois pares de chaves gerados localmente, que nunca
-//! saem da máquina:
+//! Each device holds two locally generated keypairs whose private keys never
+//! leave the machine:
 //!
-//! - **assinatura** (ed25519): prova quem é o dispositivo e assina o netmap,
-//!   os tickets de relay e a transcrição do handshake;
-//! - **troca de chaves** (x25519): usada pelo WireGuard da malha e pelo canal
-//!   de controle Noise.
+//! - **signing** (`ed25519`): proves device identity and signs netmaps, relay
+//!   tickets, and handshake transcripts;
+//! - **key exchange** (`x25519`): used by the WireGuard mesh and the Noise
+//!   control channel.
 //!
-//! O [`DeviceId`] é derivado da chave de assinatura, então não pode ser
-//! forjado sem a chave privada.
+//! [`DeviceId`] is derived from the signing public key, so it cannot be forged
+//! without possessing the corresponding private key.
 
 mod store;
 
@@ -23,27 +23,27 @@ use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 pub use store::{FileStore, KeyStore, KeyringStore, MemoryStore, StoreError, default_store};
 
-/// Tamanho do segredo serializado: 32 bytes de assinatura + 32 de troca.
+/// Length of serialized secret key material: 32 signing bytes + 32 exchange bytes.
 const SECRET_LEN: usize = 64;
 
-/// Versão do formato serializado, para permitir migrações futuras.
+/// Version byte prefixing serialized secret key material to support future migrations.
 const SECRET_FORMAT_VERSION: u8 = 1;
 
-/// Erros de identidade.
+/// Identity errors.
 #[derive(Debug, thiserror::Error)]
 pub enum IdentityError {
-    /// Os bytes serializados não têm o formato esperado.
-    #[error("identidade serializada inválida")]
+    /// Serialized secret bytes do not match the expected format.
+    #[error("invalid serialized device identity")]
     InvalidEncoding,
-    /// A chave pública não é um ponto ed25519 válido.
-    #[error("chave pública inválida")]
+    /// The public key is not a valid Ed25519 curve point.
+    #[error("invalid public key")]
     InvalidPublicKey,
-    /// A assinatura não confere.
-    #[error("assinatura inválida")]
+    /// Signature verification failed.
+    #[error("invalid signature")]
     InvalidSignature,
 }
 
-/// Identidade completa do dispositivo, com as chaves privadas.
+/// Complete device identity, including private keys.
 #[derive(ZeroizeOnDrop)]
 pub struct DeviceIdentity {
     signing: SigningKey,
@@ -51,7 +51,7 @@ pub struct DeviceIdentity {
 }
 
 impl DeviceIdentity {
-    /// Gera uma identidade nova com o gerador aleatório do sistema.
+    /// Generates a fresh device identity using the operating system CSPRNG.
     #[must_use]
     pub fn generate() -> Self {
         Self {
@@ -60,7 +60,7 @@ impl DeviceIdentity {
         }
     }
 
-    /// Parte pública, que pode ser enviada ao servidor e a outros peers.
+    /// Returns the public half of this identity, suitable for sharing with peers.
     #[must_use]
     pub fn public(&self) -> DevicePublic {
         DevicePublic {
@@ -69,25 +69,25 @@ impl DeviceIdentity {
         }
     }
 
-    /// Identificador estável do dispositivo.
+    /// Stable identifier of this device.
     #[must_use]
     pub fn id(&self) -> DeviceId {
         self.public().id()
     }
 
-    /// Assina uma mensagem com a chave de assinatura do dispositivo.
+    /// Signs a message with the device's Ed25519 signing key.
     #[must_use]
     pub fn sign(&self, message: &[u8]) -> [u8; 64] {
         self.signing.sign(message).to_bytes()
     }
 
-    /// Segredo de troca de chaves x25519, para o WireGuard e o Noise.
+    /// X25519 key-exchange secret used for WireGuard and Noise.
     #[must_use]
     pub fn exchange_secret(&self) -> &StaticSecret {
         &self.exchange
     }
 
-    /// Serializa as chaves privadas para guardar num [`KeyStore`].
+    /// Serializes private keys for storage in a [`KeyStore`].
     #[must_use]
     pub fn to_secret_bytes(&self) -> Zeroizing<Vec<u8>> {
         let mut bytes = Zeroizing::new(Vec::with_capacity(1 + SECRET_LEN));
@@ -97,11 +97,11 @@ impl DeviceIdentity {
         bytes
     }
 
-    /// Reconstrói a identidade a partir de [`to_secret_bytes`](Self::to_secret_bytes).
+    /// Reconstructs a device identity from [`to_secret_bytes`](Self::to_secret_bytes).
     ///
     /// # Errors
     ///
-    /// Retorna [`IdentityError::InvalidEncoding`] se o formato não for reconhecido.
+    /// Returns [`IdentityError::InvalidEncoding`] if the version or length is unrecognized.
     pub fn from_secret_bytes(bytes: &[u8]) -> Result<Self, IdentityError> {
         let Some((&version, keys)) = bytes.split_first() else {
             return Err(IdentityError::InvalidEncoding);
@@ -125,12 +125,12 @@ impl DeviceIdentity {
         Ok(identity)
     }
 
-    /// Carrega a identidade guardada ou gera e guarda uma nova.
+    /// Loads an existing identity from `store`, or generates and persists a new one.
     ///
     /// # Errors
     ///
-    /// Retorna erro se o armazenamento falhar ou se o conteúdo guardado
-    /// estiver corrompido. Nesse caso nada é sobrescrito.
+    /// Returns an error if the store fails or if existing stored bytes are
+    /// corrupted (in which case nothing is overwritten).
     pub fn load_or_create(store: &dyn KeyStore) -> Result<Self, StoreError> {
         if let Some(secret) = store.load()? {
             return Ok(Self::from_secret_bytes(&secret)?);
@@ -149,7 +149,7 @@ impl fmt::Debug for DeviceIdentity {
     }
 }
 
-/// Parte pública da identidade de um dispositivo.
+/// Public half of a device identity.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct DevicePublic {
     signing: VerifyingKey,
@@ -157,12 +157,12 @@ pub struct DevicePublic {
 }
 
 impl DevicePublic {
-    /// Monta a identidade pública a partir das chaves recebidas de um peer.
+    /// Builds a public identity from raw key bytes received from a peer.
     ///
     /// # Errors
     ///
-    /// Retorna [`IdentityError::InvalidPublicKey`] se a chave de assinatura
-    /// não for um ponto ed25519 válido.
+    /// Returns [`IdentityError::InvalidPublicKey`] if `signing` is not a valid
+    /// Ed25519 public key.
     pub fn from_bytes(signing: &[u8; 32], exchange: &[u8; 32]) -> Result<Self, IdentityError> {
         Ok(Self {
             signing: VerifyingKey::from_bytes(signing)
@@ -171,32 +171,32 @@ impl DevicePublic {
         })
     }
 
-    /// Chave pública de assinatura (ed25519).
+    /// Ed25519 signing public key bytes.
     #[must_use]
     pub fn signing_key_bytes(&self) -> [u8; 32] {
         self.signing.to_bytes()
     }
 
-    /// Chave pública de troca de chaves (x25519).
+    /// X25519 key-exchange public key bytes.
     #[must_use]
     pub fn exchange_key_bytes(&self) -> [u8; 32] {
         self.exchange.to_bytes()
     }
 
-    /// Identificador estável do dispositivo.
+    /// Stable identifier of this device.
     #[must_use]
     pub fn id(&self) -> DeviceId {
         DeviceId::from_signing_key(&self.signing.to_bytes())
     }
 
-    /// Confere uma assinatura feita por este dispositivo.
+    /// Verifies a signature produced by this device.
     ///
-    /// Usa a verificação estrita do ed25519, que rejeita assinaturas
-    /// maleáveis e chaves de ordem baixa.
+    /// Uses strict Ed25519 verification, rejecting malleable signatures and
+    /// small-order public keys.
     ///
     /// # Errors
     ///
-    /// Retorna [`IdentityError::InvalidSignature`] se a assinatura não conferir.
+    /// Returns [`IdentityError::InvalidSignature`] if verification fails.
     pub fn verify(&self, message: &[u8], signature: &[u8; 64]) -> Result<(), IdentityError> {
         let signature = Signature::from_bytes(signature);
         self.signing
@@ -213,15 +213,16 @@ impl fmt::Debug for DevicePublic {
     }
 }
 
-/// Identificador do dispositivo: os primeiros 20 bytes do SHA-256 da chave de
-/// assinatura, em base32 minúsculo, agrupado de 4 em 4 para leitura humana.
+/// Device identifier: the first 20 bytes of the SHA-256 digest of the signing
+/// public key, formatted in lowercase base32 in 4-character groups for human
+/// readability.
 ///
-/// Exemplo: `k3xq-7f2m-…` (32 caracteres em 8 grupos).
+/// Example: `k3xq-7f2m-…` (32 characters across 8 groups).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct DeviceId([u8; 20]);
 
 impl DeviceId {
-    /// Deriva o identificador de uma chave pública de assinatura.
+    /// Derives the device identifier from an Ed25519 signing public key.
     #[must_use]
     pub fn from_signing_key(signing_key: &[u8; 32]) -> Self {
         let digest = Sha256::new()
@@ -233,7 +234,7 @@ impl DeviceId {
         Self(id)
     }
 
-    /// Bytes brutos do identificador.
+    /// Raw 20-byte identifier.
     #[must_use]
     pub fn as_bytes(&self) -> &[u8; 20] {
         &self.0

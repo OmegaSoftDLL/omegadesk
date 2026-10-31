@@ -1,4 +1,4 @@
-//! Verificador TLS que aceita só um certificado com impressão digital fixa.
+//! TLS certificate verifier that pins the SHA-256 fingerprint of a single certificate.
 
 use std::sync::Arc;
 
@@ -30,13 +30,13 @@ impl ServerCertVerifier for PinnedVerifier {
         _now: UnixTime,
     ) -> Result<ServerCertVerified, Error> {
         let digest: [u8; 32] = Sha256::digest(end_entity).into();
-        // Comparação em tempo constante não é necessária: a impressão digital
-        // esperada é pública.
+        // Constant-time comparison is not required here because the expected
+        // certificate fingerprint is public information.
         if digest == self.expected {
             Ok(ServerCertVerified::assertion())
         } else {
             Err(Error::General(
-                "certificado do agente não confere com a impressão digital".into(),
+                "agent certificate does not match the pinned fingerprint".into(),
             ))
         }
     }
@@ -47,7 +47,7 @@ impl ServerCertVerifier for PinnedVerifier {
         _cert: &CertificateDer<'_>,
         _dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, Error> {
-        Err(Error::General("TLS 1.2 não é aceito".into()))
+        Err(Error::General("TLS 1.2 is not accepted".into()))
     }
 
     fn verify_tls13_signature(

@@ -1,11 +1,11 @@
-//! Conversão de cor BGRA → YUV 4:2:0, BT.601 faixa limitada (16–235), em
-//! inteiros. É o que o decoder do OpenH264 assume em `write_rgba8`.
+//! Integer BGRA → YUV 4:2:0 color conversion using BT.601 limited range (16–235),
+//! matching what OpenH264's `write_rgba8` decoder expects.
 
-/// Converte BGRA para I420 (planos Y, U e V separados).
+/// Converts BGRA into planar I420 (separate Y, U, and V planes).
 ///
-/// `source_width` é a largura da imagem BGRA; `width` e `height` (pares) são a
-/// área convertida, a partir do canto superior esquerdo. Assim uma captura com
-/// dimensão ímpar perde só a última coluna/linha.
+/// `source_width` is the stride in pixels of the input BGRA buffer; `width` and
+/// `height` (both even) are the converted dimensions starting from the top-left
+/// corner, so an odd-sized capture simply drops its last column or row.
 #[must_use]
 pub fn bgra_to_i420(
     bgra: &[u8],
@@ -30,8 +30,8 @@ pub fn bgra_to_i420(
     (y_plane, u_plane, v_plane)
 }
 
-/// Converte BGRA para NV12 (plano Y seguido de U/V intercalados) direto em
-/// `destination`, que precisa ter `width * height * 3 / 2` bytes.
+/// Converts BGRA into semi-planar NV12 (Y plane followed by interleaved U/V)
+/// directly inside `destination`, which must be `width * height * 3 / 2` bytes long.
 pub fn bgra_to_nv12(
     bgra: &[u8],
     source_width: usize,
@@ -78,7 +78,7 @@ fn convert(
                     sum_b += b;
                 }
             }
-            // Média dos 4 pixels com arredondamento.
+            // Average of the 2x2 pixel block with rounding.
             let (r, g, b) = ((sum_r + 2) >> 2, (sum_g + 2) >> 2, (sum_b + 2) >> 2);
             put_chroma(
                 chroma_row + col / 2,
@@ -137,7 +137,7 @@ mod tests {
 
     #[test]
     fn crops_odd_source() {
-        // Imagem 3x2: só as 2 primeiras colunas entram.
+        // 3x2 image: only the first 2 columns are converted.
         let mut bgra = [0u8; 3 * 2 * 4].to_vec();
         for row in 0..2 {
             bgra[(row * 3 + 2) * 4..][..4].copy_from_slice(&[255, 255, 255, 255]);
@@ -145,7 +145,7 @@ mod tests {
         let (y, _, _) = bgra_to_i420(&bgra, 3, 2, 2);
         assert!(
             y.iter().all(|&l| l == 16),
-            "a coluna branca descartada vazou"
+            "cropped white column leaked into output"
         );
     }
 }

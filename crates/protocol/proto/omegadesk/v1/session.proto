@@ -1,7 +1,7 @@
-// Protocolo de sessão do OmegaDesk, versão 1.
+// OmegaDesk session protocol, version 1.
 //
-// Toda mensagem trafega dentro de um Envelope. Novos tipos entram como novos
-// campos do oneof, sem reaproveitar números de campo removidos.
+// Every wire message travels inside an Envelope. New message kinds are added
+// as new fields of the oneof without reusing retired field numbers.
 syntax = "proto3";
 
 package omegadesk.v1;
@@ -20,14 +20,14 @@ message Envelope {
   }
 }
 
-// Primeira mensagem de quem abre a conexão.
+// First message sent by the initiator of the connection.
 message Hello {
   uint32 protocol_version = 1;
-  // Chave pública ed25519 do dispositivo (32 bytes).
+  // Ed25519 device signing public key (32 bytes).
   bytes device_public_key = 2;
   string device_name = 3;
   Capabilities capabilities = 4;
-  // Senha de acesso mostrada pelo agente. Sem ela o agente recusa a conexão.
+  // Access password displayed by the agent. Without it the agent rejects the connection.
   string access_password = 5;
 }
 
@@ -36,7 +36,7 @@ message HelloAck {
   bytes device_public_key = 2;
   string device_name = 3;
   Capabilities capabilities = 4;
-  // Codec escolhido para esta sessão, entre os que os dois lados suportam.
+  // Codec chosen for this session from the intersection of both peers' capabilities.
   VideoCodec selected_codec = 5;
 }
 
@@ -53,8 +53,8 @@ enum VideoCodec {
   VIDEO_CODEC_VP9 = 4;
 }
 
-// Medição de ida e volta. O timestamp é do relógio de quem envia o Ping e
-// volta intacto no Pong.
+// Round-trip latency probe. The timestamp comes from the sender's clock and
+// is echoed back unchanged in Pong.
 message Ping {
   uint64 sequence = 1;
   uint64 sent_at_micros = 2;
@@ -65,8 +65,8 @@ message Pong {
   uint64 ping_sent_at_micros = 2;
 }
 
-// O cliente perdeu a sequência de quadros (erro de decodificação ou quadro
-// descartado) e precisa de um keyframe para voltar a mostrar a imagem.
+// Sent when the client lost the frame sequence (decode error or dropped frame)
+// and needs an IDR keyframe to resume rendering.
 message RequestKeyframe {}
 
 message Error {
@@ -84,10 +84,10 @@ enum ErrorCode {
 
 message VideoFrame {
   uint64 sequence = 1;
-  // Instante da captura, no relógio do host.
+  // Capture timestamp on the host's clock.
   uint64 captured_at_micros = 2;
-  // Tempo entre a captura e o fim da codificação no host. O cliente soma
-  // com a rede, a decodificação e a renderização para mostrar a latência total.
+  // Time elapsed between screen capture and completion of encoding on the host.
+  // The client adds network, decode, and render times to display total latency.
   uint32 host_processing_micros = 3;
   VideoCodec codec = 4;
   bool keyframe = 5;
@@ -98,8 +98,8 @@ message VideoFrame {
 }
 
 message KeyEvent {
-  // Scancode físico (USB HID usage) e keysym, para que layouts
-  // internacionais como o ABNT2 funcionem nos dois lados.
+  // Physical scancode (USB HID usage) and keysym so international keyboard
+  // layouts (including ABNT2) work across both peers.
   uint32 hid_usage = 1;
   uint32 keysym = 2;
   bool pressed = 3;
@@ -108,7 +108,7 @@ message KeyEvent {
 
 message PointerEvent {
   uint32 display_index = 1;
-  // Posição absoluta normalizada em 0..=65535 nos dois eixos.
+  // Normalized absolute position in 0..=65535 along both axes.
   uint32 x = 2;
   uint32 y = 3;
   uint32 buttons = 4;

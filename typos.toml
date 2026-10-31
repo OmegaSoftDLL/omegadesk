@@ -1,0 +1,18 @@
+# Configuration for `typos-cli` (https://github.com/crate-ci/typos).
+# Run `typos` locally to check the repository with the same rules as CI.
+
+[files]
+extend-exclude = [
+    "*.bin",
+    "*.bmp",
+    "Cargo.lock",
+    "fuzz/Cargo.lock",
+    "fuzz/corpus/**",
+    "fuzz/artifacts/**",
+]
+
+[default]
+extend-ignore-re = [
+    # Git commit hashes in documentation and changelogs.
+    "\\b[0-9a-f]{7,40}\\b",
+]

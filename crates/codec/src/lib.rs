@@ -1,9 +1,9 @@
-//! Codificação e decodificação de vídeo do OmegaDesk.
+//! Video encoding and decoding for OmegaDesk.
 //!
-//! Tudo passa pelas traits [`VideoEncoder`] e [`VideoDecoder`]. A primeira
-//! implementação é H.264 por software (OpenH264). Os encoders por hardware
-//! (NVENC, QSV, AMF, VAAPI, VideoToolbox) entram como novas implementações,
-//! sem mudar quem usa o crate.
+//! All codecs implement the [`VideoEncoder`] and [`VideoDecoder`] traits.
+//! Software H.264 is provided via OpenH264, and hardware H.264 on Windows is
+//! provided via Media Foundation (Intel Quick Sync, NVIDIA NVENC, AMD AMF)
+//! without changing callers of this crate.
 
 mod color;
 #[cfg(windows)]
@@ -15,102 +15,104 @@ pub use color::{bgra_to_i420, bgra_to_nv12};
 pub use media_foundation::MediaFoundationEncoder;
 pub use openh264_codec::{OpenH264Decoder, OpenH264Encoder};
 
-/// Erros de codec.
+/// Codec errors.
 #[derive(Debug, thiserror::Error)]
 pub enum CodecError {
-    /// Dimensões que o codec não aceita (zero ou grandes demais).
-    #[error("dimensões inválidas: {width}x{height}")]
+    /// Frame dimensions rejected by the codec (zero, odd-sized below 2, or too large).
+    #[error("invalid dimensions: {width}x{height}")]
     InvalidDimensions {
-        /// Largura recebida.
+        /// Width received.
         width: u32,
-        /// Altura recebida.
+        /// Height received.
         height: u32,
     },
-    /// O buffer de entrada não tem o tamanho esperado.
-    #[error("buffer de {got} bytes; esperado {expected}")]
+    /// Input buffer length does not match `width * height * 4`.
+    #[error("buffer of {got} bytes; expected {expected}")]
     BufferSize {
-        /// Tamanho recebido.
+        /// Actual buffer size in bytes.
         got: usize,
-        /// Tamanho esperado.
+        /// Expected buffer size in bytes.
         expected: usize,
     },
-    /// Erro do OpenH264.
+    /// OpenH264 error.
     #[error("OpenH264: {0}")]
     OpenH264(#[from] openh264::Error),
-    /// Não há encoder de hardware nesta máquina.
-    #[error("nenhum encoder de hardware disponível")]
+    /// No hardware video encoder is available on this machine.
+    #[error("no hardware video encoder available")]
     HardwareUnavailable,
-    /// Erro da API do sistema (Media Foundation, VA-API…).
+    /// Platform media API error (Media Foundation, VA-API…).
     #[error("{0}")]
     Platform(String),
 }
 
-/// Quadro de entrada para o encoder, em BGRA sem preenchimento entre linhas.
+/// Uncompressed input frame for an encoder, in tightly packed BGRA.
 #[derive(Debug, Clone, Copy)]
 pub struct RawFrame<'a> {
-    /// Largura em pixels.
+    /// Width in pixels.
     pub width: u32,
-    /// Altura em pixels.
+    /// Height in pixels.
     pub height: u32,
-    /// `width * height * 4` bytes BGRA.
+    /// `width * height * 4` bytes of BGRA pixel data.
     pub bgra: &'a [u8],
 }
 
-/// Quadro codificado.
+/// Encoded video frame.
 #[derive(Debug, Clone)]
 pub struct EncodedFrame {
-    /// Bitstream (Annex B, no caso do H.264).
+    /// Encoded bitstream (Annex B for H.264).
     pub data: Vec<u8>,
-    /// Quadro que pode ser decodificado sozinho (IDR).
+    /// Whether this frame can be decoded independently (IDR keyframe).
     pub keyframe: bool,
-    /// Largura efetivamente codificada (pode ser 1 pixel menor que a entrada).
+    /// Effective encoded width in pixels (may be 1 pixel smaller than an odd input width).
     pub width: u32,
-    /// Altura efetivamente codificada.
+    /// Effective encoded height in pixels.
     pub height: u32,
 }
 
-/// Imagem decodificada, pronta para desenhar.
+/// Decoded image ready to be drawn to a window surface.
 #[derive(Debug, Clone)]
 pub struct DecodedImage {
-    /// Largura em pixels.
+    /// Width in pixels.
     pub width: u32,
-    /// Altura em pixels.
+    /// Height in pixels.
     pub height: u32,
-    /// Um `u32` por pixel no formato `0x00RRGGBB`.
+    /// One `u32` per pixel in `0x00RRGGBB` format.
     pub xrgb: Vec<u32>,
 }
 
-/// Codificador de vídeo.
+/// Video encoder trait.
 pub trait VideoEncoder: Send {
-    /// Codifica um quadro e devolve, em ordem, todos os quadros codificados que
-    /// ficaram prontos (pode ser nenhum, ou mais de um num encoder com fila).
-    /// Quem chama precisa enviar todos: perder um quadro corrompe os seguintes.
+    /// Encodes a single raw frame and returns, in order, all encoded frames that
+    /// became ready (which may be empty or contain multiple frames on a queued
+    /// hardware encoder). Callers must transmit every returned frame in order,
+    /// as dropping an inter-frame corrupts subsequent P-frames.
     ///
     /// # Errors
     ///
-    /// Retorna erro se o quadro for inválido ou o codec falhar.
+    /// Returns an error if the input frame is invalid or the underlying codec fails.
     fn encode(&mut self, frame: RawFrame<'_>) -> Result<Vec<EncodedFrame>, CodecError>;
 
-    /// Faz o próximo quadro ser um keyframe (quando um cliente entra ou perde dados).
+    /// Forces the next encoded frame to be an IDR keyframe (used when a new
+    /// client joins or after packet/frame loss).
     fn request_keyframe(&mut self);
 }
 
-/// Decodificador de vídeo.
+/// Video decoder trait.
 pub trait VideoDecoder: Send {
-    /// Decodifica um quadro. Devolve `None` se ainda não há imagem completa.
+    /// Decodes a bitstream packet. Returns `None` if a complete frame is not yet ready.
     ///
     /// # Errors
     ///
-    /// Retorna erro se o bitstream estiver corrompido.
+    /// Returns an error if the bitstream is malformed.
     fn decode(&mut self, data: &[u8]) -> Result<Option<DecodedImage>, CodecError>;
 }
 
-/// Configuração do encoder.
+/// Encoder target settings.
 #[derive(Debug, Clone, Copy)]
 pub struct EncoderSettings {
-    /// Taxa alvo em bits por segundo.
+    /// Target bitrate in bits per second.
     pub bitrate_bps: u32,
-    /// Quadros por segundo máximos.
+    /// Maximum frame rate in frames per second.
     pub max_fps: f32,
 }
 
@@ -129,7 +131,8 @@ mod tests {
         EncoderSettings, OpenH264Decoder, OpenH264Encoder, RawFrame, VideoDecoder, VideoEncoder,
     };
 
-    /// Codifica e decodifica um gradiente e confere que a imagem volta parecida.
+    /// Encodes and decodes a color gradient and checks that the reconstructed
+    /// pixels stay close to the original.
     #[test]
     fn round_trip_gradient() {
         let (width, height) = (320_u32, 240_u32);
@@ -156,10 +159,10 @@ mod tests {
         let image = decoder
             .decode(&bitstream.data)
             .unwrap()
-            .expect("imagem decodificada");
+            .expect("decoded image");
         assert_eq!((image.width, image.height), (width, height));
 
-        // Confere o pixel do meio com tolerância de compressão.
+        // Check the center pixel within lossy compression tolerance.
         let (col, row) = (width / 2, height / 2);
         let pixel = image.xrgb[(row * width + col) as usize];
         let [_, red, green, blue] = pixel.to_be_bytes();
@@ -167,12 +170,12 @@ mod tests {
         let expected_green = row * 255 / height;
         assert!(
             u32::from(blue).abs_diff(expected_blue) < 24,
-            "azul {blue} vs {expected_blue}"
+            "blue {blue} vs {expected_blue}"
         );
         assert!(
             u32::from(green).abs_diff(expected_green) < 24,
-            "verde {green} vs {expected_green}"
+            "green {green} vs {expected_green}"
         );
-        assert!(u32::from(red).abs_diff(128) < 24, "vermelho {red}");
+        assert!(u32::from(red).abs_diff(128) < 24, "red {red}");
     }
 }

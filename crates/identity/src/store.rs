@@ -1,4 +1,4 @@
-//! Armazenamento das chaves privadas do dispositivo.
+//! Storage backends for private device keys.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -8,52 +8,53 @@ use zeroize::Zeroizing;
 
 use crate::IdentityError;
 
-/// Erros de armazenamento.
+/// Key storage errors.
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
-    /// O cofre do sistema operacional recusou ou falhou na operação.
-    #[error("cofre do sistema: {0}")]
+    /// The operating system credential store rejected or failed the operation.
+    #[error("system credential store: {0}")]
     Keyring(#[from] keyring::Error),
-    /// Falha ao ler ou gravar o arquivo de chaves.
-    #[error("arquivo de chaves: {0}")]
+    /// Failed to read or write the key file on disk.
+    #[error("key file: {0}")]
     Io(#[from] std::io::Error),
-    /// O conteúdo guardado não é uma identidade válida.
+    /// Stored bytes do not represent a valid device identity.
     #[error(transparent)]
     Identity(#[from] IdentityError),
-    /// O armazenamento em memória ficou inconsistente (thread em pânico).
-    #[error("armazenamento em memória inconsistente")]
+    /// In-memory store mutex was poisoned by a panicking thread.
+    #[error("in-memory store mutex poisoned")]
     Poisoned,
 }
 
-/// Onde as chaves privadas do dispositivo ficam guardadas.
+/// Persistent or ephemeral storage backend for private device keys.
 pub trait KeyStore {
-    /// Lê o segredo guardado, ou `None` se ainda não existe.
+    /// Loads the stored secret, or returns `None` if no secret has been stored yet.
     ///
     /// # Errors
     ///
-    /// Retorna erro se o armazenamento falhar.
+    /// Returns an error if the underlying storage backend fails.
     fn load(&self) -> Result<Option<Zeroizing<Vec<u8>>>, StoreError>;
 
-    /// Guarda o segredo, substituindo o anterior.
+    /// Persists `secret`, replacing any previous value.
     ///
     /// # Errors
     ///
-    /// Retorna erro se o armazenamento falhar.
+    /// Returns an error if the underlying storage backend fails.
     fn save(&self, secret: &[u8]) -> Result<(), StoreError>;
 }
 
-/// Armazenamento padrão para `account` neste sistema operacional:
+/// Opens the default key store for `account` on the current operating system:
 ///
-/// - Windows e macOS: cofre do sistema (Gerenciador de Credenciais, Keychain);
-/// - Linux e outros: arquivo `<config>/omegadesk/<account>.key` com permissão
-///   0600. O keyring do kernel (keyutils) perde as chaves no reboot, o que
-///   mudaria o ID do dispositivo, e o Secret Service não existe em servidores
-///   sem sessão gráfica.
+/// - Windows and macOS: operating system credential store (Credential Manager,
+///   Keychain);
+/// - Linux and other Unix platforms: `<config>/omegadesk/<account>.key` with
+///   mode `0600`. The Linux kernel keyring (`keyutils`) is cleared on reboot,
+///   which would change the device ID, and D-Bus Secret Service is unavailable
+///   on headless servers.
 ///
 /// # Errors
 ///
-/// Retorna erro se o cofre não estiver disponível ou se não houver diretório
-/// de configuração.
+/// Returns an error if the credential store cannot be opened or no
+/// configuration directory is available.
 pub fn default_store(account: &str) -> Result<Box<dyn KeyStore>, StoreError> {
     if cfg!(any(windows, target_os = "macos")) {
         Ok(Box::new(KeyringStore::new(account)?))
@@ -62,23 +63,22 @@ pub fn default_store(account: &str) -> Result<Box<dyn KeyStore>, StoreError> {
     }
 }
 
-/// Cofre do sistema operacional: Gerenciador de Credenciais no Windows e
-/// Keychain no macOS.
+/// Operating system credential store: Windows Credential Manager and macOS Keychain.
 #[derive(Debug)]
 pub struct KeyringStore {
     entry: keyring::Entry,
 }
 
 impl KeyringStore {
-    /// Nome do serviço usado no cofre do sistema.
+    /// Service name registered in the OS credential store.
     pub const SERVICE: &'static str = "omegadesk";
 
-    /// Abre a entrada `account` do cofre. Use nomes diferentes para o agente
-    /// (serviço do sistema) e para o cliente (usuário).
+    /// Opens the `account` entry in the OS credential store. Use distinct
+    /// account names for the agent (system service) and the client (user app).
     ///
     /// # Errors
     ///
-    /// Retorna erro se o cofre do sistema não estiver disponível.
+    /// Returns an error if the OS credential store is unavailable.
     pub fn new(account: &str) -> Result<Self, StoreError> {
         Ok(Self {
             entry: keyring::Entry::new(Self::SERVICE, account)?,
@@ -100,25 +100,25 @@ impl KeyStore for KeyringStore {
     }
 }
 
-/// Arquivo com permissão restrita ao dono (0600 em Unix).
+/// File store restricted to the file owner (`0600` on Unix).
 #[derive(Debug, Clone)]
 pub struct FileStore {
     path: PathBuf,
 }
 
 impl FileStore {
-    /// Usa o arquivo `path`.
+    /// Stores keys in `path`.
     #[must_use]
     pub fn new(path: impl Into<PathBuf>) -> Self {
         Self { path: path.into() }
     }
 
-    /// Usa `<config>/omegadesk/<account>.key`, onde `<config>` é
-    /// `$XDG_CONFIG_HOME` ou `~/.config` (ou `%APPDATA%` no Windows).
+    /// Uses `<config>/omegadesk/<account>.key`, where `<config>` is resolved
+    /// from `$XDG_CONFIG_HOME`, `%APPDATA%`, or `~/.config`.
     ///
     /// # Errors
     ///
-    /// Retorna erro se nenhum diretório de configuração estiver definido.
+    /// Returns an error if no configuration directory environment variable is set.
     pub fn in_config_dir(account: &str) -> Result<Self, StoreError> {
         let base = std::env::var_os("XDG_CONFIG_HOME")
             .map(PathBuf::from)
@@ -127,7 +127,7 @@ impl FileStore {
             .ok_or_else(|| {
                 std::io::Error::new(
                     std::io::ErrorKind::NotFound,
-                    "nenhum diretório de configuração (XDG_CONFIG_HOME, APPDATA ou HOME)",
+                    "no configuration directory found (XDG_CONFIG_HOME, APPDATA, or HOME)",
                 )
             })?;
         Ok(Self::new(
@@ -135,7 +135,7 @@ impl FileStore {
         ))
     }
 
-    /// Caminho do arquivo.
+    /// Path to the key file.
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
@@ -155,8 +155,8 @@ impl KeyStore for FileStore {
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        // Grava num arquivo temporário e renomeia: uma queda no meio não deixa
-        // a identidade corrompida.
+        // Write to a temporary file and rename atomically so a crash mid-write
+        // never leaves a half-written identity on disk.
         let temporary = self.path.with_extension("key.tmp");
         let mut options = std::fs::OpenOptions::new();
         options.write(true).create(true).truncate(true);
@@ -171,8 +171,7 @@ impl KeyStore for FileStore {
     }
 }
 
-/// Armazenamento em memória, para testes e para identidades efêmeras
-/// (por exemplo, o `QuickSupport`).
+/// In-memory key store for tests and ephemeral identities (such as `QuickSupport`).
 #[derive(Debug, Default)]
 pub struct MemoryStore {
     secret: Mutex<Option<Zeroizing<Vec<u8>>>>,
@@ -214,7 +213,7 @@ mod tests {
                 .unwrap()
                 .permissions()
                 .mode();
-            assert_eq!(mode & 0o777, 0o600, "o arquivo de chaves precisa ser 0600");
+            assert_eq!(mode & 0o777, 0o600, "key file permissions must be 0600");
         }
         std::fs::remove_dir_all(&directory).unwrap();
     }

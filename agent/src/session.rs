@@ -1,4 +1,4 @@
-//! Uma sessão de acesso remoto: handshake, vídeo e controle.
+//! Remote access session handling: handshake, video streaming, and control messages.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -18,30 +18,31 @@ use tracing::{info, warn};
 
 use crate::capture_loop::{self, EncoderChoice};
 
-/// Codecs que este agente sabe codificar, em ordem de preferência.
+/// Video codecs this agent can encode, in preference order.
 const ENCODERS: [VideoCodec; 1] = [VideoCodec::H264];
 
-/// Atraso antes de responder a uma senha errada, contra tentativa e erro.
+/// Artificial delay before replying to a wrong password to slow down brute-force attempts.
 const WRONG_PASSWORD_DELAY: Duration = Duration::from_secs(1);
 
-/// Tempo para o cliente ler a mensagem de recusa antes de a conexão fechar.
+/// Grace period allowing the client to read the rejection message before the connection closes.
 const REJECT_GRACE: Duration = Duration::from_secs(2);
 
-/// Quadros de vídeo prontos esperando a rede. Pequeno de propósito: o que
-/// não couber é descartado na captura (ver `capture_loop`).
+/// Bounded queue of encoded video frames waiting to be sent on the network.
+/// Intentionally tiny: frames that do not fit are dropped at capture time
+/// (see `capture_loop`).
 const VIDEO_QUEUE: usize = 2;
 
-/// Códigos de encerramento da conexão QUIC.
+/// QUIC application close codes.
 mod close_code {
     pub(super) const NORMAL: u32 = 0;
     pub(super) const REJECTED: u32 = 1;
 }
 
-/// Configuração da sessão, vinda da linha de comando.
+/// Session configuration derived from CLI arguments.
 #[derive(Debug, Clone)]
 pub(crate) struct SessionConfig {
     pub(crate) name: String,
-    /// Chave pública de assinatura deste dispositivo, enviada no `HelloAck`.
+    /// Ed25519 signing public key of this device, sent in `HelloAck`.
     pub(crate) device_public_key: [u8; 32],
     pub(crate) password: String,
     pub(crate) monitor: u32,
@@ -50,7 +51,7 @@ pub(crate) struct SessionConfig {
     pub(crate) input: bool,
 }
 
-/// Estado compartilhado entre a thread de captura e a tarefa de controle.
+/// Shared state between the blocking capture thread and the async control task.
 #[derive(Debug, Default)]
 pub(crate) struct SessionState {
     pub(crate) stop: AtomicBool,
@@ -68,14 +69,14 @@ impl SessionState {
     }
 }
 
-/// Atende uma conexão do começo ao fim.
+/// Serves a single client connection from handshake to teardown.
 pub(crate) async fn run(connection: Connection, config: Arc<SessionConfig>) -> anyhow::Result<()> {
     let result = serve(&connection, &config).await;
-    let reason: &[u8] = if result.is_ok() { b"fim" } else { b"erro" };
+    let reason: &[u8] = if result.is_ok() { b"done" } else { b"error" };
     connection.close(close_code::NORMAL.into(), reason);
     let stats = connection.stats();
     info!(
-        "rede: rtt {:?}, {} pacotes perdidos de {}, {} eventos de congestionamento",
+        "network: rtt {:?}, {} lost packets out of {}, {} congestion events",
         stats.path.rtt,
         stats.path.lost_packets,
         stats.path.sent_packets,
@@ -88,15 +89,15 @@ async fn serve(connection: &Connection, config: &Arc<SessionConfig>) -> anyhow::
     let (mut control_send, control_recv) = connection.accept_bi().await?;
     let mut control = EnvelopeReader::new(control_recv);
     if let Err(error) = handshake(&mut control_send, &mut control, config).await {
-        // Garante que o motivo chegue ao cliente antes de fechar: termina o
-        // stream e dá ao cliente um tempo para ler e fechar do lado dele.
+        // Ensure the rejection reason reaches the client before closing:
+        // finish the stream and give the client a brief window to read it.
         let _ = control_send.finish();
         let _ = tokio::time::timeout(REJECT_GRACE, connection.closed()).await;
-        connection.close(close_code::REJECTED.into(), b"recusado");
+        connection.close(close_code::REJECTED.into(), b"rejected");
         return Err(error);
     }
 
-    // Vídeo num stream próprio, para não atrasar as mensagens de controle.
+    // Dedicated unidirectional stream for video so large keyframes do not block control messages.
     let mut video_send = connection.open_uni().await?;
     let state = Arc::new(SessionState {
         keyframe_requested: AtomicBool::new(true),
@@ -108,7 +109,7 @@ async fn serve(connection: &Connection, config: &Arc<SessionConfig>) -> anyhow::
         let state = state.clone();
         let config = config.clone();
         std::thread::Builder::new()
-            .name("captura".into())
+            .name("capture".into())
             .spawn(move || {
                 capture_loop::run(
                     config.monitor,
@@ -135,7 +136,7 @@ async fn serve(connection: &Connection, config: &Arc<SessionConfig>) -> anyhow::
         match omegadesk_input::open() {
             Ok(injector) => Some(injector),
             Err(error) => {
-                warn!("sem controle remoto de teclado e mouse: {error}");
+                warn!("remote keyboard and mouse disabled: {error}");
                 None
             }
         }
@@ -147,17 +148,17 @@ async fn serve(connection: &Connection, config: &Arc<SessionConfig>) -> anyhow::
 
     state.stop.store(true, Ordering::Relaxed);
     video.abort();
-    // `join` bloqueia: fora das threads do runtime.
+    // `join` blocks, so run it off the async runtime worker threads.
     if tokio::task::spawn_blocking(move || capture.join().is_err())
         .await
         .unwrap_or(true)
     {
-        warn!("a thread de captura terminou com pânico");
+        warn!("capture thread panicked");
     }
     result
 }
 
-/// Recebe o `Hello`, confere a senha, escolhe o codec e responde com `HelloAck`.
+/// Receives `Hello`, verifies the access password, negotiates a video codec, and replies with `HelloAck`.
 async fn handshake(
     control_send: &mut SendStream,
     control: &mut EnvelopeReader,
@@ -167,24 +168,24 @@ async fn handshake(
         payload: Some(Payload::Hello(hello)),
     }) = control.next().await?
     else {
-        bail!("o cliente não começou com Hello");
+        bail!("client did not start with Hello");
     };
     if hello.protocol_version != PROTOCOL_VERSION {
         reject(
             control_send,
             ErrorCode::UnsupportedVersion,
-            "versão do protocolo diferente",
+            "unsupported protocol version",
         )
         .await;
         bail!(
-            "cliente usa a versão {} do protocolo",
+            "client uses unsupported protocol version {}",
             hello.protocol_version
         );
     }
     if !crate::password::matches(&config.password, &hello.access_password) {
         tokio::time::sleep(WRONG_PASSWORD_DELAY).await;
-        reject(control_send, ErrorCode::Unauthorized, "senha incorreta").await;
-        bail!("senha incorreta");
+        reject(control_send, ErrorCode::Unauthorized, "invalid password").await;
+        bail!("invalid access password");
     }
     let client_decoders: Vec<VideoCodec> = hello
         .capabilities
@@ -195,13 +196,13 @@ async fn handshake(
         reject(
             control_send,
             ErrorCode::NoCommonCodec,
-            "nenhum codec em comum",
+            "no common video codec",
         )
         .await;
-        bail!("nenhum codec em comum com o cliente");
+        bail!("no common video codec with client");
     };
     info!(
-        "cliente \"{}\" ({}) autorizado, usando {codec:?}",
+        "client {:?} ({}) authorized, using {codec:?}",
         hello.device_name,
         describe_device(&hello.device_public_key),
     );
@@ -225,7 +226,7 @@ async fn handshake(
     Ok(codec)
 }
 
-/// Atende o stream de controle: ping, keyframe, teclado e mouse.
+/// Serves the bidirectional control stream: ping/pong, keyframe requests, and input events.
 async fn serve_control(
     control_send: &mut SendStream,
     control: &mut EnvelopeReader,
@@ -251,12 +252,12 @@ async fn serve_control(
                 if let Some(injector) = injector.as_mut()
                     && let Err(error) = injector.key(&key)
                 {
-                    warn!("tecla não injetada: {error}");
+                    warn!("key event not injected: {error}");
                 }
             }
             Some(Payload::PointerEvent(pointer)) => {
                 if let Some(injector) = injector.as_mut() {
-                    // O monitor capturado pode mudar (reabertura, troca de modo).
+                    // The captured monitor bounds may change across reopen/mode switches.
                     let current = state.target();
                     if current != target
                         && let Some(display) = current
@@ -265,12 +266,12 @@ async fn serve_control(
                         target = current;
                     }
                     if let Err(error) = injector.pointer(&pointer) {
-                        warn!("mouse não injetado: {error}");
+                        warn!("pointer event not injected: {error}");
                     }
                 }
             }
             Some(Payload::Error(error)) => {
-                bail!("cliente reportou erro: {}", error.message);
+                bail!("client reported error: {}", error.message);
             }
             Some(
                 Payload::Hello(_)
@@ -294,11 +295,11 @@ async fn reject(stream: &mut SendStream, code: ErrorCode, message: &str) {
     let _ = send_envelope(stream, &envelope).await;
 }
 
-/// ID do dispositivo a partir da chave pública recebida, para os logs. Na
-/// Fase 2 o coordenador passa a autorizar por essa identidade.
+/// Formats the peer's `DeviceId` from its 32-byte signing public key for logging.
+/// In Phase 2 the coordinator authorizes sessions using this identity.
 fn describe_device(public_key: &[u8]) -> String {
     <[u8; 32]>::try_from(public_key).map_or_else(
-        |_| "sem identidade".to_owned(),
+        |_| "no identity".to_owned(),
         |key| {
             format!(
                 "ID {}",

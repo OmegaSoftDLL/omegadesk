@@ -1,4 +1,4 @@
 allow-unwrap-in-tests = true
 allow-expect-in-tests = true
 allow-panic-in-tests = true
-doc-valid-idents = ["OmegaDesk", "WireGuard", "QuickSupport", "OpenH264", "NVENC", "VideoToolbox", "DirectX", ".."]
+doc-valid-idents = ["OmegaDesk", "WireGuard", "QuickSupport", "OpenH264", "NVENC", "VideoToolbox", "DirectX", "RustDesk", "CrossDesk", "IronRDP", "FreeRDP", "EasyTier", "MeshCentral", "JumpServer", "SubnetDesk", ".."]
