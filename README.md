@@ -93,12 +93,12 @@ The full design, from the WireGuard mesh to the web client, is in [docs/plan.md]
 |---|---|---|
 | 0 | Foundation: workspace, CI on three platforms, license policy, protocol, identity | ✅ Done |
 | 1 | First image on screen: capture, hardware encoding, QUIC, input, ≤ 30 ms on LAN | ✅ Done |
-| 2 | Mesh network and coordination server: NAT traversal, relay, internal DNS | 🧩 Library only: coordinator, relay, mesh engine and DNS exist; agent and client do not use them; 23 open review findings |
-| 3 | Remote access product: Windows service, login/UAC screens, clipboard, files, audio | 🧩 Library only: desktop switching, session channels, QoS/FEC, QuickSupport and LAN mode exist; nothing is wired into the agent; 12 open review findings |
-| 4 | Web dashboard and browser client | 🧩 Library only: policy model, gateway and WebCodecs worker exist; the gateway never starts and the TypeScript is not built; 15 open review findings |
-| 5 | Security, session recording and privileged access | 🧩 Library only: recording, HuJSON policies, MFA, PAM, DLP and vault exist; no handshake consults them; 9 open review findings |
-| 6 | Remote monitoring and management (RMM) | 🧩 Library only: in-memory RMM models; the agent reports nothing; 5 open review findings |
-| 7 | RDP/VNC compatibility, virtual displays, MCP server, Linux/macOS/mobile | ⬜ Not started in substance: no IronRDP dependency, no driver, no MCP server, no Linux/macOS capture; 14 open review findings |
+| 2 | Mesh network and coordination server: NAT traversal, relay, internal DNS | 🧩 Library only: coordinator, relay, mesh engine and DNS exist; agent and client do not use them; open findings: [#26](https://github.com/OmegaSoftDLL/omegadesk/issues/26) |
+| 3 | Remote access product: Windows service, login/UAC screens, clipboard, files, audio | 🧩 Library only: desktop switching, session channels, QoS/FEC, QuickSupport and LAN mode exist; nothing is wired into the agent; open findings: [#27](https://github.com/OmegaSoftDLL/omegadesk/issues/27) |
+| 4 | Web dashboard and browser client | 🧩 Library only: policy model, gateway and WebCodecs worker exist; the gateway never starts and the TypeScript is not built; open findings: [#28](https://github.com/OmegaSoftDLL/omegadesk/issues/28) |
+| 5 | Security, session recording and privileged access | 🧩 Library only: recording, HuJSON policies, MFA, PAM, DLP and vault exist; no handshake consults them; open findings: [#29](https://github.com/OmegaSoftDLL/omegadesk/issues/29) |
+| 6 | Remote monitoring and management (RMM) | 🧩 Library only: in-memory RMM models; the agent reports nothing; open findings: [#30](https://github.com/OmegaSoftDLL/omegadesk/issues/30) |
+| 7 | RDP/VNC compatibility, virtual displays, MCP server, Linux/macOS/mobile | ⬜ Not started in substance: no IronRDP dependency, no driver, no MCP server, no Linux/macOS capture; open findings: [#31](https://github.com/OmegaSoftDLL/omegadesk/issues/31), [#33](https://github.com/OmegaSoftDLL/omegadesk/issues/33) |
 
 ## Contributing
 

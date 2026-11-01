@@ -250,7 +250,15 @@ omegadesk/
 
 Each phase ends with something that runs and can be demoed.
 
-Status legend: ✅ implemented, wired into a binary and verified; 🧩 library code exists but is not wired into any binary, or has the known defects listed below; ⬜ not started. A phase is only ✅ when its **Done when** line is ✅. Phases 2–7 were marked complete on 2026-11-01 by an automated agent; the audit of the same day (see `CHANGELOG.md`) reverted those marks. Every open finding from Copilot Code Review on PRs #17–#24 must be fixed before the corresponding item becomes ✅.
+Status legend:
+
+- ✅ implemented, wired into a binary and verified;
+- 🧩 library code exists but is not wired into any binary, or has the known defects listed below;
+- ⬜ not started.
+
+A phase is only ✅ when its **Done when** line is ✅.
+
+Phases 2–7 were marked complete on 2026-11-01 by an automated agent; the audit of the same day (see `CHANGELOG.md`) reverted those marks. The open findings from Copilot Code Review on PRs #17–#24 are tracked in issues [#26](https://github.com/OmegaSoftDLL/omegadesk/issues/26) to [#33](https://github.com/OmegaSoftDLL/omegadesk/issues/33); each must be fixed, with a regression test, before the corresponding item becomes ✅.
 
 ### Phase 0: Foundation (1–2 weeks) ✅
 - ✅ Rust workspace, CI (Windows, Linux and macOS builds; `clippy` with strict lints in the Firezone style; `cargo deny` for licenses).
