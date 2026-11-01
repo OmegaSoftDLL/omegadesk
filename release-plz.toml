@@ -1,0 +1,56 @@
+# Configuration for release-plz (modeled after Devolutions/IronRDP).
+#
+# All workspace members share a single lockstep version (`version_group = "omegadesk"`).
+# Crates are not published to crates.io (`publish = false` in Cargo.toml); `release-plz`
+# maintains `CHANGELOG.md`, opens the version-bump pull request, and creates the
+# `v<version>` Git tag and GitHub Release that trigger multiplatform binary builds.
+
+[workspace]
+changelog_config = "cliff.toml"
+changelog_update = false
+dependencies_update = false
+git_release_enable = false
+git_tag_enable = false
+publish = false
+semver_check = false
+pr_branch_prefix = "release-plz/"
+pr_name = "chore(release): prepare release"
+release_commits = "^(feat|fix|perf|docs|build)"
+
+[[package]]
+name = "omegadesk-agent"
+version_group = "omegadesk"
+changelog_path = "CHANGELOG.md"
+changelog_update = true
+git_tag_enable = true
+git_tag_name = "v{{ version }}"
+git_release_enable = true
+git_release_name = "OmegaDesk v{{ version }}"
+
+[[package]]
+name = "omegadesk-client"
+version_group = "omegadesk"
+
+[[package]]
+name = "omegadesk-capture"
+version_group = "omegadesk"
+
+[[package]]
+name = "omegadesk-codec"
+version_group = "omegadesk"
+
+[[package]]
+name = "omegadesk-identity"
+version_group = "omegadesk"
+
+[[package]]
+name = "omegadesk-input"
+version_group = "omegadesk"
+
+[[package]]
+name = "omegadesk-protocol"
+version_group = "omegadesk"
+
+[[package]]
+name = "omegadesk-transport"
+version_group = "omegadesk"

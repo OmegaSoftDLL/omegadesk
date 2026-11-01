@@ -6,6 +6,8 @@
 
 [![CI](https://github.com/OmegaSoftDLL/omegadesk/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/OmegaSoftDLL/omegadesk/actions/workflows/ci.yml)
 [![CodeQL](https://github.com/OmegaSoftDLL/omegadesk/actions/workflows/codeql.yml/badge.svg?branch=main)](https://github.com/OmegaSoftDLL/omegadesk/actions/workflows/codeql.yml)
+[![Release](https://github.com/OmegaSoftDLL/omegadesk/actions/workflows/release.yml/badge.svg)](https://github.com/OmegaSoftDLL/omegadesk/actions/workflows/release.yml)
+[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/OmegaSoftDLL/omegadesk/badge)](https://scorecard.dev/viewer/?uri=github.com/OmegaSoftDLL/omegadesk)
 [![License: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](LICENSE)
 [![MSRV](https://img.shields.io/badge/rustc-1.90%2B-orange.svg)](Cargo.toml)
 

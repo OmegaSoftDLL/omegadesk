@@ -1,0 +1,79 @@
+# Configuration file for git-cliff (modeled after Devolutions/IronRDP).
+
+[changelog]
+trim = false
+
+header = """
+# Changelog
+
+All notable changes to OmegaDesk are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows [Semantic Versioning](https://semver.org/).
+
+"""
+
+body = """
+{% if version -%}
+  ## [[{{ version | trim_start_matches(pat="v") }}]{%- if release_link -%}({{ release_link }}){% endif %}] - {{ timestamp | date(format="%Y-%m-%d") }}
+{%- else -%}
+  ## [Unreleased]
+{%- endif %}
+
+{% for group, commits in commits | group_by(attribute="group") -%}
+
+### {{ group | upper_first }}
+
+{%- for commit in commits %}
+
+{%- set message = commit.message | upper_first %}
+
+{%- if commit.breaking %}
+  {%- set breaking = "[**breaking**] " %}
+{%- else %}
+  {%- set breaking = "" %}
+{%- endif %}
+
+{%- set short_sha = commit.id | truncate(length=10, end="") %}
+{%- set commit_url = "https://github.com/OmegaSoftDLL/omegadesk/commit/" ~ commit.id %}
+{%- set commit_link = "[" ~ short_sha ~ "](" ~ commit_url ~ ")" %}
+
+- {{ breaking }}{{ message }} ({{ commit_link }})
+{%- endfor %}
+
+{% endfor -%}
+"""
+
+footer = ""
+
+[git]
+conventional_commits = true
+filter_unconventional = false
+filter_commits = false
+date_order = false
+protect_breaking_commits = true
+sort_commits = "oldest"
+
+commit_preprocessors = [
+  { pattern = "\\(#([0-9]+)\\)", replace = "([#${1}](https://github.com/OmegaSoftDLL/omegadesk/issues/${1}))" },
+  { pattern = '([a-f0-9]{10})([a-f0-9]{30})', replace = "[${0}](https://github.com/OmegaSoftDLL/omegadesk/commit/${1}${2})" },
+]
+
+commit_parsers = [
+  { message = "^chore\\(release\\):", skip = true },
+  { message = "^chore", skip = true },
+  { message = "^style", skip = true },
+  { message = "^refactor", skip = true },
+  { message = "^test", skip = true },
+  { message = "^ci", skip = true },
+  { footer = "^[Cc]hangelog: ?ignore", skip = true },
+
+  { message = "(?i)security", group = "<!-- 0 -->Security" },
+  { body = "(?i)security", group = "<!-- 0 -->Security" },
+  { footer = "^[Ss]ecurity: ?yes", group = "<!-- 0 -->Security" },
+
+  { message = "^feat", group = "<!-- 1 -->Added" },
+  { message = "^fix", group = "<!-- 2 -->Fixed" },
+  { message = "^perf", group = "<!-- 3 -->Performance" },
+  { message = "^revert", group = "<!-- 4 -->Reverted" },
+  { message = "^docs", group = "<!-- 5 -->Documentation" },
+  { message = "^build", group = "<!-- 6 -->Build" },
+  { message = ".*", group = "<!-- 99 -->Other" },
+]
