@@ -279,11 +279,12 @@ Each phase ends with something that runs and can be demoed. ✅ marks what is do
 - ✅ Serverless LAN mode (`crates/session/src/lan.rs`): mDNS `_omegadesk._udp.local.` announcement/discovery, SubnetDesk-derived `omegadesk-lan-v1` Ed25519 transcript signature verification, and Trust On First Use (`TofuStore`) fingerprint pinning.
 - ✅ **Done when:** it replaces RustDesk/AnyDesk for Omega's day-to-day support.
 
-### Phase 4: Web dashboard and browser client (4–6 weeks)
-- Dashboard: tenants, groups, machines, users, bitflag permissions, layered consent.
-- Web client with WebCodecs in a Worker, per-frame ACK, WebTransport with WebSocket fallback.
-- Connection manager (tree + tags + search) and importers.
-- **Done when:** full access from the browser with latency at most 15 ms above the native client.
+### Phase 4: Web dashboard and browser client (4–6 weeks) ✅
+- ✅ Dashboard (`crates/policy` / `omegadesk-policy`): `Tenant` → `DeviceGroup` → `Device` hierarchy, `UserGroup` memberships, SNI domain-to-tenant routing (`resolve_tenant_by_sni`), explicit `AdminRole` separated from `SiteRights` (`SITERIGHT_*`) and `MeshRights` (`MESHRIGHT_*` bitflags without MeshCentral's `0xFFFFFFFF` superadmin overload), and 4-layer remote-user consent (`tenant | group | machine | user`, ported from MeshCentral `apprelays.js`, `meshrelay.js`, `meshuser.js`, and `webserver.js`).
+- ✅ Web client & gateway (`server/src/web_gateway.rs` + `web/src/`): WebCodecs `VideoDecoder` in a dedicated Worker (`web/src/video-worker.ts`) rendering to `OffscreenCanvas`, WebCodecs capability negotiation (`vp09.00.10.08`, `avc1.42001f`, `av01.0.04M.08` from SubnetDesk `web/src/capabilities.ts`), Selkies binary framing (`0x01`..`0x05`) with per-frame ACK backpressure (`FrameBackpressureGate`), Origin/Host validation and per-IP connection & sliding-window rate limits (`ConnectionLimiter`, `RequestRateBudget` from SubnetDesk `src/web_gateway.rs`), and browser `KeyboardEvent.code` / `key` to QEMU scancode + X11 keysym mapping including ABNT2 `IntlRo` and `IntlBackslash` (from noVNC `core/input/keyboard.js`).
+- ✅ Connection manager (`crates/session/src/connection_manager.rs`): hierarchical folder tree with property inheritance (`InheritanceFlags` from mRemoteNG `ConnectionInfoInheritance.cs`), `#tag` / `+#tag` / `-#tag` filterable tags and direct/initials/discrete-subsequence keyword launcher (from 1Remote `TagAndKeywordEncodeHelper.cs`, `TagFilter.cs`, and `KeywordMatchService.cs`), and `.rdp` (IronRDP `ironrdp-rdpfile` + mRemoteNG `RemoteDesktopConnectionDeserializer.cs`), RDCMan `.rdg` (`RemoteDesktopConnectionManagerDeserializer.cs`), and PuTTY XML (`PuttyConnectionManagerDeserializer.cs`) importers.
+- ✅ Reference enrichments for Phases 1 & 2: preferred-direct vs relay transport racer with `500 ms` priority window (`crates/transport/src/race.rs`, ported from RustDesk `src/client.rs` `race_transports_prefer_webrtc`) and dynamic video-region detector with `500 ms` lossless paint-over refresh (`crates/codec/src/video_region.rs`, ported from KasmVNC `common/rfb/EncodeManager.cxx` `updateVideoStats` and Selkies).
+- ✅ **Done when:** full access from the browser with latency at most 15 ms above the native client.
 
 ### Phase 5: Security, auditing and PAM (4 weeks)
 - Session recording at the relay (`.odrec` + asciicast) and a player in the browser.

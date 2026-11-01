@@ -7,6 +7,7 @@
 //! and the coordination server.
 
 mod pinned;
+pub mod race;
 mod uro;
 
 use std::net::SocketAddr;

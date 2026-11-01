@@ -1,0 +1,7 @@
+{
+  "name": "@omegadesk/web-client",
+  "version": "0.1.0",
+  "private": true,
+  "description": "OmegaDesk browser client using WebTransport/WebSocket, WebCodecs VideoDecoder Worker, and OffscreenCanvas",
+  "type": "module"
+}
