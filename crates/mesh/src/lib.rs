@@ -813,9 +813,12 @@ impl MeshNode {
         if !peer.replay.check_and_accept(counter) {
             return Err(MeshError::TunnelAuthFailed);
         }
-        if let (Some(src), ConnectionPath::Direct { remote }) = (from_udp, peer.path)
-            && src == remote
-        {
+        // Any authenticated packet that arrived directly proves the peer is
+        // alive on the direct path, whichever of its addresses it came from:
+        // a multi-homed or double-NATed peer is seen through several aliases
+        // (LAN address and the router's address), and its replies may use a
+        // different one than the validated `remote`.
+        if from_udp.is_some() && matches!(peer.path, ConnectionPath::Direct { .. }) {
             peer.last_direct_rx = Some(now);
             peer.liveness_probe_sent = false;
         }
@@ -935,9 +938,7 @@ impl MeshNode {
         if let Some(peer) = self.peers_by_id.get_mut(&peer_id) {
             epoch_changed = peer.peer_epoch != Some(epoch);
             peer.learn_peer_epoch(epoch, &local_pub);
-            if let (Some(src), ConnectionPath::Direct { remote }) = (from_udp, peer.path)
-                && src == remote
-            {
+            if from_udp.is_some() && matches!(peer.path, ConnectionPath::Direct { .. }) {
                 peer.last_direct_rx = Some(now);
                 peer.liveness_probe_sent = false;
             }
@@ -1610,6 +1611,60 @@ mod tests {
                 .handle_receive(Some(bob_addr), &data.payload, now)
                 .unwrap(),
             None
+        );
+    }
+
+    #[test]
+    fn direct_liveness_counts_packets_from_any_alias_of_the_peer() {
+        // Field test 2026-11-01: a peer behind a double NAT answered from its
+        // router's address while the validated path pointed at its LAN
+        // address; every packet from the "other" alias was ignored for
+        // liveness, so the path flapped to the relay every 1.5 s.
+        let now = Instant::now();
+        let alice_id = DeviceIdentity::generate();
+        let bob_id = DeviceIdentity::generate();
+        let alice_pub = alice_id.public();
+        let bob_pub = bob_id.public();
+        let alice_addr: SocketAddr = "192.168.1.19:64141".parse().unwrap();
+        let bob_lan: SocketAddr = "192.168.15.36:7070".parse().unwrap();
+        let bob_router: SocketAddr = "192.168.1.14:7070".parse().unwrap();
+        let mut alice = MeshNode::new(alice_id, vec![alice_addr], vec![]);
+        let mut bob = MeshNode::new(bob_id, vec![bob_lan], vec![]);
+        alice.upsert_peer(bob_pub, vec![bob_lan], now);
+        bob.upsert_peer(alice_pub, vec![alice_addr], now);
+        deliver_direct(&mut alice, alice_addr, &mut bob, now);
+        deliver_direct(&mut bob, bob_lan, &mut alice, now);
+        assert_eq!(
+            alice.peer_path(bob_pub.id()),
+            Some(ConnectionPath::Direct { remote: bob_lan })
+        );
+        drain_events(&mut alice);
+
+        // Alice keeps sending; Bob's replies arrive from the router alias.
+        let mut t = now;
+        for _ in 0..6 {
+            t += Duration::from_millis(400);
+            alice.handle_timeout(t);
+            alice
+                .encapsulate(bob_pub.id(), &sample_packet(), t)
+                .unwrap();
+            while alice.poll_transmit().is_some() {}
+            bob.encapsulate(alice_pub.id(), &sample_packet(), t)
+                .unwrap();
+            let reply = bob.poll_transmit().unwrap();
+            alice
+                .handle_receive(Some(bob_router), &reply.payload, t)
+                .unwrap()
+                .unwrap();
+        }
+        alice.handle_timeout(t + DIRECT_LIVENESS_TIMEOUT);
+        assert!(
+            !drain_events(&mut alice).contains(&MeshEvent::FallbackToRelay { peer: bob_pub.id() }),
+            "replies from an alias keep the direct path alive"
+        );
+        assert_eq!(
+            alice.peer_path(bob_pub.id()),
+            Some(ConnectionPath::Direct { remote: bob_lan })
         );
     }
 }
