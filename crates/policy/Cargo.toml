@@ -1,6 +1,6 @@
 [package]
 name = "omegadesk-policy"
-description = "Multi-tenant hierarchy (Tenant > DeviceGroup > Device, UserGroups), MeshCentral MESHRIGHT/SITERIGHT bitflag permissions, explicit Admin roles, and 4-layer remote-user consent"
+description = "Multi-tenant hierarchy (Tenant > DeviceGroup > Device, UserGroups), MeshCentral MESHRIGHT/SITERIGHT bitflag permissions, HuJSON policy/v2 compiler, posture checks, per-connection MFA, and PAM approval/sharing workflows"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -11,6 +11,8 @@ publish.workspace = true
 [dependencies]
 omegadesk-identity.workspace = true
 omegadesk-quicksupport.workspace = true
+ring.workspace = true
+sha2.workspace = true
 thiserror.workspace = true
 
 [lints]

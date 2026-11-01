@@ -4,6 +4,7 @@
 
 pub mod channels;
 pub mod connection_manager;
+pub mod dlp;
 pub mod fec;
 pub mod lan;
 pub mod qos;
@@ -18,6 +19,10 @@ pub use connection_manager::{
     DecodedQuery, ImportError, InheritanceFlags, KeywordMatcher, TagFilter, TagFilterKind,
     decode_keyword, import_putty_xml, import_rdcman_rdg, import_rdp_file, rectify_tag_name,
     split_rdp_full_address,
+};
+pub use dlp::{
+    ClipboardDirection, DlpEnforcer, DlpPolicy, DlpViolation, RedactedRegion, WatermarkConfig,
+    WatermarkOverlay, redact_bgra_region,
 };
 pub use fec::{
     DEFAULT_SHARD_SIZE, FecError, MAX_TOTAL_SHARDS, adaptive_parity_count, encode_fec_block,
