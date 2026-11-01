@@ -75,7 +75,9 @@ jobs:
       # On Linux the capture smoke test runs against a virtual display under xvfb-run.
       - name: Test (Linux, under Xvfb)
         if: matrix.os == 'ubuntu-latest'
-        run: xvfb-run -a cargo test --workspace --all-features --locked
+        env:
+          CARGO_BUILD_JOBS: "2"
+        run: xvfb-run -a cargo test --workspace --all-features --locked -- --test-threads=2
       - name: Test (Windows and macOS)
         if: matrix.os != 'ubuntu-latest'
         run: cargo test --workspace --all-features --locked
