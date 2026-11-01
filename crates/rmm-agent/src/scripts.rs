@@ -398,6 +398,7 @@ async fn run_with(
         Ok(Ok(output)) => output,
         Ok(Err(_)) | Err(_) => (Vec::new(), true),
     };
+    #[cfg(windows)]
     drop(process_tree);
     let _ = tokio::fs::remove_file(&path).await;
 
