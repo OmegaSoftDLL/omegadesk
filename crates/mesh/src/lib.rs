@@ -69,8 +69,18 @@ pub const TRUST_UDP_ADDR_DURATION: Duration = Duration::from_millis(6500);
 pub const DIRECT_LIVENESS_PROBE_AFTER: Duration = Duration::from_millis(500);
 
 /// While traffic is being sent on a direct path, silence from the peer for this
-/// long abandons the path and falls back to the relay (within the 2 s budget).
+/// long abandons the path and falls back to the relay (within the 2 s budget):
+/// [`DIRECT_LIVENESS_PROBE_AFTER`] of silence, then [`DIRECT_LIVENESS_PONG_TIMEOUT`]
+/// for the liveness `Ping` to be answered.
 pub const DIRECT_LIVENESS_TIMEOUT: Duration = Duration::from_millis(1500);
+
+/// Time the liveness `Ping` has to be answered by a `Pong` before the direct
+/// path is abandoned. Only the explicit `Pong` (from any address of the peer)
+/// or a direct packet from the peer counts: a peer that currently sends *its*
+/// traffic through the relay while still answering our pings keeps our
+/// direct path valid (asymmetric paths are legitimate, Tailscale `magicsock`
+/// treats each direction independently).
+pub const DIRECT_LIVENESS_PONG_TIMEOUT: Duration = Duration::from_millis(1000);
 
 /// Time after which an unanswered `Ping` or STUN request is forgotten
 /// (Tailscale `tsconst.DefaultPingTimeout`).
@@ -255,7 +265,8 @@ struct PeerState {
     last_direct_rx: Option<Instant>,
     /// Last datagram we sent on the validated direct address.
     last_direct_tx: Option<Instant>,
-    liveness_probe_sent: bool,
+    /// When the liveness `Ping` for the current silence was sent, if any.
+    liveness_probe_at: Option<Instant>,
 }
 
 impl PeerState {
@@ -489,7 +500,7 @@ impl MeshNode {
                 connected_emitted: false,
                 last_direct_rx: None,
                 last_direct_tx: None,
-                liveness_probe_sent: false,
+                liveness_probe_at: None,
             },
         );
         self.send_probes_for_peer(peer_id, now);
@@ -552,7 +563,7 @@ impl MeshNode {
             && matches!(p.path, ConnectionPath::Direct { .. })
         {
             p.last_direct_rx = Some(now);
-            p.liveness_probe_sent = false;
+            p.liveness_probe_at = None;
         }
     }
 
@@ -577,10 +588,10 @@ impl MeshNode {
                         consider(trust);
                     }
                     if let Some(rx) = peer.direct_traffic_pending() {
-                        if !peer.liveness_probe_sent {
-                            consider(rx + DIRECT_LIVENESS_PROBE_AFTER);
+                        match peer.liveness_probe_at {
+                            None => consider(rx + DIRECT_LIVENESS_PROBE_AFTER),
+                            Some(probe) => consider(probe + DIRECT_LIVENESS_PONG_TIMEOUT),
                         }
-                        consider(rx + DIRECT_LIVENESS_TIMEOUT);
                     }
                 }
             }
@@ -622,12 +633,13 @@ impl MeshNode {
                 match peer.path {
                     ConnectionPath::Direct { remote } => {
                         let trust_expired = peer.trust_until.is_some_and(|trust| now >= trust);
-                        let silent_under_traffic = peer
-                            .direct_traffic_pending()
-                            .is_some_and(|rx| now >= rx + DIRECT_LIVENESS_TIMEOUT);
-                        if trust_expired || silent_under_traffic {
-                            // No Pong for TRUST_UDP_ADDR_DURATION, or active traffic
-                            // unanswered for DIRECT_LIVENESS_TIMEOUT: the path is dead.
+                        let probe_unanswered = peer.direct_traffic_pending().is_some()
+                            && peer
+                                .liveness_probe_at
+                                .is_some_and(|probe| now >= probe + DIRECT_LIVENESS_PONG_TIMEOUT);
+                        if trust_expired || probe_unanswered {
+                            // No Pong for TRUST_UDP_ADDR_DURATION, or the liveness Ping
+                            // sent under active traffic went unanswered: the path is dead.
                             peer.path = ConnectionPath::Relayed {
                                 peer_exchange_key: peer.public.exchange_key_bytes(),
                             };
@@ -636,7 +648,7 @@ impl MeshNode {
                             peer.fallback_deadline = None;
                             peer.last_direct_rx = None;
                             peer.last_direct_tx = None;
-                            peer.liveness_probe_sent = false;
+                            peer.liveness_probe_at = None;
                             peer.next_probe_at = now;
                             self.events
                                 .push_back(MeshEvent::FallbackToRelay { peer: peer_id });
@@ -644,9 +656,9 @@ impl MeshNode {
                         } else if peer
                             .direct_traffic_pending()
                             .is_some_and(|rx| now >= rx + DIRECT_LIVENESS_PROBE_AFTER)
-                            && !peer.liveness_probe_sent
+                            && peer.liveness_probe_at.is_none()
                         {
-                            peer.liveness_probe_sent = true;
+                            peer.liveness_probe_at = Some(now);
                             ping_to = Some(remote);
                         } else if now >= peer.next_heartbeat_at {
                             peer.next_heartbeat_at = now + HEARTBEAT_INTERVAL;
@@ -820,7 +832,7 @@ impl MeshNode {
         // different one than the validated `remote`.
         if from_udp.is_some() && matches!(peer.path, ConnectionPath::Direct { .. }) {
             peer.last_direct_rx = Some(now);
-            peer.liveness_probe_sent = false;
+            peer.liveness_probe_at = None;
         }
 
         let ip_packet = IpPacket::parse(plaintext)?;
@@ -940,7 +952,7 @@ impl MeshNode {
             peer.learn_peer_epoch(epoch, &local_pub);
             if from_udp.is_some() && matches!(peer.path, ConnectionPath::Direct { .. }) {
                 peer.last_direct_rx = Some(now);
-                peer.liveness_probe_sent = false;
+                peer.liveness_probe_at = None;
             }
         }
         match msg {
@@ -1017,7 +1029,7 @@ impl MeshNode {
         let Some(peer) = self.peers_by_id.get_mut(&peer_id) else {
             return;
         };
-        let Some((_, sent_at)) = peer.inflight_pings.remove(&tx_id) else {
+        let Some((pinged, sent_at)) = peer.inflight_pings.remove(&tx_id) else {
             return;
         };
         let rtt = now.saturating_duration_since(sent_at);
@@ -1040,11 +1052,18 @@ impl MeshNode {
             };
             peer.best_rtt = Some(rtt);
         }
-        if matches!(peer.path, ConnectionPath::Direct { remote } if remote == remote_addr) {
+        // The Pong validates the current path when it comes back from the
+        // validated address or answers a Ping we sent to it (a multi-homed or
+        // double-NATed peer may reply from another of its addresses).
+        let validates_current = matches!(
+            peer.path,
+            ConnectionPath::Direct { remote } if remote == remote_addr || remote == pinged
+        );
+        if validates_current {
             peer.trust_until = Some(now + TRUST_UDP_ADDR_DURATION);
             peer.next_heartbeat_at = now + HEARTBEAT_INTERVAL;
             peer.last_direct_rx = Some(now);
-            peer.liveness_probe_sent = false;
+            peer.liveness_probe_at = None;
         }
         peer.fallback_deadline = None;
         if !peer.connected_emitted {
@@ -1661,6 +1680,114 @@ mod tests {
         assert!(
             !drain_events(&mut alice).contains(&MeshEvent::FallbackToRelay { peer: bob_pub.id() }),
             "replies from an alias keep the direct path alive"
+        );
+        assert_eq!(
+            alice.peer_path(bob_pub.id()),
+            Some(ConnectionPath::Direct { remote: bob_lan })
+        );
+    }
+
+    /// Validates a direct path from `a` to `b` by exchanging the initial probes.
+    fn establish_direct(
+        a: &mut MeshNode,
+        a_addr: SocketAddr,
+        b: &mut MeshNode,
+        b_addr: SocketAddr,
+        now: Instant,
+    ) {
+        deliver_direct(a, a_addr, b, now);
+        deliver_direct(b, b_addr, a, now);
+        drain_events(a);
+        drain_events(b);
+    }
+
+    #[test]
+    fn asymmetric_paths_are_stable_when_liveness_pings_are_answered() {
+        // Field test 2026-11-01: both sides flapped every ~2 s. Alice sent
+        // directly while Bob (who had just fallen back) sent through the relay;
+        // Bob's relayed data did not count as liveness for Alice, so her path
+        // died 1.5 s later and dragged Bob along. Only the answer to the
+        // explicit liveness Ping decides now.
+        let now = Instant::now();
+        let alice_id = DeviceIdentity::generate();
+        let bob_id = DeviceIdentity::generate();
+        let alice_pub = alice_id.public();
+        let bob_pub = bob_id.public();
+        let alice_addr: SocketAddr = "192.168.1.19:64141".parse().unwrap();
+        let bob_addr: SocketAddr = "192.168.1.14:7070".parse().unwrap();
+        let mut alice = MeshNode::new(alice_id, vec![alice_addr], vec![]);
+        let mut bob = MeshNode::new(bob_id, vec![bob_addr], vec![]);
+        alice.upsert_peer(bob_pub, vec![bob_addr], now);
+        bob.upsert_peer(alice_pub, vec![alice_addr], now);
+        establish_direct(&mut alice, alice_addr, &mut bob, bob_addr, now);
+        assert!(matches!(
+            alice.peer_path(bob_pub.id()),
+            Some(ConnectionPath::Direct { .. })
+        ));
+
+        let mut t = now;
+        for _ in 0..12 {
+            t += Duration::from_millis(500);
+            // Alice sends directly; Bob's data comes back through the relay only.
+            alice
+                .encapsulate(bob_pub.id(), &sample_packet(), t)
+                .unwrap();
+            while alice.poll_transmit().is_some() {}
+            bob.encapsulate(alice_pub.id(), &sample_packet(), t)
+                .unwrap();
+            let relayed = bob.poll_transmit().unwrap();
+            alice
+                .handle_receive(None, &relayed.payload, t)
+                .unwrap()
+                .unwrap();
+            // Alice's timers: a liveness Ping goes out; Bob answers it directly.
+            alice.handle_timeout(t);
+            deliver_direct(&mut alice, alice_addr, &mut bob, t);
+            deliver_direct(&mut bob, bob_addr, &mut alice, t);
+        }
+        assert!(
+            !drain_events(&mut alice).contains(&MeshEvent::FallbackToRelay { peer: bob_pub.id() }),
+            "answered liveness pings keep the direct path"
+        );
+        assert_eq!(
+            alice.peer_path(bob_pub.id()),
+            Some(ConnectionPath::Direct { remote: bob_addr })
+        );
+    }
+
+    #[test]
+    fn heartbeat_pong_from_an_alias_refreshes_trust() {
+        let now = Instant::now();
+        let alice_id = DeviceIdentity::generate();
+        let bob_id = DeviceIdentity::generate();
+        let alice_pub = alice_id.public();
+        let bob_pub = bob_id.public();
+        let alice_addr: SocketAddr = "192.168.1.19:64141".parse().unwrap();
+        let bob_lan: SocketAddr = "192.168.15.36:7070".parse().unwrap();
+        let bob_router: SocketAddr = "192.168.1.14:7070".parse().unwrap();
+        let mut alice = MeshNode::new(alice_id, vec![alice_addr], vec![]);
+        let mut bob = MeshNode::new(bob_id, vec![bob_lan], vec![]);
+        alice.upsert_peer(bob_pub, vec![bob_lan], now);
+        bob.upsert_peer(alice_pub, vec![alice_addr], now);
+        establish_direct(&mut alice, alice_addr, &mut bob, bob_lan, now);
+        assert_eq!(
+            alice.peer_path(bob_pub.id()),
+            Some(ConnectionPath::Direct { remote: bob_lan })
+        );
+
+        // Idle path: heartbeats every 3 s, each Pong arriving from the router
+        // alias instead of the validated LAN address, for longer than the
+        // 6.5 s trust window.
+        let mut t = now;
+        for _ in 0..4 {
+            t += HEARTBEAT_INTERVAL;
+            alice.handle_timeout(t);
+            deliver_direct(&mut alice, alice_addr, &mut bob, t);
+            deliver_direct(&mut bob, bob_router, &mut alice, t);
+        }
+        assert!(
+            !drain_events(&mut alice).contains(&MeshEvent::FallbackToRelay { peer: bob_pub.id() }),
+            "a Pong answering a Ping to the validated address refreshes trust"
         );
         assert_eq!(
             alice.peer_path(bob_pub.id()),
