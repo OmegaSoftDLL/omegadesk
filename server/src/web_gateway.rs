@@ -32,6 +32,8 @@ use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use omegadesk_input::{WHEEL_STEP, buttons, modifiers};
+use omegadesk_protocol::v1::{KeyEvent, PointerEvent, VideoCodec};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 /// Default HTTPS/WebSocket port (`SubnetDesk/src/web_gateway.rs:66`).
@@ -101,6 +103,9 @@ pub enum WebGatewayError {
         /// Total frame length received.
         len: usize,
     },
+    /// Text frame is not a valid [`WebClientMessage`].
+    #[error("invalid control message: {0}")]
+    InvalidControlMessage(String),
 }
 
 /// Global and per-IP connection limiter ported from `zibo-chen_SubnetDesk/src/web_gateway.rs`
@@ -691,6 +696,17 @@ impl FrameBackpressureGate {
                 .saturating_add(BACKPRESSURE_ALLOWED_DESYNC_MS)
     }
 
+    /// Restarts the stall timer after a probe keyframe was sent to a stalled client.
+    ///
+    /// Selkies sends a stalled client nothing, then after
+    /// `STALLED_CLIENT_REPROBE_SECONDS` "reopens on an IDR and the stall timer restarts
+    /// from that send, which a client that is still gone trips again and a returned one
+    /// answers" (`websockets_mode.py` `_run_frame_backpressure_logic`). Without this the
+    /// probe would be judged stalled immediately, since frames are already in flight.
+    pub const fn record_probe_sent(&mut self, now: Instant) {
+        self.last_ack_at = Some(now);
+    }
+
     /// Returns `true` if the client has not acknowledged any frame within
     /// [`STALLED_CLIENT_TIMEOUT`] (`4.0 s`, `websockets_mode.py:196`).
     #[must_use]
@@ -967,6 +983,285 @@ fn character_keysym(key: &str) -> u32 {
 
 const ISO_LEVEL3_SHIFT_KEYSYM: u32 = 0xFE03;
 
+/// `WebSocket` text (JSON) control protocol shared with the browser client. **This Rust
+/// definition is the source of truth**; `web/src/protocol.ts` mirrors it field by field
+/// and both sides parse the same fixtures ([`WEB_CONTROL_CONNECT_FIXTURE`],
+/// [`WEB_CONTROL_VIDEO_CONFIG_FIXTURE`]).
+///
+/// Binary frames carry video and ACKs ([`WEB_VIDEO_PROTOCOL`]); text frames carry one
+/// JSON object per message with a `type` discriminator, the way Selkies types its text
+/// verbs (`websockets_mode.py`) and Guacamole's `GuacamoleWebSocketTunnelEndpoint`
+/// keeps the control instructions on the text side of the socket.
+pub const WEB_CONTROL_PROTOCOL: &str = "omegadesk-web-control/1";
+
+/// Longest accepted agent name in a `connect` message (a DNS name).
+pub const MAX_AGENT_NAME_LEN: usize = 253;
+
+/// Longest accepted access password in a `connect` message.
+pub const MAX_PASSWORD_LEN: usize = 256;
+
+/// Longest accepted `KeyboardEvent.code` / `KeyboardEvent.key` string.
+pub const MAX_KEY_STRING_LEN: usize = 32;
+
+/// Largest text (JSON) message accepted from the browser.
+pub const MAX_CONTROL_MESSAGE_LEN: usize = 4096;
+
+/// Shared fixture: the `connect` message the browser sends after the login form.
+/// `web/src/protocol.ts` (`CONNECT_FIXTURE`) encodes the same JSON.
+pub const WEB_CONTROL_CONNECT_FIXTURE: &str =
+    r#"{"type":"connect","agent":"office-pc","password":"correct horse"}"#;
+
+/// Shared fixture: the `video-config` message the gateway sends before the first
+/// keyframe. `web/src/protocol.ts` (`VIDEO_CONFIG_FIXTURE`) parses the same JSON.
+pub const WEB_CONTROL_VIDEO_CONFIG_FIXTURE: &str =
+    r#"{"type":"video-config","codec":"avc1.42001f","width":1920,"height":1080}"#;
+
+/// JSON text message from the browser to the gateway (`web/src/protocol.ts`
+/// `ClientMessage`).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "type", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum WebClientMessage {
+    /// Login: agent name (`office-pc` or `office-pc.omega`) and its access password.
+    Connect {
+        /// Agent name on the mesh.
+        agent: String,
+        /// Access password typed in the browser, forwarded in `Hello`.
+        password: String,
+    },
+    /// Keyboard event; the gateway maps `code`/`key` with [`map_browser_key_event`].
+    Key {
+        /// `KeyboardEvent.code` (physical key).
+        code: String,
+        /// `KeyboardEvent.key` (layout-dependent value).
+        key: String,
+        /// `true` on `keydown`, `false` on `keyup`.
+        pressed: bool,
+        /// `omegadesk_input::modifiers` bitmask computed by `web/src/input.ts`.
+        #[serde(default)]
+        modifiers: u32,
+    },
+    /// Pointer state: absolute position normalized to `0..=65535`, button mask and
+    /// wheel deltas in 1/120-notch units (`PointerEvent` in `session.proto`).
+    Pointer {
+        /// Normalized X.
+        x: u32,
+        /// Normalized Y.
+        y: u32,
+        /// `omegadesk_input::buttons` bitmask.
+        #[serde(default)]
+        buttons: u32,
+        /// Horizontal wheel delta (positive = right).
+        #[serde(default)]
+        wheel_x: i32,
+        /// Vertical wheel delta (positive = up).
+        #[serde(default)]
+        wheel_y: i32,
+    },
+    /// The decoder lost its reference (Selkies `requestKeyframe()`): forwarded to the
+    /// agent as `RequestKeyframe`.
+    RequestKeyframe {
+        /// Human-readable reason, logged only.
+        #[serde(default)]
+        reason: String,
+    },
+    /// Browser round-trip probe; answered with [`WebServerMessage::Pong`].
+    Ping {
+        /// Browser clock (`performance.now()`), echoed back unchanged.
+        sent_at_ms: f64,
+    },
+}
+
+/// JSON text message from the gateway to the browser (`web/src/protocol.ts`
+/// `ServerMessage`).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "type", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum WebServerMessage {
+    /// `HelloAck` arrived: the agent accepted the password.
+    Connected {
+        /// Device name reported by the agent.
+        agent: String,
+        /// Agent `DeviceId` (from its signing key), for the status bar.
+        device_id: String,
+    },
+    /// Sent before the first keyframe and whenever the frame size changes, so the
+    /// browser configures its `VideoDecoder` (`web/src/video-worker.ts` `init` /
+    /// `reconfigure`).
+    VideoConfig {
+        /// `WebCodecs` codec string (`avc1.42001f`, ...).
+        codec: String,
+        /// Coded width in pixels.
+        width: u32,
+        /// Coded height in pixels.
+        height: u32,
+    },
+    /// Answer to [`WebClientMessage::Ping`].
+    Pong {
+        /// The browser timestamp from the ping.
+        sent_at_ms: f64,
+    },
+    /// Periodic latency and backpressure statistics.
+    Stats {
+        /// Smoothed gateway-to-agent QUIC round trip (`Ping`/`Pong` on the control stream).
+        agent_rtt_ms: u64,
+        /// Smoothed gateway-to-browser round trip from per-frame ACKs
+        /// ([`FrameBackpressureGate::smoothed_rtt_ms`]).
+        browser_rtt_ms: u64,
+        /// `host_processing_micros` of the newest forwarded frame, in milliseconds.
+        host_processing_ms: u32,
+        /// Frames forwarded to the browser since the session started.
+        frames_sent: u64,
+        /// Frames dropped by the gate or while waiting for a keyframe.
+        frames_dropped: u64,
+        /// Frames sent and not yet acknowledged.
+        in_flight: usize,
+    },
+    /// The session cannot continue (bad password, unknown agent, agent gone).
+    Error {
+        /// Human-readable reason.
+        message: String,
+    },
+}
+
+impl WebClientMessage {
+    /// Parses one text frame from the browser.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WebGatewayError::InvalidControlMessage`] if the text is longer than
+    /// [`MAX_CONTROL_MESSAGE_LEN`], is not one of the known messages, or carries a
+    /// field outside its limits.
+    pub fn parse(text: &str) -> Result<Self, WebGatewayError> {
+        if text.len() > MAX_CONTROL_MESSAGE_LEN {
+            return Err(WebGatewayError::InvalidControlMessage(format!(
+                "{} bytes exceeds the {MAX_CONTROL_MESSAGE_LEN}-byte limit",
+                text.len()
+            )));
+        }
+        let message: Self = serde_json::from_str(text)
+            .map_err(|error| WebGatewayError::InvalidControlMessage(error.to_string()))?;
+        let invalid = |what: &str| Err(WebGatewayError::InvalidControlMessage(what.to_owned()));
+        match &message {
+            Self::Connect { agent, password } => {
+                if agent.is_empty() || agent.len() > MAX_AGENT_NAME_LEN {
+                    return invalid("agent name length");
+                }
+                if !agent
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_'))
+                {
+                    return invalid("agent name characters");
+                }
+                if password.len() > MAX_PASSWORD_LEN {
+                    return invalid("password length");
+                }
+            }
+            Self::Key { code, key, .. } => {
+                if code.len() > MAX_KEY_STRING_LEN || key.len() > MAX_KEY_STRING_LEN {
+                    return invalid("key string length");
+                }
+            }
+            Self::Pointer { x, y, .. } => {
+                if *x > 0xFFFF || *y > 0xFFFF {
+                    return invalid("pointer position out of range");
+                }
+            }
+            Self::RequestKeyframe { reason } => {
+                if reason.len() > 128 {
+                    return invalid("reason length");
+                }
+            }
+            Self::Ping { sent_at_ms } => {
+                if !sent_at_ms.is_finite() {
+                    return invalid("ping timestamp");
+                }
+            }
+        }
+        Ok(message)
+    }
+}
+
+impl WebServerMessage {
+    /// Serializes the message as one JSON text frame.
+    #[must_use]
+    pub fn to_json(&self) -> String {
+        // Every variant is a flat struct of strings and numbers; serialization cannot fail.
+        serde_json::to_string(self).unwrap_or_else(|_| {
+            r#"{"type":"error","message":"internal serialization error"}"#.to_owned()
+        })
+    }
+}
+
+/// `WebCodecs` codec string for a negotiated session codec, or `None` if the browser
+/// client cannot decode it.
+#[must_use]
+pub fn web_codec_string(codec: VideoCodec) -> Option<&'static str> {
+    let protocol = match codec {
+        VideoCodec::H264 => WebVideoCodec::H264,
+        VideoCodec::Vp9 => WebVideoCodec::Vp9,
+        VideoCodec::Av1 => WebVideoCodec::Av1,
+        VideoCodec::H265 | VideoCodec::Unspecified => return None,
+    };
+    VIDEO_CODEC_CANDIDATES
+        .iter()
+        .find(|candidate| candidate.protocol == protocol)
+        .map(|candidate| candidate.codec_string)
+}
+
+/// Translates a browser keyboard message into the session `KeyEvent`, or `None` for a
+/// key the agent cannot inject (unknown `code`). Unknown modifier bits are dropped.
+#[must_use]
+pub fn key_event_from_browser(
+    code: &str,
+    key: &str,
+    pressed: bool,
+    modifiers: u32,
+) -> Option<KeyEvent> {
+    let mapping = map_browser_key_event(code, key)?;
+    Some(KeyEvent {
+        hid_usage: u32::from(mapping.usb_hid_usage),
+        keysym: mapping.keysym,
+        pressed,
+        modifiers: modifiers & KNOWN_MODIFIER_BITS,
+    })
+}
+
+/// Translates a browser pointer message into the session `PointerEvent`: position is
+/// clamped to `0..=65535`, unknown button bits are dropped and wheel deltas are capped
+/// to a sane number of notches.
+#[must_use]
+pub fn pointer_event_from_browser(
+    x: u32,
+    y: u32,
+    buttons: u32,
+    wheel_x: i32,
+    wheel_y: i32,
+) -> PointerEvent {
+    PointerEvent {
+        display_index: 0,
+        x: x.min(0xFFFF),
+        y: y.min(0xFFFF),
+        buttons: buttons & KNOWN_BUTTON_BITS,
+        wheel_x: wheel_x.clamp(-MAX_WHEEL_DELTA, MAX_WHEEL_DELTA),
+        wheel_y: wheel_y.clamp(-MAX_WHEEL_DELTA, MAX_WHEEL_DELTA),
+    }
+}
+
+/// `omegadesk_input::modifiers` bits a browser may set.
+const KNOWN_MODIFIER_BITS: u32 = modifiers::SHIFT
+    | modifiers::CTRL
+    | modifiers::ALT
+    | modifiers::META
+    | modifiers::CAPS_LOCK
+    | modifiers::NUM_LOCK
+    | modifiers::LOCK_STATE_VALID;
+
+/// `omegadesk_input::buttons` bits a browser may set.
+const KNOWN_BUTTON_BITS: u32 =
+    buttons::LEFT | buttons::RIGHT | buttons::MIDDLE | buttons::BACK | buttons::FORWARD;
+
+/// Largest wheel delta accepted per pointer message (50 notches).
+const MAX_WHEEL_DELTA: i32 = 50 * WHEEL_STEP;
+
 #[cfg(test)]
 mod tests {
     use std::net::Ipv4Addr;
@@ -1127,6 +1422,28 @@ mod tests {
         assert!(gate.is_client_stalled(resume + STALLED_CLIENT_TIMEOUT));
     }
 
+    /// A probe keyframe sent to a stalled client restarts the stall timer, so the
+    /// gateway judges the client on the probe rather than on the frames it never saw.
+    #[test]
+    fn probe_keyframe_restarts_the_stall_timer() {
+        let mut gate = FrameBackpressureGate::new();
+        let t0 = Instant::now();
+        gate.record_frame_sent(1, t0);
+        assert!(gate.is_client_stalled(t0 + STALLED_CLIENT_TIMEOUT));
+
+        let probe_at = t0 + STALLED_CLIENT_TIMEOUT + Duration::from_secs(2);
+        gate.record_frame_sent(2, probe_at);
+        gate.record_probe_sent(probe_at);
+        assert!(!gate.is_client_stalled(probe_at + Duration::from_secs(1)));
+        assert!(gate.is_client_stalled(probe_at + STALLED_CLIENT_TIMEOUT));
+
+        // A returned client answers the probe and is no longer stalled.
+        gate.record_frame_ack(2, probe_at + Duration::from_millis(30));
+        gate.record_frame_ack(1, probe_at + Duration::from_millis(31));
+        assert_eq!(gate.in_flight_len(), 0);
+        assert!(!gate.is_client_stalled(probe_at + Duration::from_secs(10)));
+    }
+
     /// Regression for the PR #38 review: a discard ACK for a newer frame must not clear
     /// the older frames still inside the browser decoder from the in-flight queue.
     #[test]
@@ -1233,6 +1550,151 @@ mod tests {
         assert_eq!(
             parse_web_frame_ack(&WEB_VIDEO_FRAME_FIXTURE),
             Err(WebGatewayError::UnknownBinaryOpcode(0x04))
+        );
+    }
+
+    /// The JSON control contract is pinned by fixtures that `web/src/protocol.ts`
+    /// (`CONNECT_FIXTURE`, `VIDEO_CONFIG_FIXTURE`) encodes and parses identically.
+    #[test]
+    fn web_control_protocol_fixtures_match_the_browser_contract() {
+        assert_eq!(
+            WebClientMessage::parse(WEB_CONTROL_CONNECT_FIXTURE),
+            Ok(WebClientMessage::Connect {
+                agent: "office-pc".to_owned(),
+                password: "correct horse".to_owned(),
+            })
+        );
+        assert_eq!(
+            serde_json::to_string(&WebClientMessage::Connect {
+                agent: "office-pc".to_owned(),
+                password: "correct horse".to_owned(),
+            })
+            .unwrap(),
+            WEB_CONTROL_CONNECT_FIXTURE
+        );
+        let video_config = WebServerMessage::VideoConfig {
+            codec: "avc1.42001f".to_owned(),
+            width: 1920,
+            height: 1080,
+        };
+        assert_eq!(video_config.to_json(), WEB_CONTROL_VIDEO_CONFIG_FIXTURE);
+        assert_eq!(
+            serde_json::from_str::<WebServerMessage>(WEB_CONTROL_VIDEO_CONFIG_FIXTURE).unwrap(),
+            video_config
+        );
+
+        // Every browser message parses with the field names `web/src/protocol.ts` sends.
+        assert_eq!(
+            WebClientMessage::parse(
+                r#"{"type":"key","code":"KeyA","key":"a","pressed":true,"modifiers":129}"#
+            ),
+            Ok(WebClientMessage::Key {
+                code: "KeyA".to_owned(),
+                key: "a".to_owned(),
+                pressed: true,
+                modifiers: 129,
+            })
+        );
+        assert_eq!(
+            WebClientMessage::parse(r#"{"type":"pointer","x":1,"y":2,"buttons":1,"wheel_y":-120}"#),
+            Ok(WebClientMessage::Pointer {
+                x: 1,
+                y: 2,
+                buttons: 1,
+                wheel_x: 0,
+                wheel_y: -120,
+            })
+        );
+        assert_eq!(
+            WebClientMessage::parse(r#"{"type":"request-keyframe"}"#),
+            Ok(WebClientMessage::RequestKeyframe {
+                reason: String::new(),
+            })
+        );
+        assert_eq!(
+            WebClientMessage::parse(r#"{"type":"ping","sent_at_ms":12.5}"#),
+            Ok(WebClientMessage::Ping { sent_at_ms: 12.5 })
+        );
+        assert!(
+            WebServerMessage::Pong { sent_at_ms: 12.5 }
+                .to_json()
+                .contains(r#""type":"pong""#)
+        );
+    }
+
+    #[test]
+    fn web_control_messages_outside_their_limits_are_rejected() {
+        let rejects = |text: &str| {
+            assert!(
+                matches!(
+                    WebClientMessage::parse(text),
+                    Err(WebGatewayError::InvalidControlMessage(_))
+                ),
+                "{text}"
+            );
+        };
+        rejects("not json");
+        rejects(r#"{"type":"shutdown"}"#);
+        rejects(r#"{"type":"connect","agent":"","password":"x"}"#);
+        rejects(r#"{"type":"connect","agent":"office pc","password":"x"}"#);
+        rejects(r#"{"type":"connect","agent":"../etc","password":"x"}"#);
+        rejects(&format!(
+            r#"{{"type":"connect","agent":"{}","password":"x"}}"#,
+            "a".repeat(MAX_AGENT_NAME_LEN + 1)
+        ));
+        rejects(&format!(
+            r#"{{"type":"connect","agent":"pc","password":"{}"}}"#,
+            "p".repeat(MAX_PASSWORD_LEN + 1)
+        ));
+        rejects(r#"{"type":"connect","agent":"pc","password":"x","extra":1}"#);
+        rejects(&format!(
+            r#"{{"type":"key","code":"{}","key":"a","pressed":true}}"#,
+            "K".repeat(MAX_KEY_STRING_LEN + 1)
+        ));
+        rejects(r#"{"type":"pointer","x":65536,"y":0}"#);
+        rejects(r#"{"type":"pointer","x":-1,"y":0}"#);
+        rejects(&format!(
+            r#"{{"type":"request-keyframe","reason":"{}"}}"#,
+            "r".repeat(129)
+        ));
+        rejects(&format!(
+            r#"{{"type":"ping","sent_at_ms":1,"pad":"{}"}}"#,
+            "x".repeat(MAX_CONTROL_MESSAGE_LEN)
+        ));
+    }
+
+    #[test]
+    fn browser_input_translates_to_session_events_with_unknown_bits_dropped() {
+        assert_eq!(web_codec_string(VideoCodec::H264), Some("avc1.42001f"));
+        assert_eq!(web_codec_string(VideoCodec::Vp9), Some("vp09.00.10.08"));
+        assert_eq!(web_codec_string(VideoCodec::Av1), Some("av01.0.04M.08"));
+        assert_eq!(web_codec_string(VideoCodec::H265), None);
+        assert_eq!(web_codec_string(VideoCodec::Unspecified), None);
+
+        let key = key_event_from_browser("KeyA", "a", true, 0xFFFF_FFFF).unwrap();
+        assert_eq!(key.hid_usage, 0x04);
+        assert_eq!(key.keysym, u32::from(b'a'));
+        assert!(key.pressed);
+        assert_eq!(key.modifiers, KNOWN_MODIFIER_BITS);
+        assert_eq!(
+            key.modifiers & 0x40,
+            0,
+            "CTRL_ALT_DEL cannot come from a browser"
+        );
+        assert!(key_event_from_browser("MediaPlayPause", "", true, 0).is_none());
+
+        let pointer = pointer_event_from_browser(70_000, 65_535, 0xFF, -100_000, 100_000);
+        assert_eq!((pointer.x, pointer.y), (65_535, 65_535));
+        assert_eq!(pointer.buttons, KNOWN_BUTTON_BITS);
+        assert_eq!(
+            (pointer.wheel_x, pointer.wheel_y),
+            (-MAX_WHEEL_DELTA, MAX_WHEEL_DELTA)
+        );
+        assert_eq!(pointer.display_index, 0);
+        let plain = pointer_event_from_browser(1, 2, buttons::LEFT, 0, -WHEEL_STEP);
+        assert_eq!(
+            (plain.x, plain.y, plain.buttons, plain.wheel_y),
+            (1, 2, 1, -120)
         );
     }
 

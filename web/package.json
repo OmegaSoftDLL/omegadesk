@@ -2,6 +2,19 @@
   "name": "@omegadesk/web-client",
   "version": "0.1.0",
   "private": true,
-  "description": "OmegaDesk browser client using WebTransport/WebSocket, WebCodecs VideoDecoder Worker, and OffscreenCanvas",
-  "type": "module"
+  "description": "OmegaDesk browser client: WebSocket gateway framing, WebCodecs VideoDecoder worker and OffscreenCanvas",
+  "license": "AGPL-3.0-only",
+  "type": "module",
+  "engines": {
+    "node": ">=22.18"
+  },
+  "scripts": {
+    "check": "tsc -p tsconfig.json --noEmit",
+    "build": "tsc -p tsconfig.build.json && node scripts/copy-static.mjs",
+    "test": "node --test \"tests/**/*.test.ts\""
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.5",
+    "typescript": "^5.9.3"
+  }
 }

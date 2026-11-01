@@ -10,23 +10,35 @@ publish.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+axum.workspace = true
 bytes.workspace = true
 clap.workspace = true
 data-encoding.workspace = true
+futures-util.workspace = true
+omegadesk-control.workspace = true
 omegadesk-identity.workspace = true
+omegadesk-input.workspace = true
+omegadesk-magicsock.workspace = true
 omegadesk-mesh = { path = "../crates/mesh" }
 omegadesk-noise = { path = "../crates/noise" }
 omegadesk-protocol.workspace = true
 prost.workspace = true
 omegadesk-relay = { path = "../relay" }
+omegadesk-transport.workspace = true
 omegadesk-tun = { path = "../crates/tun" }
 rand_core.workspace = true
 ring.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["fs"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio-tungstenite.workspace = true
 
 [lints]
 workspace = true
