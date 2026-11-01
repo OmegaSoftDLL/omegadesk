@@ -88,6 +88,10 @@ pub enum DialError {
     /// The name is not in this tenant's netmap.
     #[error("no agent named `{0}` is enrolled in this tenant")]
     UnknownAgent(String),
+    /// The agent is known but the QUIC connection did not come up within
+    /// [`AGENT_DIAL_TIMEOUT`].
+    #[error("connecting to `{0}` timed out")]
+    Timeout(String),
     /// The mesh connection failed.
     #[error(transparent)]
     Node(#[from] NodeError),
@@ -239,7 +243,7 @@ async fn serve(
 
     let connection = tokio::time::timeout(AGENT_DIAL_TIMEOUT, dialer.dial(&agent))
         .await
-        .map_err(|_| DialError::UnknownAgent(agent.clone()))??;
+        .map_err(|_| DialError::Timeout(agent.clone()))??;
     let result = proxy(ws_tx, ws_rx, &connection, &identity, &password, remote).await;
     connection.close(0u32.into(), b"done");
     let stats = connection.stats();
