@@ -26,7 +26,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use anyhow::Context;
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use omegadesk_codec::EncoderSettings;
 use omegadesk_control::{ControlConfig, parse_server_key};
 use omegadesk_magicsock::{Node, NodeConfig};
@@ -39,6 +39,10 @@ use crate::session::SessionConfig;
 #[derive(Debug, Parser)]
 #[command(version, about = "OmegaDesk remote desktop agent")]
 struct Args {
+    /// Manage the Windows unattended-access service (install, start, ...).
+    #[command(subcommand)]
+    command: Option<Command>,
+
     /// Address and UDP port on which the agent listens for connections.
     #[arg(long, default_value = "0.0.0.0:7070")]
     listen: SocketAddr,
@@ -97,8 +101,19 @@ struct Args {
     key_file: Option<std::path::PathBuf>,
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+/// Agent subcommands.
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// Install, remove, start, stop or run the Windows unattended-access
+    /// service (unattended remote access across the login screen and UAC).
+    Service {
+        /// Service action.
+        #[command(subcommand)]
+        action: omegadesk_service::ServiceCommand,
+    },
+}
+
+fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr()))
@@ -106,7 +121,24 @@ async fn main() -> anyhow::Result<()> {
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
-    let args = Args::parse();
+    let mut args = Args::parse();
+
+    // The service subcommands (including the SCM `run` entry point, which blocks
+    // for the service's lifetime) must not run under a pre-built async runtime,
+    // so they are dispatched before the agent's own runtime is created.
+    if let Some(Command::Service { action }) = args.command.take() {
+        return omegadesk_service::run_command(action);
+    }
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("failed to build the agent runtime")?;
+    runtime.block_on(run_share(args))
+}
+
+/// Runs the screen-sharing agent (the default, no-subcommand behaviour).
+async fn run_share(args: Args) -> anyhow::Result<()> {
     platform::prefer_performance();
 
     let password = match args.password {

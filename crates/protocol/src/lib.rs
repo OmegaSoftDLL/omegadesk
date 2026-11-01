@@ -41,6 +41,23 @@ pub mod control {
     }
 }
 
+/// Windows service <-> session-worker IPC messages exchanged over a named pipe.
+pub mod service {
+    /// Current service IPC protocol version sent in `WorkerHello` / `ServiceWelcome`.
+    pub const SERVICE_PROTOCOL_VERSION: u32 = 1;
+
+    /// Version 1 service IPC messages.
+    #[allow(
+        missing_docs,
+        unreachable_pub,
+        clippy::pedantic,
+        clippy::wildcard_enum_match_arm
+    )]
+    pub mod v1 {
+        include!(concat!(env!("OUT_DIR"), "/omegadesk.service.v1.rs"));
+    }
+}
+
 /// Selects the session codec: the first entry in the host's preference list
 /// that the client is able to decode.
 #[must_use]
