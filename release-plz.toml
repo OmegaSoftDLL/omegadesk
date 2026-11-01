@@ -54,3 +54,51 @@ version_group = "omegadesk"
 [[package]]
 name = "omegadesk-transport"
 version_group = "omegadesk"
+
+[[package]]
+name = "omegadesk-idd"
+version_group = "omegadesk"
+
+[[package]]
+name = "omegadesk-mcp"
+version_group = "omegadesk"
+
+[[package]]
+name = "omegadesk-mesh"
+version_group = "omegadesk"
+
+[[package]]
+name = "omegadesk-noise"
+version_group = "omegadesk"
+
+[[package]]
+name = "omegadesk-policy"
+version_group = "omegadesk"
+
+[[package]]
+name = "omegadesk-quicksupport"
+version_group = "omegadesk"
+
+[[package]]
+name = "omegadesk-rdp"
+version_group = "omegadesk"
+
+[[package]]
+name = "omegadesk-recording"
+version_group = "omegadesk"
+
+[[package]]
+name = "omegadesk-relay"
+version_group = "omegadesk"
+
+[[package]]
+name = "omegadesk-server"
+version_group = "omegadesk"
+
+[[package]]
+name = "omegadesk-session"
+version_group = "omegadesk"
+
+[[package]]
+name = "omegadesk-tun"
+version_group = "omegadesk"
