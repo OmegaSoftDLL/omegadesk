@@ -7,7 +7,12 @@
 //!   input and compiling per-node filter rules on demand.
 //! - `juanfont_headscale/hscontrol/policy/v2/filter.go` (lines 29–175): `compileFilterRules`
 //!   and `reduceFilterRules` translating high-level `groups`/`tags`/`hosts`/`autogroup:self`
-//!   selectors into concrete `(src_ips, dst_ports, proto)` packet filter rules for each node.
+//!   selectors into concrete `(src_ips, dst_ports, proto)` packet filter rules for each node;
+//!   `compileSSHPolicy` (lines 258–460) splitting `autogroup:self` destinations from the others
+//!   and stable-sorting compiled SSH rules so `check` precedes `accept`.
+//! - `juanfont_headscale/hscontrol/policy/v2/compiled.go` (`buildUserNodeIndex`,
+//!   `compileAutogroupSelf`, `filterSourcesToSameUser`): per-node `autogroup:self` expansion
+//!   that intersects every resolved source address with the untagged devices of the target's owner.
 
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
@@ -316,6 +321,13 @@ impl PolicyV2 {
     /// Returns `Ok(Some((action, record_session)))` if a rule permits the login, or `Ok(None)`
     /// if no rule matches.
     ///
+    /// Matching `Check` rules win over matching `Accept` rules regardless of their position in
+    /// the policy, preserving the policy order within each action type. This mirrors
+    /// `compileSSHPolicy` in `juanfont_headscale/hscontrol/policy/v2/filter.go`, which stable-sorts
+    /// the compiled rules so that `check` (`HoldAndDelegate`) entries precede `accept` entries
+    /// (most-restrictive first); otherwise an earlier broad `Accept` would bypass a later
+    /// step-up `Check`.
+    ///
     /// # Errors
     ///
     /// Returns [`HuJsonError`] if a rule references an undefined group.
@@ -325,45 +337,69 @@ impl PolicyV2 {
         target_node: &PolicyNode,
         ssh_user: &str,
     ) -> Result<Option<(SshAction, bool)>, HuJsonError> {
-        for rule in &self.ssh {
-            let user_ok = rule.users.iter().any(|u| {
-                u == "*"
-                    || u == ssh_user
-                    || (u == "autogroup:nonroot" && ssh_user != "root" && !ssh_user.is_empty())
-            });
-            if !user_ok {
-                continue;
-            }
+        let check_rules = self
+            .ssh
+            .iter()
+            .filter(|rule| matches!(rule.action, SshAction::Check { .. }));
+        let accept_rules = self
+            .ssh
+            .iter()
+            .filter(|rule| rule.action == SshAction::Accept);
 
-            let mut dst_matches = false;
-            let mut is_self_rule = false;
-            for dst_sel in &rule.destinations {
-                let allow_self = dst_sel == "autogroup:self";
-                if self.node_matches_selector(target_node, dst_sel, allow_self)? {
-                    dst_matches = true;
-                    is_self_rule |= allow_self;
-                    break;
-                }
-            }
-            if !dst_matches {
-                continue;
-            }
-
-            if is_self_rule
-                && (!source_node.tags.is_empty()
-                    || !target_node.tags.is_empty()
-                    || source_node.user != target_node.user)
-            {
-                continue;
-            }
-
-            for src_sel in &rule.sources {
-                if self.node_matches_selector(source_node, src_sel, false)? {
-                    return Ok(Some((rule.action, rule.record_session)));
-                }
+        for rule in check_rules.chain(accept_rules) {
+            if self.ssh_rule_matches(rule, source_node, target_node, ssh_user)? {
+                return Ok(Some((rule.action, rule.record_session)));
             }
         }
         Ok(None)
+    }
+
+    /// Returns `true` if `rule` authorizes an SSH login as `ssh_user` from `source_node` to
+    /// `target_node`.
+    ///
+    /// Each destination selector is evaluated independently: an `autogroup:self` destination
+    /// only authorizes untagged same-owner pairs (`compileSSHPolicy` in `filter.go` splits
+    /// `autogroupSelfDests` from `otherDests` and resolves the former only for untagged nodes
+    /// owned by the target's user), while any other matching destination is still consulted
+    /// afterwards, so the order of the destinations never changes the decision.
+    fn ssh_rule_matches(
+        &self,
+        rule: &SshAclRule,
+        source_node: &PolicyNode,
+        target_node: &PolicyNode,
+        ssh_user: &str,
+    ) -> Result<bool, HuJsonError> {
+        let user_ok = rule.users.iter().any(|u| {
+            u == "*"
+                || u == ssh_user
+                || (u == "autogroup:nonroot" && ssh_user != "root" && !ssh_user.is_empty())
+        });
+        if !user_ok {
+            return Ok(false);
+        }
+
+        let mut dst_matches = false;
+        for dst_sel in &rule.destinations {
+            let is_self = dst_sel == "autogroup:self";
+            if !self.node_matches_selector(target_node, dst_sel, is_self)? {
+                continue;
+            }
+            if is_self && !is_same_owner_untagged_pair(source_node, target_node) {
+                continue;
+            }
+            dst_matches = true;
+            break;
+        }
+        if !dst_matches {
+            return Ok(false);
+        }
+
+        for src_sel in &rule.sources {
+            if self.node_matches_selector(source_node, src_sel, false)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     fn node_matches_selector(
@@ -408,24 +444,41 @@ impl PolicyV2 {
             return Err(HuJsonError::UndefinedGroup(selector.to_owned()));
         }
 
+        // For `autogroup:self` only the untagged devices of the target's owner may ever appear
+        // as sources (`buildUserNodeIndex` + `compileAutogroupSelf` in
+        // `juanfont_headscale/hscontrol/policy/v2/compiled.go`), and a tagged or ownerless
+        // target gets nothing. Narrowing the candidate set first keeps a wildcard self-rule
+        // linear in the owner's device count instead of scanning the whole mesh per address.
+        let candidates: Vec<&PolicyNode> = if autogroup_self {
+            if !target_node.tags.is_empty() || target_node.user.is_empty() {
+                return Ok(Vec::new());
+            }
+            all_nodes
+                .iter()
+                .filter(|node| is_same_owner_untagged_pair(node, target_node))
+                .collect()
+        } else {
+            all_nodes.iter().collect()
+        };
+
         let mut ips = Vec::new();
-        if let Some(host_ip) = self.hosts.get(selector) {
-            ips.push(*host_ip);
-            return Ok(ips);
-        }
-        if let Ok(ip) = selector.parse::<IpAddr>() {
-            ips.push(ip);
+        let literal = self
+            .hosts
+            .get(selector)
+            .copied()
+            .or_else(|| selector.parse::<IpAddr>().ok());
+        if let Some(ip) = literal {
+            // `filterSourcesToSameUser` in `compiled.go` intersects every resolved source
+            // address, including `hosts` aliases and literal IPs, with the same-owner devices.
+            // Without this an ACL from Bob's IP to `autogroup:self:*` would be compiled into
+            // Alice's node and grant Bob access to her devices.
+            if !autogroup_self || candidates.iter().any(|node| node.ips.contains(&ip)) {
+                ips.push(ip);
+            }
             return Ok(ips);
         }
 
-        for candidate in all_nodes {
-            if autogroup_self
-                && (!candidate.tags.is_empty()
-                    || !target_node.tags.is_empty()
-                    || candidate.user != target_node.user)
-            {
-                continue;
-            }
+        for candidate in candidates {
             if self.node_matches_selector(candidate, selector, false)? {
                 for ip in &candidate.ips {
                     if !ips.contains(ip) {
@@ -436,6 +489,13 @@ impl PolicyV2 {
         }
         Ok(ips)
     }
+}
+
+/// Returns `true` if both nodes are untagged and owned by the same (non-empty) user, which is
+/// the only pairing `autogroup:self` may authorize (`compileAutogroupSelf` and
+/// `buildUserNodeIndex` in `juanfont_headscale/hscontrol/policy/v2/compiled.go`).
+fn is_same_owner_untagged_pair(a: &PolicyNode, b: &PolicyNode) -> bool {
+    a.tags.is_empty() && b.tags.is_empty() && !a.user.is_empty() && a.user == b.user
 }
 
 fn parse_destination_spec(spec: &str) -> Result<(&str, (u16, u16)), HuJsonError> {
@@ -563,6 +623,157 @@ mod tests {
                 },
                 true
             ))
+        );
+    }
+
+    fn node(id: &str, user: &str, ip: Ipv4Addr, tags: &[&str]) -> PolicyNode {
+        PolicyNode {
+            id: id.to_owned(),
+            user: user.to_owned(),
+            ips: vec![IpAddr::V4(ip)],
+            tags: tags.iter().map(|t| (*t).to_owned()).collect(),
+        }
+    }
+
+    const ALICE_IP: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 1);
+    const BOB_IP: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 2);
+
+    /// Issue #29 `hujson.rs:333`: a `hosts` alias or literal IP source must be subject to the
+    /// same untagged/same-owner restriction as every other `autogroup:self` source.
+    #[test]
+    fn autogroup_self_rejects_host_alias_and_literal_ip_sources_of_other_users() {
+        let mut policy = PolicyV2::new();
+        policy
+            .hosts
+            .insert("bob-laptop".to_owned(), IpAddr::V4(BOB_IP));
+        policy
+            .hosts
+            .insert("alice-laptop".to_owned(), IpAddr::V4(ALICE_IP));
+        policy.acls.push(AclRuleV2 {
+            sources: vec!["bob-laptop".to_owned(), BOB_IP.to_string()],
+            destinations: vec!["autogroup:self:*".to_owned()],
+            proto: FilterProto::Any,
+        });
+
+        let alice = node("alice-1", "alice@example.com", ALICE_IP, &[]);
+        let bob = node("bob-1", "bob@example.com", BOB_IP, &[]);
+        let all_nodes = vec![alice.clone(), bob.clone()];
+
+        let rules = policy.compile_for_node(&alice, &all_nodes).unwrap();
+        assert!(
+            rules.is_empty(),
+            "Bob's host alias / IP must not reach Alice's autogroup:self node: {rules:?}"
+        );
+
+        // The same selectors still work when they really are the owner's own devices.
+        policy.acls[0].sources = vec!["alice-laptop".to_owned(), ALICE_IP.to_string()];
+        let rules = policy.compile_for_node(&alice, &all_nodes).unwrap();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].src_ips, vec![IpAddr::V4(ALICE_IP)]);
+
+        // A tagged target never matches autogroup:self, even for its own owner's alias.
+        let alice_tagged = node("alice-srv", "alice@example.com", ALICE_IP, &["tag:prod"]);
+        let rules = policy
+            .compile_for_node(&alice_tagged, &[alice_tagged.clone(), bob])
+            .unwrap();
+        assert_eq!(rules, Vec::<CompiledFilterRule>::new());
+    }
+
+    fn ssh_rule(action: SshAction, sources: &[&str], destinations: &[&str]) -> SshAclRule {
+        SshAclRule {
+            action,
+            sources: sources.iter().map(|s| (*s).to_owned()).collect(),
+            destinations: destinations.iter().map(|d| (*d).to_owned()).collect(),
+            users: vec!["*".to_owned()],
+            record_session: false,
+        }
+    }
+
+    /// Issue #33 `hujson.rs:328`: a matching `Check` rule must win over an earlier broad
+    /// `Accept` rule, as Headscale's `compileSSHPolicy` sorts check rules first.
+    #[test]
+    fn ssh_check_rule_takes_precedence_over_earlier_accept_rule() {
+        let check = SshAction::Check {
+            check_period_secs: 3_600,
+        };
+        let mut policy = PolicyV2::new();
+        policy
+            .ssh
+            .push(ssh_rule(SshAction::Accept, &["*"], &["tag:prod"]));
+        policy
+            .ssh
+            .push(ssh_rule(check, &["bob@example.com"], &["tag:prod"]));
+
+        let bob = node("bob-1", "bob@example.com", BOB_IP, &[]);
+        let prod = node("prod-1", "ops@example.com", ALICE_IP, &["tag:prod"]);
+
+        assert_eq!(
+            policy.evaluate_ssh_access(&bob, &prod, "ubuntu").unwrap(),
+            Some((check, false))
+        );
+
+        // Sources outside the Check rule still fall through to the Accept rule, in policy order.
+        let carol = node(
+            "carol-1",
+            "carol@example.com",
+            Ipv4Addr::new(100, 64, 0, 3),
+            &[],
+        );
+        assert_eq!(
+            policy.evaluate_ssh_access(&carol, &prod, "ubuntu").unwrap(),
+            Some((SshAction::Accept, false))
+        );
+    }
+
+    /// Issue #33 `hujson.rs:358`: the self-ownership restriction applies per destination
+    /// selector, so the order of `autogroup:self` among the destinations cannot change the
+    /// authorization result.
+    #[test]
+    fn ssh_autogroup_self_destination_order_does_not_change_decision() {
+        let alice = node("alice-1", "alice@example.com", ALICE_IP, &[]);
+        let bob = node("bob-1", "bob@example.com", BOB_IP, &[]);
+
+        let decisions: Vec<_> = [
+            ["autogroup:self", "alice@example.com"],
+            ["alice@example.com", "autogroup:self"],
+        ]
+        .into_iter()
+        .map(|destinations| {
+            let mut policy = PolicyV2::new();
+            policy.ssh.push(ssh_rule(
+                SshAction::Accept,
+                &["bob@example.com"],
+                &destinations,
+            ));
+            policy.evaluate_ssh_access(&bob, &alice, "ubuntu").unwrap()
+        })
+        .collect();
+
+        assert_eq!(decisions[0], decisions[1]);
+        assert_eq!(decisions[0], Some((SshAction::Accept, false)));
+
+        // autogroup:self alone still refuses a different owner but accepts the owner's own node.
+        let mut self_only = PolicyV2::new();
+        self_only
+            .ssh
+            .push(ssh_rule(SshAction::Accept, &["*"], &["autogroup:self"]));
+        assert_eq!(
+            self_only
+                .evaluate_ssh_access(&bob, &alice, "ubuntu")
+                .unwrap(),
+            None
+        );
+        let alice_phone = node(
+            "alice-2",
+            "alice@example.com",
+            Ipv4Addr::new(100, 64, 0, 9),
+            &[],
+        );
+        assert_eq!(
+            self_only
+                .evaluate_ssh_access(&alice_phone, &alice, "ubuntu")
+                .unwrap(),
+            Some((SshAction::Accept, false))
         );
     }
 }

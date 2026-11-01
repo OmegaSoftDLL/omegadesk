@@ -37,6 +37,24 @@ pub enum PamError {
     /// Share link does not exist, is inactive, or has expired (`sharing.py` lines 106–115).
     #[error("session share cannot be joined: {0}")]
     ShareJoinDenied(&'static str),
+    /// Approval workflow has no steps, or a step has no assignees, so nobody could ever review it.
+    #[error("ticket '{ticket_id}' has an empty approval workflow: {reason}")]
+    EmptyApprovalWorkflow {
+        /// Ticket being created.
+        ticket_id: String,
+        /// Which part of the workflow is empty.
+        reason: &'static str,
+    },
+    /// Share link names a different live session than the controller that received it.
+    #[error("share '{share_id}' belongs to session '{share_session}', not '{controller_session}'")]
+    ShareSessionMismatch {
+        /// Share identifier.
+        share_id: String,
+        /// Session named by the share link.
+        share_session: String,
+        /// Session managed by the controller.
+        controller_session: String,
+    },
 }
 
 /// Lifecycle state of an [`AccessTicket`] or [`ApprovalStep`] (`general.py` lines 22–25).
@@ -84,13 +102,35 @@ pub struct AccessTicket {
 
 impl AccessTicket {
     /// Creates a new pending [`AccessTicket`] with one or more sequential approval steps.
-    #[must_use]
+    ///
+    /// Every ticket starts [`TicketState::Pending`]: in JumpServer a ticket is only approved
+    /// through `Ticket.approve(processor)` after `create_process_steps_by_flow` built the steps
+    /// (`apps/tickets/models/ticket/general.py` lines 169–171 and 278–286), never because the
+    /// flow had no rules. A missing or empty approval configuration therefore fails closed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PamError::EmptyApprovalWorkflow`] if `step_assignees` is empty or any step has
+    /// no assignees, since such a ticket could never be reviewed by anyone.
     pub fn new(
         ticket_id: impl Into<String>,
         applicant: impl Into<String>,
         target_device: DeviceId,
         step_assignees: Vec<HashSet<String>>,
-    ) -> Self {
+    ) -> Result<Self, PamError> {
+        let ticket_id = ticket_id.into();
+        if step_assignees.is_empty() {
+            return Err(PamError::EmptyApprovalWorkflow {
+                ticket_id,
+                reason: "no approval steps configured",
+            });
+        }
+        if step_assignees.iter().any(HashSet::is_empty) {
+            return Err(PamError::EmptyApprovalWorkflow {
+                ticket_id,
+                reason: "an approval step has no assignees",
+            });
+        }
         let steps: Vec<ApprovalStep> = step_assignees
             .into_iter()
             .enumerate()
@@ -101,19 +141,14 @@ impl AccessTicket {
                 processed_by: None,
             })
             .collect();
-        let initial_state = if steps.is_empty() {
-            TicketState::Approved
-        } else {
-            TicketState::Pending
-        };
-        Self {
-            ticket_id: ticket_id.into(),
+        Ok(Self {
+            ticket_id,
             applicant: applicant.into(),
             target_device,
             steps,
             current_step_idx: 0,
-            state: initial_state,
-        }
+            state: TicketState::Pending,
+        })
     }
 
     /// Approves the currently active step on behalf of `processor`, advancing to the next step
@@ -341,15 +376,41 @@ impl LiveSessionController {
     }
 
     /// Registers a new [`SessionShareLink`] for this live session.
-    pub fn create_share(&mut self, share: SessionShareLink) {
+    ///
+    /// In JumpServer the join record's session is always derived from the sharing object
+    /// (`SessionJoinRecordSerializer.create` sets `session = sharing.session`,
+    /// `apps/terminal/serializers/sharing.py` lines 80–85) because `SessionSharing.session` is a
+    /// foreign key that can only point at one session. The controller enforces the same
+    /// invariant: a link that names another session is refused instead of silently authorizing
+    /// access to this one with a misleading audit record.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PamError::ShareSessionMismatch`] if `share.session_id` differs from the managed
+    /// session.
+    pub fn create_share(&mut self, share: SessionShareLink) -> Result<(), PamError> {
+        self.ensure_share_belongs_here(&share)?;
         self.shares.insert(share.share_id.clone(), share);
+        Ok(())
+    }
+
+    fn ensure_share_belongs_here(&self, share: &SessionShareLink) -> Result<(), PamError> {
+        if share.session_id != self.session_id {
+            return Err(PamError::ShareSessionMismatch {
+                share_id: share.share_id.clone(),
+                share_session: share.session_id.clone(),
+                controller_session: self.session_id.clone(),
+            });
+        }
+        Ok(())
     }
 
     /// Validates a join attempt and records a [`SessionJoinRecord`] on success.
     ///
     /// # Errors
     ///
-    /// Returns [`PamError::ShareJoinDenied`] if the session is terminated or share validation fails.
+    /// Returns [`PamError::ShareJoinDenied`] if the session is terminated or share validation
+    /// fails, or [`PamError::ShareSessionMismatch`] if the link names a different session.
     pub fn join_shared_session(
         &mut self,
         share_id: &str,
@@ -363,6 +424,7 @@ impl LiveSessionController {
         let Some(share) = self.shares.get(share_id) else {
             return Err(PamError::ShareJoinDenied("Share link not found"));
         };
+        self.ensure_share_belongs_here(share)?;
         let perm = share.validate_join(joiner_id, verify_code, now_ms)?;
         self.join_records.push(SessionJoinRecord {
             session_id: self.session_id.clone(),
@@ -427,7 +489,8 @@ mod tests {
                 HashSet::from(["team-lead".to_owned()]),
                 HashSet::from(["sec-admin".to_owned()]),
             ],
-        );
+        )
+        .unwrap();
 
         assert!(ticket.approve_current_step("random-user").is_err());
         assert_eq!(
@@ -464,19 +527,98 @@ mod tests {
         assert_eq!(matched.map(|r| r.action), Some(GradedAction::Review));
     }
 
+    /// Issue #29 `pam.rs:105`: an empty approval workflow must be rejected, never auto-approved.
     #[test]
-    fn live_session_sharing_and_operator_termination() {
-        let mut controller = LiveSessionController::new("sess-99");
-        controller.create_share(SessionShareLink {
-            share_id: "shr-1".to_owned(),
-            session_id: "sess-99".to_owned(),
+    fn empty_approval_workflow_is_rejected_instead_of_auto_approved() {
+        let device_id = DeviceIdentity::generate().id();
+
+        let no_steps = AccessTicket::new("tkt-empty", "operator-1", device_id, Vec::new());
+        assert_eq!(
+            no_steps,
+            Err(PamError::EmptyApprovalWorkflow {
+                ticket_id: "tkt-empty".to_owned(),
+                reason: "no approval steps configured",
+            })
+        );
+
+        let empty_step = AccessTicket::new(
+            "tkt-hollow",
+            "operator-1",
+            device_id,
+            vec![HashSet::from(["team-lead".to_owned()]), HashSet::new()],
+        );
+        assert!(matches!(
+            empty_step,
+            Err(PamError::EmptyApprovalWorkflow { ref ticket_id, .. }) if ticket_id == "tkt-hollow"
+        ));
+
+        let valid = AccessTicket::new(
+            "tkt-ok",
+            "operator-1",
+            device_id,
+            vec![HashSet::from(["team-lead".to_owned()])],
+        )
+        .unwrap();
+        assert_eq!(valid.state, TicketState::Pending);
+    }
+
+    fn share(share_id: &str, session_id: &str) -> SessionShareLink {
+        SessionShareLink {
+            share_id: share_id.to_owned(),
+            session_id: session_id.to_owned(),
             creator_id: "alice".to_owned(),
             verify_code: "849201".to_owned(),
             is_active: true,
             expires_at_ms: 50_000,
             allowed_users: HashSet::from(["bob".to_owned()]),
             permission: SharePermission::ReadOnly,
-        });
+        }
+    }
+
+    /// Issue #29 `pam.rs:366`: a share link whose `session_id` differs from the managed session
+    /// must be rejected, so a guest can never be admitted to a session the link does not name.
+    #[test]
+    fn share_link_for_another_session_is_rejected() {
+        let mut controller = LiveSessionController::new("sess-99");
+
+        let err = controller.create_share(share("shr-foreign", "sess-42"));
+        assert_eq!(
+            err,
+            Err(PamError::ShareSessionMismatch {
+                share_id: "shr-foreign".to_owned(),
+                share_session: "sess-42".to_owned(),
+                controller_session: "sess-99".to_owned(),
+            })
+        );
+        assert_eq!(
+            controller.join_shared_session("shr-foreign", "bob", "849201", 10_000),
+            Err(PamError::ShareJoinDenied("Share link not found"))
+        );
+        assert_eq!(controller.join_records(), []);
+
+        assert_eq!(controller.create_share(share("shr-1", "sess-99")), Ok(()));
+        assert_eq!(
+            controller.join_shared_session("shr-1", "bob", "849201", 10_000),
+            Ok(SharePermission::ReadOnly)
+        );
+        assert_eq!(controller.join_records()[0].session_id, "sess-99");
+    }
+
+    #[test]
+    fn live_session_sharing_and_operator_termination() {
+        let mut controller = LiveSessionController::new("sess-99");
+        controller
+            .create_share(SessionShareLink {
+                share_id: "shr-1".to_owned(),
+                session_id: "sess-99".to_owned(),
+                creator_id: "alice".to_owned(),
+                verify_code: "849201".to_owned(),
+                is_active: true,
+                expires_at_ms: 50_000,
+                allowed_users: HashSet::from(["bob".to_owned()]),
+                permission: SharePermission::ReadOnly,
+            })
+            .unwrap();
 
         assert_eq!(
             controller.join_shared_session("shr-1", "bob", "849201", 10_000),

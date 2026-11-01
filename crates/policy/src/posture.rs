@@ -173,8 +173,13 @@ impl PosturePolicy {
             }
         }
 
+        // `None` means "no network restriction". A configured rule with an empty allow-list
+        // fails closed: no address can belong to "at least one allowed CIDR" when there are
+        // none, exactly like a `BlockList`-free `GeoLocationRule::AllowOnly(∅)` above rejects
+        // every country. This mirrors Headscale's default-deny packet filter
+        // (`juanfont_headscale/hscontrol/policy/v2/filter.go`), where an ACL whose sources
+        // resolve to no addresses grants nothing instead of everything.
         if let Some(net_rule) = &self.network_rule
-            && !net_rule.allowed_cidrs.is_empty()
             && !net_rule
                 .allowed_cidrs
                 .iter()
@@ -229,5 +234,36 @@ mod tests {
             ipv4_addr: Ipv4Addr::new(192, 168, 1, 10),
         };
         assert_eq!(policy.evaluate(&non_compliant).len(), 4);
+    }
+
+    /// Issue #29 `posture.rs:177`: `None` is unrestricted, but a configured rule with an empty
+    /// allow-list must fail closed instead of permitting every address.
+    #[test]
+    fn configured_network_rule_with_empty_allow_list_fails_closed() {
+        let report = DevicePostureReport {
+            os_family: OsFamily::Windows,
+            os_version: (10, 0, 22_631),
+            running_processes: HashSet::new(),
+            country_code: "BR".to_owned(),
+            ipv4_addr: Ipv4Addr::new(203, 0, 113, 7),
+        };
+
+        let unrestricted = PosturePolicy::new();
+        assert!(unrestricted.network_rule.is_none());
+        assert_eq!(
+            unrestricted.evaluate(&report),
+            Vec::<PostureViolation>::new()
+        );
+
+        let mut empty_allow_list = PosturePolicy::new();
+        empty_allow_list.network_rule = Some(NetworkRangeRule {
+            allowed_cidrs: Vec::new(),
+        });
+        assert_eq!(
+            empty_allow_list.evaluate(&report),
+            vec![PostureViolation::DisallowedNetwork(Ipv4Addr::new(
+                203, 0, 113, 7
+            ))]
+        );
     }
 }
