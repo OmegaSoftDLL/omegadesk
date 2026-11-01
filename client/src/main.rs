@@ -18,6 +18,7 @@
 //! The window title bar displays a live latency breakdown: host processing,
 //! network (half RTT), decoding, and drawing.
 
+mod channels;
 mod keymap;
 mod network;
 mod stats;
@@ -25,6 +26,7 @@ mod win_hook;
 mod window;
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Context;
@@ -76,6 +78,20 @@ struct Args {
     /// Watch only; do not send keyboard or mouse events.
     #[arg(long)]
     view_only: bool,
+
+    /// Do not synchronize the text clipboard with the agent.
+    #[arg(long)]
+    no_clipboard: bool,
+
+    /// Directory where files sent by the agent are stored
+    /// (default: `Downloads/OmegaDesk` under the user profile).
+    #[arg(long, default_value_os_t = omegadesk_session::file_io::default_receive_dir())]
+    receive_dir: PathBuf,
+
+    /// File to send to the agent right after connecting (repeatable). Files
+    /// dropped on the window during the session are sent the same way.
+    #[arg(long, action = clap::ArgAction::Append)]
+    send_file: Vec<PathBuf>,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -132,17 +148,20 @@ fn main() -> anyhow::Result<()> {
         }
     };
     let shared = stats::Shared::default();
-    let input = network::start(
+    let handles = network::start(
         network::Target {
             device_public_key,
             route,
             password: args.password,
+            clipboard: !args.no_clipboard,
+            receive_dir: args.receive_dir,
+            send_files: args.send_file,
         },
         shared.clone(),
         event_loop.create_proxy(),
     );
 
-    let mut app = window::App::new(shared, input, args.view_only);
+    let mut app = window::App::new(shared, handles.control, handles.files, args.view_only);
     event_loop.run_app(&mut app)?;
     app.into_result()
 }

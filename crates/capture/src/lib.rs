@@ -93,6 +93,81 @@ pub struct DisplayBounds {
     pub height: u32,
 }
 
+/// Static description of one monitor attached to the desktop, as published to
+/// the client in a `DisplayList` (`crates/protocol`): the `index` is the same
+/// one [`open_display`] accepts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DisplayInfo {
+    /// Capture index accepted by [`open_display`] (`0` is the first attached monitor).
+    pub index: u32,
+    /// GDI device name (`\\.\DISPLAY1`) or the backend's own identifier.
+    pub name: String,
+    /// Position and upright size in virtual desktop coordinates.
+    pub bounds: DisplayBounds,
+    /// Effective DPI scaling in percent (`100` = 96 DPI).
+    pub scale_percent: u32,
+    /// `true` for the monitor whose origin is `(0, 0)` (the Windows primary monitor).
+    pub primary: bool,
+}
+
+/// Enumerates every monitor attached to the desktop in the same order that
+/// [`open_display`] indexes them (DXGI outputs across all adapters, falling back
+/// to `EnumDisplayDevicesW` when no DXGI output is available, exactly like the
+/// capturer fallback chain).
+///
+/// # Errors
+///
+/// Returns [`CaptureError::Unsupported`] off Windows and an operating system
+/// error if neither backend can enumerate monitors.
+pub fn list_displays() -> Result<Vec<DisplayInfo>, CaptureError> {
+    #[cfg(windows)]
+    {
+        match dxgi::list_outputs() {
+            Ok(displays) if !displays.is_empty() => Ok(displays),
+            Ok(_) => gdi::list_monitors(),
+            Err(dxgi_error) => gdi::list_monitors().map_err(|gdi_error| {
+                CaptureError::Os(format!(
+                    "DXGI enumeration failed ({dxgi_error}) and GDI enumeration failed ({gdi_error})"
+                ))
+            }),
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        Err(CaptureError::Unsupported)
+    }
+}
+
+/// Converts a NUL-terminated UTF-16 device name (`DISPLAY_DEVICEW::DeviceName`,
+/// `DXGI_OUTPUT_DESC::DeviceName`) into a `String`.
+#[cfg(windows)]
+pub(crate) fn utf16_device_name(name: &[u16]) -> String {
+    let end = name.iter().position(|&c| c == 0).unwrap_or(name.len());
+    String::from_utf16_lossy(&name[..end])
+}
+
+/// Effective DPI scaling of `monitor` in percent (`GetDpiForMonitor`,
+/// `MDT_EFFECTIVE_DPI`), or `100` when the query fails (pre-8.1 or a monitor
+/// handle that is no longer valid).
+#[cfg(windows)]
+#[allow(unsafe_code, reason = "Win32 DPI query")]
+pub(crate) fn dpi_scale_percent(monitor: windows::Win32::Graphics::Gdi::HMONITOR) -> u32 {
+    use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
+
+    if monitor.is_invalid() {
+        return 100;
+    }
+    let (mut dpi_x, mut dpi_y) = (0u32, 0u32);
+    // SAFETY: `monitor` is a non-null handle returned by the display enumeration
+    // and both out-pointers address live local variables.
+    let result =
+        unsafe { GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &raw mut dpi_x, &raw mut dpi_y) };
+    match result {
+        Ok(()) if dpi_x > 0 => dpi_x * 100 / 96,
+        Ok(()) | Err(_) => 100,
+    }
+}
+
 /// Source of frames for a single monitor.
 pub trait Capturer: Send {
     /// Waits up to `timeout` for the next frame.
@@ -457,5 +532,40 @@ mod tests {
         assert_eq!(bgra[0], 0); // Blue = 0
         assert!(bgra[2] > bgra[1]); // Red channel brighter than Green channel
         assert_eq!(bgra[3], 255); // Alpha = 255
+    }
+
+    /// `list_displays` indexes must be contiguous from `0` and name every monitor,
+    /// because the client selects a display by sending that index back. Headless
+    /// runners (no desktop) legitimately return an error, which is tolerated; off
+    /// Windows the result is `Unsupported`, never an empty mock list.
+    #[test]
+    fn display_list_indexes_are_contiguous_or_unsupported() {
+        match list_displays() {
+            Ok(displays) => {
+                assert_ne!(displays.len(), 0);
+                for (expected, display) in displays.iter().enumerate() {
+                    assert_eq!(usize::try_from(display.index), Ok(expected));
+                    assert!(display.bounds.width > 0 && display.bounds.height > 0);
+                    assert!(display.scale_percent >= 100);
+                }
+                assert!(displays.iter().filter(|d| d.primary).count() <= 1);
+            }
+            // `Unsupported` is the only answer off Windows; an OS error is only
+            // acceptable on a Windows runner without a desktop.
+            Err(CaptureError::Unsupported) if !cfg!(windows) => {}
+            Err(CaptureError::Os(_)) if cfg!(windows) => {}
+            Err(other) => panic!("unexpected enumeration error: {other}"),
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn utf16_device_name_stops_at_nul() {
+        let mut raw = [0u16; 32];
+        for (dst, src) in raw.iter_mut().zip("\\\\.\\DISPLAY1".encode_utf16()) {
+            *dst = src;
+        }
+        assert_eq!(utf16_device_name(&raw), "\\\\.\\DISPLAY1");
+        assert_eq!(utf16_device_name(&[0u16; 4]), "");
     }
 }

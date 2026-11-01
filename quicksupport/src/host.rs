@@ -213,6 +213,15 @@ impl QuickSupportHost {
                 .permissions
                 .intersects(ClientPermissions::ALL_INPUTS),
             gate: Some(gate),
+            clipboard: self.config.permissions.contains(
+                ClientPermissions::CLIPBOARD_READ.union(ClientPermissions::CLIPBOARD_SET),
+            ),
+            file_transfer: self
+                .config
+                .permissions
+                .contains(ClientPermissions::FILE_UPLOAD),
+            receive_dir: omegadesk_session::file_io::default_receive_dir(),
+            send_files: Vec::new(),
         });
         match session::run(connection, config).await {
             Ok(()) => {
@@ -224,7 +233,10 @@ impl QuickSupportHost {
                 warn!(rotated, "technician presented a wrong temporary password");
                 Ok(SessionOutcome::WrongPassword { rotated })
             }
-            Err(error) => Ok(SessionOutcome::Failed(error)),
+            Err(error) => {
+                warn!("session ended with error: {error:#}");
+                Ok(SessionOutcome::Failed(error))
+            }
         }
     }
 }

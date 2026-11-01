@@ -1,6 +1,7 @@
 //! Client window: presents the latest decoded frame and captures keyboard and pointer input.
 
 use std::num::NonZeroU32;
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -9,7 +10,7 @@ use omegadesk_input::{WHEEL_STEP, buttons, modifiers};
 use omegadesk_protocol::v1::{Envelope, KeyEvent, PointerEvent, envelope::Payload};
 use softbuffer::{Context, Surface};
 use tokio::sync::mpsc;
-use tracing::warn;
+use tracing::{info, warn};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
@@ -17,6 +18,7 @@ use winit::event_loop::ActiveEventLoop;
 use winit::keyboard::{Key, PhysicalKey};
 use winit::window::{Window, WindowId};
 
+use crate::channels::displays::{DisplayCommand, display_chord, select_display};
 use crate::keymap::keycode_to_hid;
 use crate::stats::{LatestFrame, Meter, Shared};
 use crate::win_hook::{self, KeyboardHook};
@@ -232,6 +234,7 @@ struct Graphics {
 pub(crate) struct App {
     shared: Shared,
     input: mpsc::UnboundedSender<Envelope>,
+    files: mpsc::UnboundedSender<PathBuf>,
     view_only: bool,
     graphics: Option<Graphics>,
     #[allow(dead_code, reason = "RAII guard keeps WH_KEYBOARD_LL installed")]
@@ -241,6 +244,9 @@ pub(crate) struct App {
     cursor: (f64, f64),
     pressed_buttons: u32,
     pressed_keys: std::collections::BTreeSet<u32>,
+    /// Key of a display-switch chord whose press was consumed locally; its
+    /// release is swallowed too so the remote never sees an orphan release.
+    chord_key: Option<u32>,
     scroll: ScrollAccumulator,
     altgr: AltGrFilter,
     error: Option<anyhow::Error>,
@@ -250,11 +256,13 @@ impl App {
     pub(crate) fn new(
         shared: Shared,
         input: mpsc::UnboundedSender<Envelope>,
+        files: mpsc::UnboundedSender<PathBuf>,
         view_only: bool,
     ) -> Self {
         Self {
             shared,
             input,
+            files,
             view_only,
             graphics: None,
             hook: None,
@@ -263,9 +271,21 @@ impl App {
             cursor: (0.0, 0.0),
             pressed_buttons: 0,
             pressed_keys: std::collections::BTreeSet::new(),
+            chord_key: None,
             scroll: ScrollAccumulator::default(),
             altgr: AltGrFilter::default(),
             error: None,
+        }
+    }
+
+    /// Asks the agent to stream another display. Works in `--view-only` too:
+    /// choosing what to watch is not remote input.
+    fn switch_display(&self, command: DisplayCommand) {
+        if let Some(index) = self.shared.displays().target(command) {
+            info!("requesting display {index}");
+            let _ = self.input.send(select_display(index));
+        } else {
+            info!("no other display to switch to");
         }
     }
 
@@ -341,7 +361,7 @@ impl App {
             src_h,
         );
         self.send(Payload::PointerEvent(PointerEvent {
-            display_index: 0,
+            display_index: self.shared.active_display(),
             x,
             y,
             buttons: self.pressed_buttons,
@@ -353,9 +373,15 @@ impl App {
     fn update_title(&self, extra: &str) {
         if let Some(graphics) = &self.graphics {
             let status = self.shared.status();
+            let displays = self
+                .shared
+                .displays()
+                .summary()
+                .map(|summary| format!(" — {summary}"))
+                .unwrap_or_default();
             graphics
                 .window
-                .set_title(&format!("OmegaDesk — {status}{extra}"));
+                .set_title(&format!("OmegaDesk — {status}{displays}{extra}"));
         }
     }
 
@@ -624,6 +650,17 @@ impl ApplicationHandler<UserEvent> for App {
                     self.pressed_keys.remove(&hid_usage);
                     return;
                 }
+                // Client-local chord: `Ctrl+Alt+Shift` + digit/arrow switches the
+                // streamed display; the key never reaches the remote machine.
+                if pressed && let Some(command) = display_chord(hid_usage, self.active_modifiers())
+                {
+                    self.chord_key = Some(hid_usage);
+                    self.switch_display(command);
+                    return;
+                }
+                if !pressed && self.chord_key.take_if(|key| *key == hid_usage).is_some() {
+                    return;
+                }
                 if pressed {
                     self.pressed_keys.insert(hid_usage);
                 } else {
@@ -653,6 +690,11 @@ impl ApplicationHandler<UserEvent> for App {
                     pressed,
                     modifiers: mods,
                 }));
+            }
+            // Drag-and-drop: every dropped file is sent to the agent on its own stream.
+            WindowEvent::DroppedFile(path) => {
+                info!("sending dropped file {}", path.display());
+                let _ = self.files.send(path);
             }
             WindowEvent::Focused(true) => win_hook::set_focused(true),
             // When the window loses focus (Alt+Tab or clicking outside), release

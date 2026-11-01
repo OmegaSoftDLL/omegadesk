@@ -1,7 +1,9 @@
 //! Background QUIC session task (running on its own Tokio runtime) and
-//! dedicated video decoder thread.
+//! dedicated video decoder thread, plus the session channels from
+//! `crate::channels` (clipboard, file transfer, display catalog, frame acks).
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::mpsc as std_mpsc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -14,11 +16,14 @@ use omegadesk_protocol::PROTOCOL_VERSION;
 use omegadesk_protocol::v1::{
     Capabilities, Envelope, Hello, Ping, RequestKeyframe, VideoCodec, VideoFrame, envelope::Payload,
 };
+use omegadesk_session::clipboard_io::ClipboardWorker;
 use omegadesk_transport::{Connection, EnvelopeReader, SendStream, connect, send_envelope};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 use winit::event_loop::EventLoopProxy;
 
+use crate::channels::qos::{DecodeQueueDepth, frame_ack};
+use crate::channels::{clipboard, file_transfer};
 use crate::stats::{LatestFrame, Shared};
 use crate::window::UserEvent;
 
@@ -85,16 +90,27 @@ pub(crate) struct Target {
     pub(crate) device_public_key: [u8; 32],
     pub(crate) route: Route,
     pub(crate) password: String,
+    /// Synchronize the text clipboard with the agent.
+    pub(crate) clipboard: bool,
+    /// Directory where files sent by the agent are stored.
+    pub(crate) receive_dir: PathBuf,
+    /// Files sent to the agent right after the handshake.
+    pub(crate) send_files: Vec<PathBuf>,
 }
 
-/// Spawns the background network thread and returns the channel used to send
-/// control messages (keyboard, pointer, keyframe requests) to the agent.
-pub(crate) fn start(
-    target: Target,
-    shared: Shared,
-    proxy: EventLoopProxy<UserEvent>,
-) -> mpsc::UnboundedSender<Envelope> {
+/// Channels the window uses to talk to the session task.
+pub(crate) struct Handles {
+    /// Control messages (keyboard, pointer, keyframe and display requests).
+    pub(crate) control: mpsc::UnboundedSender<Envelope>,
+    /// Files to send to the agent (drag-and-drop).
+    pub(crate) files: mpsc::UnboundedSender<PathBuf>,
+}
+
+/// Spawns the background network thread and returns the channels used to send
+/// control messages and file transfer requests to the agent.
+pub(crate) fn start(target: Target, shared: Shared, proxy: EventLoopProxy<UserEvent>) -> Handles {
     let (control_tx, control_rx) = mpsc::unbounded_channel();
+    let (files_tx, files_rx) = mpsc::unbounded_channel();
     let requests = control_tx.clone();
     std::thread::spawn(move || {
         let runtime = match tokio::runtime::Builder::new_multi_thread()
@@ -115,6 +131,7 @@ pub(crate) fn start(
             proxy.clone(),
             control_rx,
             requests,
+            files_rx,
         ));
         let status = match result {
             Ok(()) => "disconnected".to_owned(),
@@ -124,7 +141,10 @@ pub(crate) fn start(
         shared.set_status(status);
         let _ = proxy.send_event(UserEvent::Disconnected);
     });
-    control_tx
+    Handles {
+        control: control_tx,
+        files: files_tx,
+    }
 }
 
 async fn run(
@@ -133,6 +153,7 @@ async fn run(
     proxy: EventLoopProxy<UserEvent>,
     mut control_rx: mpsc::UnboundedReceiver<Envelope>,
     requests: mpsc::UnboundedSender<Envelope>,
+    files_rx: mpsc::UnboundedReceiver<PathBuf>,
 ) -> anyhow::Result<()> {
     // Keeps the LAN endpoint or the mesh node alive for the whole session.
     let (_endpoint, mesh_node, connection) = match &target.route {
@@ -186,6 +207,7 @@ async fn run(
         &proxy,
         &mut control_rx,
         requests,
+        files_rx,
     )
     .await;
     connection.close(0u32.into(), b"done");
@@ -258,6 +280,7 @@ async fn session(
     proxy: &EventLoopProxy<UserEvent>,
     control_rx: &mut mpsc::UnboundedReceiver<Envelope>,
     requests: mpsc::UnboundedSender<Envelope>,
+    files_rx: mpsc::UnboundedReceiver<PathBuf>,
 ) -> anyhow::Result<()> {
     let (mut control_send, control_recv) = connection.open_bi().await?;
     let mut control = EnvelopeReader::new(control_recv);
@@ -295,6 +318,20 @@ async fn session(
     shared.set_status(format!("connected to {}", ack.device_name));
     let _ = proxy.send_event(UserEvent::Status);
 
+    // Session channels: clipboard worker (text), file transfers in both
+    // directions on their own streams, and per-frame acks from the decoder.
+    let clipboard = clipboard::start(target.clipboard, requests.clone());
+    if let Err(error) = file_transfer::prepare_receive_dir(&target.receive_dir) {
+        warn!(
+            "cannot create {}: {error}; incoming files will fail",
+            target.receive_dir.display()
+        );
+    }
+    let file_receiver =
+        file_transfer::spawn_receiver(connection.clone(), target.receive_dir.clone());
+    let file_sender =
+        file_transfer::spawn_sender(connection.clone(), target.send_files.clone(), files_rx);
+
     let video_recv = connection.accept_uni().await?;
     let decoder = Decoder::spawn(shared.clone(), proxy.clone(), requests);
 
@@ -322,19 +359,33 @@ async fn session(
         }
     });
 
-    let control_task = control_loop(&mut control_send, &mut control, control_rx, shared);
-    tokio::select! {
+    let control_task = control_loop(
+        &mut control_send,
+        &mut control,
+        control_rx,
+        shared,
+        proxy,
+        clipboard.as_ref(),
+    );
+    let result = tokio::select! {
         result = control_task => result,
         _ = video => Ok(()),
-    }
+    };
+    file_receiver.abort();
+    file_sender.abort();
+    drop(clipboard);
+    result
 }
 
-/// Sends periodic pings and outgoing control messages, and processes incoming pongs.
+/// Sends periodic pings and outgoing control messages, and processes incoming
+/// pongs, display catalog announcements and clipboard events.
 async fn control_loop(
     send: &mut SendStream,
     control: &mut EnvelopeReader,
     control_rx: &mut mpsc::UnboundedReceiver<Envelope>,
     shared: &Shared,
+    proxy: &EventLoopProxy<UserEvent>,
+    clipboard: Option<&ClipboardWorker>,
 ) -> anyhow::Result<()> {
     let started = Instant::now();
     let mut ticker = tokio::time::interval(PING_INTERVAL);
@@ -364,6 +415,18 @@ async fn control_loop(
                             now.saturating_sub(pong.ping_sent_at_micros),
                         ));
                     }
+                    Some(Envelope { payload: Some(Payload::DisplayList(list)) }) => {
+                        info!(
+                            "agent offers {} display(s); streaming display {}",
+                            list.displays.len(),
+                            list.active_display_index
+                        );
+                        shared.set_displays(list);
+                        let _ = proxy.send_event(UserEvent::Status);
+                    }
+                    Some(Envelope { payload: Some(Payload::ClipboardEvent(event)) }) => {
+                        clipboard::apply(clipboard, event);
+                    }
                     Some(_) => {}
                     None => return Ok(()),
                 }
@@ -375,6 +438,7 @@ async fn control_loop(
 /// Bounded queue feeding the dedicated decoder thread.
 struct Decoder {
     queue: std_mpsc::SyncSender<VideoFrame>,
+    depth: DecodeQueueDepth,
     requests: mpsc::UnboundedSender<Envelope>,
 }
 
@@ -385,16 +449,27 @@ impl Decoder {
         requests: mpsc::UnboundedSender<Envelope>,
     ) -> Self {
         let (queue, rx) = std_mpsc::sync_channel::<VideoFrame>(DECODE_QUEUE);
+        let depth = DecodeQueueDepth::default();
         let thread_requests = requests.clone();
-        std::thread::spawn(move || decode_loop(&rx, &shared, &proxy, &thread_requests));
-        Self { queue, requests }
+        let thread_depth = depth.clone();
+        std::thread::spawn(move || {
+            decode_loop(&rx, &shared, &proxy, &thread_requests, &thread_depth);
+        });
+        Self {
+            queue,
+            depth,
+            requests,
+        }
     }
 
     /// Submits a frame to the decoder. If the queue is full, drops the frame
     /// and requests a keyframe. Returns `false` if the decoder thread exited.
     fn submit(&self, frame: VideoFrame) -> bool {
         match self.queue.try_send(frame) {
-            Ok(()) => true,
+            Ok(()) => {
+                self.depth.enqueued();
+                true
+            }
             Err(std_mpsc::TrySendError::Full(_)) => {
                 // The decoder will skip P-frames until the requested keyframe arrives.
                 let _ = self.requests.send(keyframe_request());
@@ -420,6 +495,7 @@ fn decode_loop(
     shared: &Shared,
     proxy: &EventLoopProxy<UserEvent>,
     requests: &mpsc::UnboundedSender<Envelope>,
+    depth: &DecodeQueueDepth,
 ) {
     let mut decoder = match OpenH264Decoder::new() {
         Ok(decoder) => decoder,
@@ -441,6 +517,7 @@ fn decode_loop(
     let mut logged_clock_skew = false;
 
     while let Ok(frame) = rx.recv() {
+        let queued_behind = depth.dequeued();
         // Sequence gap: at least one frame was dropped in transit or in the queue.
         if expected_sequence.is_some_and(|expected| frame.sequence != expected) && !frame.keyframe {
             waiting_keyframe = true;
@@ -456,17 +533,21 @@ fn decode_loop(
         let start = Instant::now();
         match decoder.decode(&frame.data) {
             Ok(Some(image)) => {
+                let decode = start.elapsed();
                 shared.publish(LatestFrame {
                     image,
                     host_processing: Duration::from_micros(u64::from(frame.host_processing_micros)),
-                    decode: start.elapsed(),
+                    decode,
                     decoded_at: Instant::now(),
                 });
+                let _ = requests.send(frame_ack(&frame, decode, queued_behind));
                 if proxy.send_event(UserEvent::Frame).is_err() {
                     break;
                 }
             }
-            Ok(None) => {}
+            Ok(None) => {
+                let _ = requests.send(frame_ack(&frame, start.elapsed(), queued_behind));
+            }
             Err(error) => {
                 warn!("frame {} failed to decode: {error}", frame.sequence);
                 waiting_keyframe = true;

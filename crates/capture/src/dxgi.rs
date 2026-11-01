@@ -31,14 +31,17 @@ use windows::Win32::Graphics::Dxgi::{
     DXGI_ERROR_NOT_FOUND, DXGI_ERROR_SESSION_DISCONNECTED, DXGI_ERROR_WAIT_TIMEOUT,
     DXGI_OUTDUPL_FRAME_INFO, DXGI_OUTDUPL_POINTER_SHAPE_INFO,
     DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR, DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MASKED_COLOR,
-    DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MONOCHROME, IDXGIAdapter1, IDXGIDevice1, IDXGIFactory1,
-    IDXGIOutput1, IDXGIOutputDuplication, IDXGIResource,
+    DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MONOCHROME, DXGI_OUTPUT_DESC, IDXGIAdapter1, IDXGIDevice1,
+    IDXGIFactory1, IDXGIOutput1, IDXGIOutputDuplication, IDXGIResource,
 };
 use windows::core::Interface;
 
 use crate::cursor::{CursorKind, CursorShape, CursorState, blend_cursor};
 use crate::rotate::{Rotation, rotate_bgra};
-use crate::{CaptureError, Capturer, DisplayBounds, Frame, GpuTexture};
+use crate::{
+    CaptureError, Capturer, DisplayBounds, DisplayInfo, Frame, GpuTexture, dpi_scale_percent,
+    utf16_device_name,
+};
 
 /// Highest GPU thread priority allowed without special privileges (Sunshine uses 7).
 const GPU_THREAD_PRIORITY: i32 = 7;
@@ -197,6 +200,65 @@ fn create_d3d11_device(
         let _ = unsafe { dxgi_device.SetGPUThreadPriority(GPU_THREAD_PRIORITY) };
     }
     Ok((device, context))
+}
+
+/// Enumerates the outputs attached to the desktop in the exact adapter/output
+/// order [`DxgiCapturer::open`] walks, so [`DisplayInfo::index`] is the index
+/// `open_display` accepts (Sunshine `display_base.cpp` and RustDesk
+/// `libs/scrap/src/dxgi/mod.rs` `Displays` enumerate the same way).
+pub(crate) fn list_outputs() -> Result<Vec<DisplayInfo>, CaptureError> {
+    // SAFETY: takes no arguments and returns a newly owned DXGI factory.
+    let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1() }.map_err(|e| os_error(&e))?;
+    let mut displays = Vec::new();
+    let mut adapter_index = 0;
+    loop {
+        // SAFETY: `factory` is a valid DXGI factory; an out-of-range index
+        // simply returns `DXGI_ERROR_NOT_FOUND`.
+        let adapter = match unsafe { factory.EnumAdapters1(adapter_index) } {
+            Ok(adapter) => adapter,
+            Err(e) if e.code() == DXGI_ERROR_NOT_FOUND => break,
+            Err(e) => return Err(os_error(&e)),
+        };
+        adapter_index += 1;
+        let mut output_index = 0;
+        loop {
+            // SAFETY: `adapter` is a valid adapter returned by `factory`;
+            // an out-of-range index returns `DXGI_ERROR_NOT_FOUND`.
+            let output = match unsafe { adapter.EnumOutputs(output_index) } {
+                Ok(output) => output,
+                Err(e) if e.code() == DXGI_ERROR_NOT_FOUND => break,
+                Err(e) => return Err(os_error(&e)),
+            };
+            output_index += 1;
+            // SAFETY: `output` is a valid output and the description is returned by value.
+            let description = unsafe { output.GetDesc() }.map_err(|e| os_error(&e))?;
+            if !description.AttachedToDesktop.as_bool() {
+                continue;
+            }
+            let index = u32::try_from(displays.len()).unwrap_or(u32::MAX);
+            displays.push(describe_output(index, &description));
+        }
+    }
+    Ok(displays)
+}
+
+/// Builds a [`DisplayInfo`] from a desktop-attached output description. The
+/// desktop coordinates are already upright (rotation applied), and the Windows
+/// primary monitor is by definition the one whose origin is `(0, 0)`.
+fn describe_output(index: u32, description: &DXGI_OUTPUT_DESC) -> DisplayInfo {
+    let rect = description.DesktopCoordinates;
+    DisplayInfo {
+        index,
+        name: utf16_device_name(&description.DeviceName),
+        bounds: DisplayBounds {
+            x: rect.left,
+            y: rect.top,
+            width: (rect.right - rect.left).unsigned_abs(),
+            height: (rect.bottom - rect.top).unsigned_abs(),
+        },
+        scale_percent: dpi_scale_percent(description.Monitor),
+        primary: rect.left == 0 && rect.top == 0,
+    }
 }
 
 impl DxgiCapturer {

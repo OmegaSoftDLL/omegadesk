@@ -19,6 +19,7 @@ host = [
     "dep:omegadesk-codec",
     "dep:omegadesk-control",
     "dep:omegadesk-magicsock",
+    "dep:omegadesk-session",
     "dep:tokio",
     "dep:tracing-subscriber",
 ]
@@ -36,6 +37,7 @@ omegadesk-codec = { workspace = true, optional = true }
 omegadesk-control = { workspace = true, optional = true }
 omegadesk-identity.workspace = true
 omegadesk-magicsock = { workspace = true, optional = true }
+omegadesk-session = { workspace = true, features = ["io"], optional = true }
 rand_core.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["io-std"], optional = true }

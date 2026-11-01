@@ -23,16 +23,20 @@
 use std::mem::size_of;
 use std::time::{Duration, Instant};
 
+use windows::Win32::Foundation::POINT;
 use windows::Win32::Graphics::Gdi::{
     BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BitBlt, CAPTUREBLT, CreateCompatibleBitmap,
     CreateCompatibleDC, CreateDCW, DEVMODEW, DIB_RGB_COLORS, DISPLAY_DEVICE_ATTACHED_TO_DESKTOP,
     DISPLAY_DEVICE_STATE_FLAGS, DISPLAY_DEVICEW, DeleteDC, DeleteObject, ENUM_CURRENT_SETTINGS,
     ENUM_DISPLAY_SETTINGS_FLAGS, EnumDisplayDevicesW, EnumDisplaySettingsExW, GetDIBits, HBITMAP,
-    HDC, HGDIOBJ, RGBQUAD, SRCCOPY, SelectObject,
+    HDC, HGDIOBJ, MONITOR_DEFAULTTONULL, MonitorFromPoint, RGBQUAD, SRCCOPY, SelectObject,
 };
 use windows::core::PCWSTR;
 
-use crate::{CaptureError, Capturer, DisplayBounds, Frame, PollAction, PollPacer};
+use crate::{
+    CaptureError, Capturer, DisplayBounds, DisplayInfo, Frame, PollAction, PollPacer,
+    dpi_scale_percent, utf16_device_name,
+};
 
 const BYTES_PER_PIXEL: usize = 4;
 
@@ -284,10 +288,12 @@ impl Drop for GdiCapturer {
     }
 }
 
-fn query_monitor(target_index: u32) -> Result<([u16; 32], DisplayBounds), CaptureError> {
+/// Walks the display devices attached to the desktop (`EnumDisplayDevicesW`)
+/// in enumeration order, calling `visit(attached_index, device)` for each and
+/// stopping early when it returns `false`.
+fn for_each_attached_device(mut visit: impl FnMut(u32, &DISPLAY_DEVICEW) -> bool) {
     let mut attached_seen = 0u32;
     let mut dev_num = 0u32;
-
     loop {
         #[allow(clippy::cast_possible_truncation)]
         let cb = size_of::<DISPLAY_DEVICEW>() as u32;
@@ -301,46 +307,91 @@ fn query_monitor(target_index: u32) -> Result<([u16; 32], DisplayBounds), Captur
             break;
         }
         dev_num += 1;
-
         if (dd.StateFlags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP) == DISPLAY_DEVICE_STATE_FLAGS(0) {
             continue;
         }
-        if attached_seen != target_index {
-            attached_seen += 1;
-            continue;
+        let index = attached_seen;
+        attached_seen += 1;
+        if !visit(index, &dd) {
+            break;
         }
+    }
+}
 
-        #[allow(clippy::cast_possible_truncation)]
-        let dm_size = size_of::<DEVMODEW>() as u16;
-        let mut dm = DEVMODEW {
-            dmSize: dm_size,
-            ..DEVMODEW::default()
-        };
-        // SAFETY: `dd.DeviceName` is a NUL-terminated UTF-16 string and `dm.dmSize` is initialized.
-        let ok = unsafe {
-            EnumDisplaySettingsExW(
-                PCWSTR(dd.DeviceName.as_ptr()),
-                ENUM_CURRENT_SETTINGS,
-                &raw mut dm,
-                ENUM_DISPLAY_SETTINGS_FLAGS(0),
-            )
-        };
-        if !ok.as_bool() || dm.dmPelsWidth == 0 || dm.dmPelsHeight == 0 {
-            return Err(CaptureError::DisplayNotFound(target_index));
+/// Current mode (`ENUM_CURRENT_SETTINGS`) of the device, as upright desktop
+/// bounds, or `None` if the device reports no usable mode.
+fn current_bounds(device_name: &[u16; 32]) -> Option<DisplayBounds> {
+    #[allow(clippy::cast_possible_truncation)]
+    let dm_size = size_of::<DEVMODEW>() as u16;
+    let mut dm = DEVMODEW {
+        dmSize: dm_size,
+        ..DEVMODEW::default()
+    };
+    // SAFETY: `device_name` is a NUL-terminated UTF-16 string and `dm.dmSize` is initialized.
+    let ok = unsafe {
+        EnumDisplaySettingsExW(
+            PCWSTR(device_name.as_ptr()),
+            ENUM_CURRENT_SETTINGS,
+            &raw mut dm,
+            ENUM_DISPLAY_SETTINGS_FLAGS(0),
+        )
+    };
+    if !ok.as_bool() || dm.dmPelsWidth == 0 || dm.dmPelsHeight == 0 {
+        return None;
+    }
+    // SAFETY: `Anonymous1.Anonymous2.dmPosition` is valid for display devices returned by
+    // `EnumDisplaySettingsExW`.
+    let pos = unsafe { dm.Anonymous1.Anonymous2.dmPosition };
+    Some(DisplayBounds {
+        x: pos.x,
+        y: pos.y,
+        width: dm.dmPelsWidth,
+        height: dm.dmPelsHeight,
+    })
+}
+
+fn query_monitor(target_index: u32) -> Result<([u16; 32], DisplayBounds), CaptureError> {
+    let mut result = Err(CaptureError::DisplayNotFound(target_index));
+    for_each_attached_device(|index, dd| {
+        if index != target_index {
+            return true;
         }
-        // SAFETY: `Anonymous1.Anonymous2.dmPosition` is valid for display devices returned by
-        // `EnumDisplaySettingsExW`.
-        let pos = unsafe { dm.Anonymous1.Anonymous2.dmPosition };
-        return Ok((
-            dd.DeviceName,
-            DisplayBounds {
-                x: pos.x,
-                y: pos.y,
-                width: dm.dmPelsWidth,
-                height: dm.dmPelsHeight,
-            },
+        if let Some(bounds) = current_bounds(&dd.DeviceName) {
+            result = Ok((dd.DeviceName, bounds));
+        }
+        false
+    });
+    result
+}
+
+/// Enumerates the monitors attached to the desktop with the same indexing
+/// [`GdiCapturer::open`] uses (RustDesk `libs/scrap/src/dxgi/gdi.rs` `Displays`).
+/// Devices without a current mode are skipped but still consume their index, so
+/// the indexes stay aligned with `open`.
+pub(crate) fn list_monitors() -> Result<Vec<DisplayInfo>, CaptureError> {
+    let mut displays = Vec::new();
+    for_each_attached_device(|index, dd| {
+        if let Some(bounds) = current_bounds(&dd.DeviceName) {
+            let point = POINT {
+                x: bounds.x,
+                y: bounds.y,
+            };
+            // SAFETY: plain value arguments; a point outside every monitor yields a null handle.
+            let monitor = unsafe { MonitorFromPoint(point, MONITOR_DEFAULTTONULL) };
+            displays.push(DisplayInfo {
+                index,
+                name: utf16_device_name(&dd.DeviceName),
+                bounds,
+                scale_percent: dpi_scale_percent(monitor),
+                primary: bounds.x == 0 && bounds.y == 0,
+            });
+        }
+        true
+    });
+    if displays.is_empty() {
+        return Err(CaptureError::Os(
+            "EnumDisplayDevicesW found no monitor attached to the desktop".into(),
         ));
     }
-
-    Err(CaptureError::DisplayNotFound(target_index))
+    Ok(displays)
 }
