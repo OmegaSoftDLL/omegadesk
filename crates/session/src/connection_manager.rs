@@ -707,159 +707,552 @@ pub fn split_rdp_full_address(full_address: &str, default_port: u16) -> (String,
     (trimmed.to_owned(), default_port)
 }
 
+/// Minimal XML element tree used by the `.rdg` and `PuTTY` importers.
+///
+/// mRemoteNG walks both formats with `XmlDocument.SelectNodes("./group|./server")`
+/// (`RemoteDesktopConnectionManagerDeserializer.cs`) and `SelectNodes("./*")`
+/// (`PuttyConnectionManagerDeserializer.cs`), i.e. strictly over *direct children*,
+/// and reads `InnerText` with entity references already decoded. This tree gives the
+/// importers the same two guarantees without an XML dependency.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct XmlElement {
+    name: String,
+    attributes: Vec<(String, String)>,
+    children: Vec<XmlElement>,
+    text: String,
+}
+
+impl XmlElement {
+    fn attr(&self, name: &str) -> Option<&str> {
+        self.attributes
+            .iter()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value.as_str())
+    }
+
+    /// First direct child named `name` (`SelectSingleNode("./name")`).
+    fn child(&self, name: &str) -> Option<&Self> {
+        self.children.iter().find(|child| child.name == name)
+    }
+
+    /// Direct children named `name` (`SelectNodes("./name")`).
+    fn children_named<'a>(&'a self, name: &'a str) -> impl Iterator<Item = &'a Self> + 'a {
+        self.children.iter().filter(move |child| child.name == name)
+    }
+
+    /// Decoded, trimmed `InnerText` of the first direct child named `name`.
+    fn child_text(&self, name: &str) -> Option<String> {
+        self.child(name).map(|child| child.text.trim().to_owned())
+    }
+
+    fn child_bool(&self, name: &str) -> Option<bool> {
+        let value = self.child_text(name)?;
+        if value.eq_ignore_ascii_case("true") {
+            Some(true)
+        } else if value.eq_ignore_ascii_case("false") {
+            Some(false)
+        } else {
+            None
+        }
+    }
+}
+
+/// Decodes the five predefined XML entities plus decimal (`&#NN;`) and hexadecimal
+/// (`&#xHH;`) character references; unknown or malformed references are kept literally.
+fn decode_xml_entities(raw: &str) -> String {
+    if !raw.contains('&') {
+        return raw.to_owned();
+    }
+    let mut out = String::with_capacity(raw.len());
+    let mut rest = raw;
+    while let Some(amp) = rest.find('&') {
+        out.push_str(&rest[..amp]);
+        let after_amp = &rest[amp + 1..];
+        let Some(semi) = after_amp.find(';').filter(|&idx| idx > 0 && idx <= 10) else {
+            out.push('&');
+            rest = after_amp;
+            continue;
+        };
+        let entity = &after_amp[..semi];
+        let decoded = match entity {
+            "amp" => Some('&'),
+            "lt" => Some('<'),
+            "gt" => Some('>'),
+            "quot" => Some('"'),
+            "apos" => Some('\''),
+            _ => entity
+                .strip_prefix('#')
+                .and_then(|number| {
+                    number.strip_prefix(['x', 'X']).map_or_else(
+                        || number.parse::<u32>().ok(),
+                        |hex| u32::from_str_radix(hex, 16).ok(),
+                    )
+                })
+                .and_then(char::from_u32),
+        };
+        if let Some(ch) = decoded {
+            out.push(ch);
+            rest = &after_amp[semi + 1..];
+        } else {
+            out.push('&');
+            rest = after_amp;
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Parses an XML document into its root [`XmlElement`]. Processing instructions,
+/// comments, and `DOCTYPE` declarations are skipped; `CDATA` sections are kept verbatim.
+fn parse_xml_document(xml: &str) -> Result<XmlElement, ImportError> {
+    let mut stack: Vec<XmlElement> = Vec::new();
+    let mut root: Option<XmlElement> = None;
+    let mut rest = xml.trim_start_matches('\u{feff}');
+
+    while let Some(lt) = rest.find('<') {
+        if let Some(current) = stack.last_mut() {
+            current.text.push_str(&decode_xml_entities(&rest[..lt]));
+        }
+        rest = &rest[lt..];
+
+        if let Some(after) = rest.strip_prefix("<![CDATA[") {
+            let end = after
+                .find("]]>")
+                .ok_or_else(|| ImportError::InvalidXml("unterminated CDATA section".to_owned()))?;
+            if let Some(current) = stack.last_mut() {
+                current.text.push_str(&after[..end]);
+            }
+            rest = &after[end + 3..];
+            continue;
+        }
+        if let Some(after) = rest.strip_prefix("<!--") {
+            let end = after
+                .find("-->")
+                .ok_or_else(|| ImportError::InvalidXml("unterminated comment".to_owned()))?;
+            rest = &after[end + 3..];
+            continue;
+        }
+        if rest.starts_with("<?") || rest.starts_with("<!") {
+            let end = rest
+                .find('>')
+                .ok_or_else(|| ImportError::InvalidXml("unterminated declaration".to_owned()))?;
+            rest = &rest[end + 1..];
+            continue;
+        }
+
+        let end = rest
+            .find('>')
+            .ok_or_else(|| ImportError::InvalidXml("unterminated tag".to_owned()))?;
+        let tag = &rest[1..end];
+        rest = &rest[end + 1..];
+
+        if let Some(closing) = tag.strip_prefix('/') {
+            let closing = closing.trim();
+            let Some(element) = stack.pop() else {
+                return Err(ImportError::InvalidXml(format!(
+                    "closing tag </{closing}> without an open element"
+                )));
+            };
+            if element.name != closing {
+                return Err(ImportError::InvalidXml(format!(
+                    "expected </{}> but found </{closing}>",
+                    element.name
+                )));
+            }
+            attach_element(&mut stack, &mut root, element)?;
+            continue;
+        }
+
+        let (self_closing, tag_body) = tag
+            .strip_suffix('/')
+            .map_or((false, tag), |body| (true, body));
+        let element = parse_start_tag(tag_body)?;
+        if self_closing {
+            attach_element(&mut stack, &mut root, element)?;
+        } else {
+            stack.push(element);
+        }
+    }
+
+    if let Some(open) = stack.last() {
+        return Err(ImportError::InvalidXml(format!(
+            "unclosed <{}> element",
+            open.name
+        )));
+    }
+    root.ok_or_else(|| ImportError::InvalidXml("document has no root element".to_owned()))
+}
+
+fn attach_element(
+    stack: &mut [XmlElement],
+    root: &mut Option<XmlElement>,
+    element: XmlElement,
+) -> Result<(), ImportError> {
+    if let Some(parent) = stack.last_mut() {
+        parent.children.push(element);
+        return Ok(());
+    }
+    if root.is_some() {
+        return Err(ImportError::InvalidXml("multiple root elements".to_owned()));
+    }
+    *root = Some(element);
+    Ok(())
+}
+
+/// Parses `name attr="value" attr2='value'` (the inside of a start tag).
+fn parse_start_tag(tag_body: &str) -> Result<XmlElement, ImportError> {
+    let body = tag_body.trim();
+    let name_end = body
+        .find(|c: char| c.is_whitespace() || c == '/')
+        .unwrap_or(body.len());
+    let name = &body[..name_end];
+    if name.is_empty() {
+        return Err(ImportError::InvalidXml("empty element name".to_owned()));
+    }
+    let mut element = XmlElement {
+        name: name.to_owned(),
+        ..XmlElement::default()
+    };
+
+    let mut attrs = body[name_end..].trim_start();
+    while !attrs.is_empty() {
+        let eq = attrs
+            .find('=')
+            .ok_or_else(|| ImportError::InvalidXml(format!("malformed attribute in <{name}>")))?;
+        let key = attrs[..eq].trim();
+        let value_part = attrs[eq + 1..].trim_start();
+        let quote = value_part
+            .chars()
+            .next()
+            .filter(|c| matches!(c, '"' | '\''));
+        let Some(quote) = quote else {
+            return Err(ImportError::InvalidXml(format!(
+                "unquoted attribute value in <{name}>"
+            )));
+        };
+        let value_body = &value_part[quote.len_utf8()..];
+        let close = value_body.find(quote).ok_or_else(|| {
+            ImportError::InvalidXml(format!("unterminated attribute value in <{name}>"))
+        })?;
+        element
+            .attributes
+            .push((key.to_owned(), decode_xml_entities(&value_body[..close])));
+        attrs = value_body[close + quote.len_utf8()..].trim_start();
+    }
+    Ok(element)
+}
+
+/// `RDCMan` `inherit="None"` marks a settings section as explicit; `FromParent` (or a
+/// missing attribute / missing section) means the section is resolved from the parent
+/// and any saved local values inside it are ignored
+/// (`RemoteDesktopConnectionManagerDeserializer.ConnectionInfoFromXml`).
+fn rdg_section_is_explicit(section: Option<&XmlElement>) -> bool {
+    section.is_some_and(|node| node.attr("inherit").is_some_and(|v| v == "None"))
+}
+
+/// Connection properties, inheritance flags, hostname, and display name read from an
+/// `RDCMan` `<group>`, `<file>`, or `<server>` element, mirroring
+/// `ConnectionInfoFromXml` in mRemoteNG's `RemoteDesktopConnectionManagerDeserializer.cs`.
+struct RdgConnectionInfo {
+    properties: ConnectionProperties,
+    inheritance: InheritanceFlags,
+    hostname: Option<String>,
+    display_name: Option<String>,
+}
+
+fn rdg_connection_info(node: &XmlElement, schema_v1: bool) -> RdgConnectionInfo {
+    // Version 2.2 (schema 1) stores the name at the element root; 2.7 (schema 3) wraps it in <properties>.
+    let props_node = if schema_v1 {
+        node
+    } else {
+        node.child("properties").unwrap_or(node)
+    };
+    let hostname = props_node.child_text("name");
+    let display_name = props_node
+        .child_text("displayName")
+        .filter(|name| !name.trim().is_empty());
+
+    let mut properties = ConnectionProperties {
+        protocol: ConnectionProtocol::Rdp,
+        port: ConnectionProtocol::Rdp.default_port(),
+        ..ConnectionProperties::default()
+    };
+    let mut inheritance = InheritanceFlags::none();
+
+    let logon = node.child("logonCredentials");
+    if rdg_section_is_explicit(logon) {
+        if let Some(section) = logon {
+            properties.username = section.child_text("userName").unwrap_or_default();
+            properties.domain = section.child_text("domain").unwrap_or_default();
+        }
+    } else {
+        inheritance.username = true;
+        inheritance.domain = true;
+    }
+
+    let connection = node.child("connectionSettings");
+    if rdg_section_is_explicit(connection) {
+        if let Some(section) = connection {
+            if let Some(console) = section.child_bool("connectToConsole") {
+                properties.use_console_session = console;
+            }
+            if let Some(port) = section
+                .child_text("port")
+                .and_then(|p| p.parse::<u16>().ok())
+            {
+                properties.port = port;
+            }
+        }
+    } else {
+        inheritance.use_console_session = true;
+        inheritance.port = true;
+    }
+
+    let gateway = node.child("gatewaySettings");
+    if rdg_section_is_explicit(gateway) {
+        if let Some(section) = gateway {
+            let enabled = section.child_bool("enabled").unwrap_or(false);
+            properties.gateway_hostname = if enabled {
+                section.child_text("hostName").filter(|h| !h.is_empty())
+            } else {
+                None
+            };
+        }
+    } else {
+        inheritance.gateway_hostname = true;
+    }
+
+    let local = node.child("localResources");
+    if rdg_section_is_explicit(local) {
+        if let Some(section) = local {
+            if let Some(clipboard) = section.child_bool("redirectClipboard") {
+                properties.redirect_clipboard = clipboard;
+            }
+            if let Some(audio) = section.child_text("audioRedirection") {
+                // 0 / Client = bring to this computer; 1 / Remote and 2 / NoSound do not play locally.
+                properties.redirect_audio = audio == "0" || audio.eq_ignore_ascii_case("Client");
+            }
+        }
+    } else {
+        inheritance.redirect_clipboard = true;
+        inheritance.redirect_audio = true;
+    }
+
+    RdgConnectionInfo {
+        properties,
+        inheritance,
+        hostname,
+        display_name,
+    }
+}
+
+struct RdgImporter {
+    tree: ConnectionTree,
+    schema_v1: bool,
+    group_counter: usize,
+    server_counter: usize,
+}
+
+impl RdgImporter {
+    /// `ImportFileOrGroup`: creates the folder for `node`, then recurses into its
+    /// *direct* `<group>` and `<server>` children with this folder as their parent.
+    fn import_group(
+        &mut self,
+        node: &XmlElement,
+        parent_id: Option<&str>,
+    ) -> Result<(), ImportError> {
+        self.group_counter += 1;
+        let folder_id = format!("rdg-group-{}", self.group_counter);
+        let info = rdg_connection_info(node, self.schema_v1);
+        let name = info
+            .display_name
+            .or(info.hostname)
+            .filter(|n| !n.is_empty())
+            .unwrap_or_else(|| format!("Group {}", self.group_counter));
+        self.tree.upsert_folder(ConnectionFolder {
+            id: folder_id.clone(),
+            name,
+            parent_id: parent_id.map(str::to_owned),
+            properties: info.properties,
+            inheritance: info.inheritance,
+        });
+
+        for child in &node.children {
+            match child.name.as_str() {
+                "group" => self.import_group(child, Some(&folder_id))?,
+                "server" => self.import_server(child, Some(&folder_id))?,
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn import_server(
+        &mut self,
+        node: &XmlElement,
+        parent_id: Option<&str>,
+    ) -> Result<(), ImportError> {
+        self.server_counter += 1;
+        let info = rdg_connection_info(node, self.schema_v1);
+        let hostname = info
+            .hostname
+            .filter(|h| !h.is_empty())
+            .ok_or(ImportError::MissingField("server/name"))?;
+        let display_name = info.display_name.unwrap_or_else(|| hostname.clone());
+        self.tree.add_entry(ConnectionEntry {
+            id: format!("rdg-srv-{}", self.server_counter),
+            display_name,
+            hostname,
+            parent_folder_id: parent_id.map(str::to_owned),
+            tags: vec!["rdg".to_owned(), "rdp".to_owned()],
+            properties: info.properties,
+            inheritance: info.inheritance,
+        });
+        Ok(())
+    }
+}
+
 /// Imports a Microsoft Remote Desktop Connection Manager (`.rdg`) XML document
 /// into a [`ConnectionTree`], ported from mRemoteNG's
-/// `RemoteDesktopConnectionManagerDeserializer.cs`.
+/// `RemoteDesktopConnectionManagerDeserializer.cs`:
+///
+/// - `<file>` and every nested `<group>` become folders whose `parent_id` is the
+///   enclosing group (a stack of open groups, like the recursive `ImportFileOrGroup`),
+///   and servers following a closed inner group return to the outer group.
+/// - Properties are read only from the element's **direct** children, so an inner
+///   group's credentials never leak into the outer folder.
+/// - Each settings section's `inherit` attribute drives [`InheritanceFlags`]:
+///   `None` means explicit values, anything else resolves from the parent and ignores
+///   saved local values (including `connectToConsole`).
+/// - Entity references (`&amp;`, `&#NN;`, `&#xHH;`, ...) are decoded.
 ///
 /// # Errors
 ///
-/// Returns [`ImportError::InvalidXml`] if `<RDCMan>` root is missing.
+/// Returns [`ImportError::InvalidXml`] if the document is malformed or `<RDCMan>` is not
+/// the root, and [`ImportError::MissingField`] for a `<server>` without a name.
 pub fn import_rdcman_rdg(xml: &str) -> Result<ConnectionTree, ImportError> {
-    if !xml.contains("<RDCMan") {
+    let doc = parse_xml_document(xml)?;
+    if doc.name != "RDCMan" {
         return Err(ImportError::InvalidXml(
             "missing <RDCMan> root element".to_owned(),
         ));
     }
+    let schema_v1 = doc
+        .attr("schemaVersion")
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        == Some(1);
 
-    let mut tree = ConnectionTree::new();
-    let mut group_counter = 0usize;
-    let mut server_counter = 0usize;
-
-    // Extract top-level or nested <group> blocks and <server> blocks.
-    let mut current_folder_id: Option<String> = None;
-    let mut cursor = xml;
-
-    while let Some(tag_start) = cursor.find('<') {
-        cursor = &cursor[tag_start..];
-        if cursor.starts_with("<group>") || cursor.starts_with("<group ") {
-            group_counter += 1;
-            let folder_id = format!("rdg-group-{group_counter}");
-            let group_header = cursor.find("<server").map_or(cursor, |idx| &cursor[..idx]);
-            let folder_name = extract_xml_tag(group_header, "name")
-                .unwrap_or_else(|| format!("Group {group_counter}"));
-            let username = extract_xml_tag(group_header, "userName").unwrap_or_default();
-            let domain = extract_xml_tag(group_header, "domain").unwrap_or_default();
-            let port = extract_xml_tag(group_header, "port")
-                .and_then(|p| p.parse::<u16>().ok())
-                .unwrap_or(ConnectionProtocol::Rdp.default_port());
-
-            tree.upsert_folder(ConnectionFolder {
-                id: folder_id.clone(),
-                name: folder_name,
-                parent_id: None,
-                properties: ConnectionProperties {
-                    username,
-                    domain,
-                    protocol: ConnectionProtocol::Rdp,
-                    port,
-                    ..ConnectionProperties::default()
-                },
-                inheritance: InheritanceFlags::none(),
-            });
-            current_folder_id = Some(folder_id);
-            cursor = &cursor[6..];
-        } else if cursor.starts_with("</group>") {
-            current_folder_id = None;
-            cursor = &cursor[8..];
-        } else if cursor.starts_with("<server>") || cursor.starts_with("<server ") {
-            let end_idx = cursor
-                .find("</server>")
-                .ok_or_else(|| ImportError::InvalidXml("unclosed <server> element".to_owned()))?;
-            let server_block = &cursor[..end_idx];
-            server_counter += 1;
-
-            let hostname = extract_xml_tag(server_block, "name")
-                .ok_or(ImportError::MissingField("server/name"))?;
-            let display_name =
-                extract_xml_tag(server_block, "displayName").unwrap_or_else(|| hostname.clone());
-            let username = extract_xml_tag(server_block, "userName");
-            let domain = extract_xml_tag(server_block, "domain");
-            let port = extract_xml_tag(server_block, "port").and_then(|p| p.parse::<u16>().ok());
-            let use_console = extract_xml_tag(server_block, "connectToConsole")
-                .is_some_and(|v| v.eq_ignore_ascii_case("true"));
-
-            let mut inheritance = InheritanceFlags::all();
-            inheritance.use_console_session = false;
-            if username.is_some() {
-                inheritance.username = false;
-            }
-            if domain.is_some() {
-                inheritance.domain = false;
-            }
-            if port.is_some() {
-                inheritance.port = false;
-            }
-
-            tree.add_entry(ConnectionEntry {
-                id: format!("rdg-srv-{server_counter}"),
-                display_name,
-                hostname,
-                parent_folder_id: current_folder_id.clone(),
-                tags: vec!["rdg".to_owned(), "rdp".to_owned()],
-                properties: ConnectionProperties {
-                    username: username.unwrap_or_default(),
-                    domain: domain.unwrap_or_default(),
-                    protocol: ConnectionProtocol::Rdp,
-                    port: port.unwrap_or(ConnectionProtocol::Rdp.default_port()),
-                    use_console_session: use_console,
-                    ..ConnectionProperties::default()
-                },
-                inheritance,
-            });
-            cursor = &cursor[end_idx + 9..];
-        } else {
-            cursor = &cursor[1..];
+    let mut importer = RdgImporter {
+        tree: ConnectionTree::new(),
+        schema_v1,
+        group_counter: 0,
+        server_counter: 0,
+    };
+    for child in &doc.children {
+        match child.name.as_str() {
+            // mRemoteNG treats <file> itself as the top container (`ImportFileOrGroup(fileNode, root)`).
+            "file" | "group" => importer.import_group(child, None)?,
+            "server" => importer.import_server(child, None)?,
+            _ => {}
         }
     }
-
-    Ok(tree)
+    Ok(importer.tree)
 }
 
-/// Imports a `PuTTY` Connection Manager XML configuration into a [`ConnectionTree`],
-/// ported from mRemoteNG's `PuttyConnectionManagerDeserializer.cs`.
-///
-/// # Errors
-///
-/// Returns [`ImportError::InvalidXml`] if `<configuration` root is missing.
-pub fn import_putty_xml(xml: &str) -> Result<ConnectionTree, ImportError> {
-    if !xml.contains("<configuration") {
-        return Err(ImportError::InvalidXml(
-            "missing <configuration> root element".to_owned(),
-        ));
+struct PuttyImporter {
+    tree: ConnectionTree,
+    folder_counter: usize,
+    conn_counter: usize,
+}
+
+impl PuttyImporter {
+    /// `ImportRootOrContainer`: a `<root type="database">` or `<container type="folder">`
+    /// becomes a folder, and its direct `<container>` / `<connection>` children are
+    /// imported with that folder as their parent.
+    fn import_container(
+        &mut self,
+        node: &XmlElement,
+        parent_id: Option<&str>,
+    ) -> Result<(), ImportError> {
+        let node_type = node.attr("type").unwrap_or_default();
+        let expected = if node.name == "root" {
+            "database"
+        } else {
+            "folder"
+        };
+        if !node_type.eq_ignore_ascii_case(expected) {
+            return Err(ImportError::InvalidXml(format!(
+                "unrecognized <{}> node type ({node_type})",
+                node.name
+            )));
+        }
+
+        self.folder_counter += 1;
+        let folder_id = format!("putty-folder-{}", self.folder_counter);
+        let name = node
+            .attr("name")
+            .filter(|n| !n.trim().is_empty())
+            .map_or_else(|| format!("Folder {}", self.folder_counter), str::to_owned);
+        self.tree.upsert_folder(ConnectionFolder {
+            id: folder_id.clone(),
+            name,
+            parent_id: parent_id.map(str::to_owned),
+            properties: ConnectionProperties {
+                protocol: ConnectionProtocol::Ssh,
+                port: ConnectionProtocol::Ssh.default_port(),
+                ..ConnectionProperties::default()
+            },
+            inheritance: InheritanceFlags::none(),
+        });
+
+        for child in &node.children {
+            match child.name.as_str() {
+                "container" => self.import_container(child, Some(&folder_id))?,
+                "connection" => self.import_connection(child, Some(&folder_id))?,
+                _ => {}
+            }
+        }
+        Ok(())
     }
 
-    let mut tree = ConnectionTree::new();
-    let mut conn_counter = 0usize;
-    let mut cursor = xml;
-
-    while let Some(idx) = cursor.find("<connection") {
-        cursor = &cursor[idx..];
-        let end_idx = cursor
-            .find("</connection>")
-            .ok_or_else(|| ImportError::InvalidXml("unclosed <connection> element".to_owned()))?;
-        let block = &cursor[..end_idx];
-        conn_counter += 1;
-
-        let display_name =
-            extract_xml_tag(block, "name").unwrap_or_else(|| format!("PuTTY {conn_counter}"));
-        let hostname =
-            extract_xml_tag(block, "host").ok_or(ImportError::MissingField("connection/host"))?;
-        let proto_str = extract_xml_tag(block, "protocol").unwrap_or_else(|| "SSH".to_owned());
+    fn import_connection(
+        &mut self,
+        node: &XmlElement,
+        parent_id: Option<&str>,
+    ) -> Result<(), ImportError> {
+        self.conn_counter += 1;
+        let info = node.child("connection_info").unwrap_or(node);
+        let display_name = info
+            .child_text("name")
+            .filter(|n| !n.is_empty())
+            .unwrap_or_else(|| format!("PuTTY {}", self.conn_counter));
+        let hostname = info
+            .child_text("host")
+            .filter(|h| !h.is_empty())
+            .ok_or(ImportError::MissingField("connection/host"))?;
+        let proto_str = info
+            .child_text("protocol")
+            .filter(|p| !p.is_empty())
+            .unwrap_or_else(|| "SSH".to_owned());
         let protocol = if proto_str.eq_ignore_ascii_case("telnet") {
             ConnectionProtocol::Telnet
         } else {
             ConnectionProtocol::Ssh
         };
-        let port = extract_xml_tag(block, "port")
+        let port = info
+            .child_text("port")
             .and_then(|p| p.parse::<u16>().ok())
             .unwrap_or_else(|| protocol.default_port());
-        let username = extract_xml_tag(block, "login").unwrap_or_default();
+        let username = node
+            .child("login")
+            .and_then(|login| login.child_text("login"))
+            .unwrap_or_default();
 
-        tree.add_entry(ConnectionEntry {
-            id: format!("putty-{conn_counter}"),
+        self.tree.add_entry(ConnectionEntry {
+            id: format!("putty-{}", self.conn_counter),
             display_name,
             hostname,
-            parent_folder_id: None,
+            parent_folder_id: parent_id.map(str::to_owned),
             tags: vec!["putty".to_owned(), proto_str.to_ascii_lowercase()],
             properties: ConnectionProperties {
                 username,
@@ -869,19 +1262,37 @@ pub fn import_putty_xml(xml: &str) -> Result<ConnectionTree, ImportError> {
             },
             inheritance: InheritanceFlags::none(),
         });
-
-        cursor = &cursor[end_idx + 13..];
+        Ok(())
     }
-
-    Ok(tree)
 }
 
-fn extract_xml_tag(block: &str, tag: &str) -> Option<String> {
-    let open = format!("<{tag}>");
-    let close = format!("</{tag}>");
-    let close_idx = block.find(&close)?;
-    let start = block[..close_idx].rfind(&open)? + open.len();
-    Some(block[start..close_idx].trim().to_owned())
+/// Imports a `PuTTY` Connection Manager XML configuration into a [`ConnectionTree`],
+/// ported from mRemoteNG's `PuttyConnectionManagerDeserializer.cs`: every
+/// `<root type="database">` and nested `<container type="folder">` becomes a folder,
+/// and each `<connection>` is attached to its enclosing folder. Entity references in
+/// names, hosts, and logins are decoded.
+///
+/// # Errors
+///
+/// Returns [`ImportError::InvalidXml`] if the document is malformed, `<configuration>`
+/// is not the root, or a `root`/`container` has an unexpected `type`, and
+/// [`ImportError::MissingField`] for a connection without a host.
+pub fn import_putty_xml(xml: &str) -> Result<ConnectionTree, ImportError> {
+    let doc = parse_xml_document(xml)?;
+    if doc.name != "configuration" {
+        return Err(ImportError::InvalidXml(
+            "missing <configuration> root element".to_owned(),
+        ));
+    }
+    let mut importer = PuttyImporter {
+        tree: ConnectionTree::new(),
+        folder_counter: 0,
+        conn_counter: 0,
+    };
+    for root in doc.children_named("root") {
+        importer.import_container(root, None)?;
+    }
+    Ok(importer.tree)
 }
 
 /// Imports Active Directory computer and organizational-unit (`OU=`) entries from an
@@ -1147,7 +1558,7 @@ audiomode:i:2
       <properties>
         <name>Core Infra</name>
       </properties>
-      <logonCredentials inherit="FromParent">
+      <logonCredentials inherit="None">
         <userName>infra_admin</userName>
         <domain>INFRA</domain>
       </logonCredentials>
@@ -1156,7 +1567,7 @@ audiomode:i:2
           <name>dc01.infra.omega</name>
           <displayName>Domain Controller 01</displayName>
         </properties>
-        <connectionSettings inherit="FromParent">
+        <connectionSettings inherit="None">
           <connectToConsole>True</connectToConsole>
         </connectionSettings>
       </server>
@@ -1173,6 +1584,12 @@ audiomode:i:2
         assert_eq!(eff.username, "infra_admin");
         assert_eq!(eff.domain, "INFRA");
         assert!(eff.use_console_session);
+        // The server sits in "Core Infra", which itself sits in the <file> folder.
+        let group = rdg_tree
+            .folder(srv.parent_folder_id.as_deref().unwrap())
+            .unwrap();
+        assert_eq!(group.name, "Core Infra");
+        assert!(group.parent_id.is_some());
 
         // 3. PuTTY Connection Manager XML
         let putty_xml = r#"
@@ -1202,8 +1619,20 @@ audiomode:i:2
         assert_eq!(ssh_entry.properties.protocol, ConnectionProtocol::Ssh);
         assert_eq!(ssh_entry.properties.port, 2222);
         assert_eq!(ssh_entry.properties.username, "netops");
+        let routers = putty_tree
+            .folder(ssh_entry.parent_folder_id.as_deref().unwrap())
+            .unwrap();
+        assert_eq!(routers.name, "Routers");
+        let database = putty_tree
+            .folder(routers.parent_id.as_deref().unwrap())
+            .unwrap();
+        assert_eq!(database.name, "ProdSSH");
+        assert!(database.parent_id.is_none());
+    }
 
-        // 4. Active Directory LDIF import (`ActiveDirectoryDeserializer.cs`)
+    #[test]
+    fn importer_parses_active_directory_ldif() {
+        // Active Directory LDIF import (`ActiveDirectoryDeserializer.cs`)
         let ad_ldif = "\
 dn: OU=Servers,DC=omega,DC=local
 objectClass: organizationalUnit
@@ -1222,5 +1651,315 @@ dNSHostName: sql01.omega.local
             Some("ad-ou-servers")
         );
         assert_eq!(ad_tree.entries()[0].inheritance, InheritanceFlags::all());
+    }
+
+    /// Regression for #28 `connection_manager.rs:741` and `:749`: nested groups keep
+    /// their real parent, a server after a closed inner group returns to the outer
+    /// group, and an inner group's credentials never become the outer folder's own.
+    #[test]
+    fn rdcman_nested_groups_keep_parents_and_do_not_leak_child_credentials() {
+        let rdg_xml = r#"<?xml version="1.0" encoding="utf-8"?>
+<RDCMan programVersion="2.83" schemaVersion="3">
+  <file>
+    <properties><name>Lab</name></properties>
+    <group>
+      <properties><name>Outer</name></properties>
+      <logonCredentials inherit="None">
+        <userName></userName>
+        <domain>OUTER</domain>
+      </logonCredentials>
+      <group>
+        <properties><name>Inner</name></properties>
+        <logonCredentials inherit="None">
+          <userName>alice</userName>
+          <domain>INNER</domain>
+        </logonCredentials>
+        <server>
+          <properties><name>inner-01</name></properties>
+        </server>
+      </group>
+      <server>
+        <properties><name>outer-01</name></properties>
+      </server>
+    </group>
+  </file>
+</RDCMan>
+"#;
+        let tree = import_rdcman_rdg(rdg_xml).unwrap();
+        assert_eq!(tree.entries().len(), 2);
+        let inner_srv = tree
+            .entries()
+            .iter()
+            .find(|e| e.hostname == "inner-01")
+            .unwrap();
+        let outer_srv = tree
+            .entries()
+            .iter()
+            .find(|e| e.hostname == "outer-01")
+            .unwrap();
+
+        let inner = tree
+            .folder(inner_srv.parent_folder_id.as_deref().unwrap())
+            .unwrap();
+        let outer = tree
+            .folder(outer_srv.parent_folder_id.as_deref().unwrap())
+            .unwrap();
+        assert_eq!(inner.name, "Inner");
+        assert_eq!(outer.name, "Outer");
+        // Inner's parent is Outer, Outer's parent is the <file> folder "Lab".
+        assert_eq!(inner.parent_id.as_deref(), Some(outer.id.as_str()));
+        let lab = tree.folder(outer.parent_id.as_deref().unwrap()).unwrap();
+        assert_eq!(lab.name, "Lab");
+        assert!(lab.parent_id.is_none());
+
+        // Outer keeps its own (empty) username: `alice` belongs to Inner only.
+        assert_eq!(outer.properties.username, "");
+        assert_eq!(outer.properties.domain, "OUTER");
+        assert_eq!(inner.properties.username, "alice");
+
+        let outer_eff = tree.effective_entry_properties(outer_srv);
+        assert_eq!(outer_eff.username, "");
+        assert_eq!(outer_eff.domain, "OUTER");
+        let inner_eff = tree.effective_entry_properties(inner_srv);
+        assert_eq!(inner_eff.username, "alice");
+        assert_eq!(inner_eff.domain, "INNER");
+    }
+
+    /// Regression for #28 `connection_manager.rs:785`: `inherit="FromParent"` resolves
+    /// the section from the parent even when it carries saved local values, and console
+    /// session inheritance follows the same attribute instead of being always disabled.
+    #[test]
+    fn rdcman_inherit_attribute_controls_section_resolution() {
+        let rdg_xml = r#"
+<RDCMan schemaVersion="3">
+  <file>
+    <properties><name>Ops</name></properties>
+    <group>
+      <properties><name>Consoles</name></properties>
+      <logonCredentials inherit="None">
+        <userName>group_admin</userName>
+        <domain>GROUP</domain>
+      </logonCredentials>
+      <connectionSettings inherit="None">
+        <connectToConsole>True</connectToConsole>
+        <port>3390</port>
+      </connectionSettings>
+      <server>
+        <properties><name>inherits</name></properties>
+        <logonCredentials inherit="FromParent">
+          <userName>stale_local_user</userName>
+          <domain>STALE</domain>
+        </logonCredentials>
+        <connectionSettings inherit="FromParent">
+          <connectToConsole>False</connectToConsole>
+          <port>13389</port>
+        </connectionSettings>
+      </server>
+      <server>
+        <properties><name>explicit</name></properties>
+        <logonCredentials inherit="None">
+          <userName>own_user</userName>
+          <domain>OWN</domain>
+        </logonCredentials>
+        <connectionSettings inherit="None">
+          <connectToConsole>False</connectToConsole>
+        </connectionSettings>
+      </server>
+    </group>
+  </file>
+</RDCMan>
+"#;
+        let tree = import_rdcman_rdg(rdg_xml).unwrap();
+        let inherits = tree
+            .entries()
+            .iter()
+            .find(|e| e.hostname == "inherits")
+            .unwrap();
+        assert!(inherits.inheritance.username);
+        assert!(inherits.inheritance.domain);
+        assert!(inherits.inheritance.use_console_session);
+        assert!(inherits.inheritance.port);
+        let eff = tree.effective_entry_properties(inherits);
+        assert_eq!(eff.username, "group_admin");
+        assert_eq!(eff.domain, "GROUP");
+        assert!(
+            eff.use_console_session,
+            "console inheritance must follow the parent"
+        );
+        assert_eq!(eff.port, 3390);
+
+        let explicit = tree
+            .entries()
+            .iter()
+            .find(|e| e.hostname == "explicit")
+            .unwrap();
+        assert!(!explicit.inheritance.username);
+        assert!(!explicit.inheritance.use_console_session);
+        let eff = tree.effective_entry_properties(explicit);
+        assert_eq!(eff.username, "own_user");
+        assert_eq!(eff.domain, "OWN");
+        assert!(!eff.use_console_session);
+        // Port section is explicit but has no <port>: RDP default, not the group's 3390.
+        assert_eq!(eff.port, 3389);
+    }
+
+    /// Regression for #28 `connection_manager.rs:862`: the `PuTTY` importer must recreate
+    /// the database/folder hierarchy instead of flattening every connection to the root.
+    #[test]
+    fn putty_importer_creates_nested_folders_and_assigns_connections_to_them() {
+        let putty_xml = r#"
+<configuration version="0.7" save="True">
+  <root type="database" name="Prod" expanded="True">
+    <connection type="PuTTY" name="bastion">
+      <connection_info><name>bastion</name><protocol>SSH</protocol><host>bastion.example</host><port>22</port></connection_info>
+    </connection>
+    <container type="folder" name="Routers">
+      <container type="folder" name="Core">
+        <connection type="PuTTY" name="core-01">
+          <connection_info><name>core-01</name><protocol>Telnet</protocol><host>10.0.0.1</host><port>23</port></connection_info>
+          <login><login>netops</login></login>
+        </connection>
+      </container>
+      <connection type="PuTTY" name="edge-01">
+        <connection_info><name>edge-01</name><protocol>SSH</protocol><host>10.0.1.1</host><port>2222</port></connection_info>
+      </connection>
+    </container>
+  </root>
+</configuration>
+"#;
+        let tree = import_putty_xml(putty_xml).unwrap();
+        assert_eq!(tree.entries().len(), 3);
+        let by_host = |host: &str| tree.entries().iter().find(|e| e.hostname == host).unwrap();
+
+        let prod = tree
+            .folder(
+                by_host("bastion.example")
+                    .parent_folder_id
+                    .as_deref()
+                    .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(prod.name, "Prod");
+        assert!(prod.parent_id.is_none());
+
+        let routers = tree
+            .folder(by_host("10.0.1.1").parent_folder_id.as_deref().unwrap())
+            .unwrap();
+        assert_eq!(routers.name, "Routers");
+        assert_eq!(routers.parent_id.as_deref(), Some(prod.id.as_str()));
+
+        let core_entry = by_host("10.0.0.1");
+        let core = tree
+            .folder(core_entry.parent_folder_id.as_deref().unwrap())
+            .unwrap();
+        assert_eq!(core.name, "Core");
+        assert_eq!(core.parent_id.as_deref(), Some(routers.id.as_str()));
+        assert_eq!(core_entry.properties.protocol, ConnectionProtocol::Telnet);
+        assert_eq!(core_entry.properties.username, "netops");
+
+        // A folder with the wrong type is rejected like mRemoteNG's FileFormatException.
+        assert!(matches!(
+            import_putty_xml(r#"<configuration><root type="folder" name="x"/></configuration>"#),
+            Err(ImportError::InvalidXml(_))
+        ));
+    }
+
+    /// Regression for #28 `connection_manager.rs:884`: XML character references must be
+    /// decoded so `ops&amp;support` imports as the login `ops&support`.
+    #[test]
+    fn xml_importers_decode_named_and_numeric_character_references() {
+        assert_eq!(decode_xml_entities("ops&amp;support"), "ops&support");
+        assert_eq!(
+            decode_xml_entities("&lt;a href=&quot;x&quot;&gt;&apos;q&apos;"),
+            "<a href=\"x\">'q'"
+        );
+        assert_eq!(decode_xml_entities("&#65;&#x42;&#X43;"), "ABC");
+        assert_eq!(decode_xml_entities("&#231;&#xE7;"), "çç");
+        // Malformed or unknown references are kept literally and never panic.
+        assert_eq!(
+            decode_xml_entities("a & b &unknown; &#; &#xZZ; &"),
+            "a & b &unknown; &#; &#xZZ; &"
+        );
+
+        let rdg_xml = r#"
+<RDCMan schemaVersion="3">
+  <file>
+    <properties><name>Ops &amp; Support</name></properties>
+    <server>
+      <properties>
+        <name>srv&#x2d;01.example</name>
+        <displayName>&quot;Quoted&quot; &lt;Server&gt;</displayName>
+      </properties>
+      <logonCredentials inherit="None">
+        <userName>ops&amp;support</userName>
+        <domain>R&amp;D</domain>
+      </logonCredentials>
+    </server>
+  </file>
+</RDCMan>
+"#;
+        let tree = import_rdcman_rdg(rdg_xml).unwrap();
+        let srv = &tree.entries()[0];
+        assert_eq!(srv.hostname, "srv-01.example");
+        assert_eq!(srv.display_name, "\"Quoted\" <Server>");
+        assert_eq!(srv.properties.username, "ops&support");
+        assert_eq!(srv.properties.domain, "R&D");
+        assert_eq!(
+            tree.folder(srv.parent_folder_id.as_deref().unwrap())
+                .unwrap()
+                .name,
+            "Ops & Support"
+        );
+
+        let putty_xml = r#"
+<configuration>
+  <root type="database" name="R&amp;D &#x4C;ab">
+    <connection type="PuTTY" name="x">
+      <connection_info><name>Edge &lt;1&gt;</name><protocol>SSH</protocol><host>edge.example</host><port>22</port></connection_info>
+      <login><login>ops&amp;support</login></login>
+    </connection>
+  </root>
+</configuration>
+"#;
+        let tree = import_putty_xml(putty_xml).unwrap();
+        let conn = &tree.entries()[0];
+        assert_eq!(conn.display_name, "Edge <1>");
+        assert_eq!(conn.properties.username, "ops&support");
+        assert_eq!(
+            tree.folder(conn.parent_folder_id.as_deref().unwrap())
+                .unwrap()
+                .name,
+            "R&D Lab"
+        );
+    }
+
+    #[test]
+    fn xml_parser_rejects_malformed_documents_without_panicking() {
+        assert!(matches!(
+            import_rdcman_rdg("<RDCMan><file><group></file></RDCMan>"),
+            Err(ImportError::InvalidXml(_))
+        ));
+        assert!(matches!(
+            import_rdcman_rdg("<RDCMan><file>"),
+            Err(ImportError::InvalidXml(_))
+        ));
+        assert!(matches!(
+            import_rdcman_rdg("<notrdcman/>"),
+            Err(ImportError::InvalidXml(_))
+        ));
+        assert!(matches!(
+            import_putty_xml("<configuration><root type=database></root></configuration>"),
+            Err(ImportError::InvalidXml(_))
+        ));
+        assert!(matches!(
+            import_putty_xml(""),
+            Err(ImportError::InvalidXml(_))
+        ));
+        // Comments, processing instructions, CDATA and self-closing tags are tolerated.
+        let tree = import_rdcman_rdg(
+            "<?xml version=\"1.0\"?><!-- c --><RDCMan schemaVersion=\"3\"><file><properties><name><![CDATA[A & B]]></name><expanded/></properties></file></RDCMan>",
+        )
+        .unwrap();
+        assert_eq!(tree.folder("rdg-group-1").unwrap().name, "A & B");
     }
 }
