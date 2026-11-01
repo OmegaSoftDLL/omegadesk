@@ -245,7 +245,7 @@ async fn serve_control(
                 };
                 send_envelope(control_send, &reply).await?;
             }
-            Some(Payload::RequestKeyframe(_)) => {
+            Some(Payload::RequestKeyframe(_) | Payload::InvalidateRefFrames(_)) => {
                 state.keyframe_requested.store(true, Ordering::Relaxed);
             }
             Some(Payload::KeyEvent(key)) => {
@@ -277,7 +277,18 @@ async fn serve_control(
                 Payload::Hello(_)
                 | Payload::HelloAck(_)
                 | Payload::Pong(_)
-                | Payload::VideoFrame(_),
+                | Payload::FrameAck(_)
+                | Payload::VideoFrame(_)
+                | Payload::AudioFrame(_)
+                | Payload::DisplayList(_)
+                | Payload::SelectDisplay(_)
+                | Payload::ClipboardEvent(_)
+                | Payload::FileTransferOffer(_)
+                | Payload::FileTransferChunk(_)
+                | Payload::FileTransferAck(_)
+                | Payload::ChatMessage(_)
+                | Payload::TerminalData(_)
+                | Payload::TerminalResize(_),
             )
             | None => {}
         }

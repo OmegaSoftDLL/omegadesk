@@ -1700,6 +1700,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "omegadesk-quicksupport"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "omegadesk-identity",
+ "rand_core 0.6.4",
+ "thiserror 2.0.21",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "omegadesk-relay"
 version = "0.1.0"
 dependencies = [
@@ -1731,6 +1743,19 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "omegadesk-session"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "omegadesk-identity",
+ "omegadesk-protocol",
+ "proptest",
+ "rand_core 0.6.4",
+ "sha2",
+ "thiserror 2.0.21",
 ]
 
 [[package]]

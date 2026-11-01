@@ -11,7 +11,10 @@ use std::time::{Duration, Instant};
 pub mod cursor;
 #[cfg(windows)]
 mod dxgi;
+#[cfg(windows)]
+pub mod gdi;
 pub mod rotate;
+pub mod service_desktop;
 
 /// Screen capture errors.
 #[derive(Debug, thiserror::Error)]
@@ -121,7 +124,16 @@ pub trait Capturer: Send {
 pub fn open_display(index: u32) -> Result<Box<dyn Capturer>, CaptureError> {
     #[cfg(windows)]
     {
-        Ok(Box::new(dxgi::DxgiCapturer::open(index)?))
+        if !service_desktop::input_desktop_selected() {
+            let _ = service_desktop::select_input_desktop();
+        }
+        match dxgi::DxgiCapturer::open(index) {
+            Ok(capturer) => Ok(Box::new(capturer)),
+            Err(CaptureError::DisplayNotFound(missing)) => {
+                Err(CaptureError::DisplayNotFound(missing))
+            }
+            Err(_dxgi_err) => Ok(Box::new(gdi::GdiCapturer::open(index)?)),
+        }
     }
     #[cfg(not(windows))]
     {

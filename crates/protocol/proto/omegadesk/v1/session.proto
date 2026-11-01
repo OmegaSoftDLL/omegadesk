@@ -14,9 +14,21 @@ message Envelope {
     Pong pong = 4;
     Error error = 5;
     RequestKeyframe request_keyframe = 6;
+    FrameAck frame_ack = 7;
+    InvalidateReferenceFrames invalidate_ref_frames = 8;
     VideoFrame video_frame = 10;
+    AudioFrame audio_frame = 11;
+    DisplayList display_list = 12;
+    SelectDisplay select_display = 13;
     KeyEvent key_event = 20;
     PointerEvent pointer_event = 21;
+    ClipboardEvent clipboard_event = 30;
+    FileTransferOffer file_transfer_offer = 31;
+    FileTransferChunk file_transfer_chunk = 32;
+    FileTransferAck file_transfer_ack = 33;
+    ChatMessage chat_message = 40;
+    TerminalData terminal_data = 41;
+    TerminalResize terminal_resize = 42;
   }
 }
 
@@ -69,6 +81,22 @@ message Pong {
 // and needs an IDR keyframe to resume rendering.
 message RequestKeyframe {}
 
+// Per-frame acknowledgement sent by the client after decoding a frame
+// (modeled after Selkies websockets_mode.py and RustDesk video_qos.rs).
+message FrameAck {
+  uint64 frame_sequence = 1;
+  uint64 captured_at_micros = 2;
+  uint32 decode_micros = 3;
+  uint32 queue_depth = 4;
+}
+
+// Sent when specific frames were lost so the encoder can invalidate reference
+// frames without emitting a full IDR frame spike (modeled after Sunshine).
+message InvalidateReferenceFrames {
+  uint64 first_lost_sequence = 1;
+  uint64 last_lost_sequence = 2;
+}
+
 message Error {
   ErrorCode code = 1;
   string message = 2;
@@ -97,6 +125,35 @@ message VideoFrame {
   bytes data = 9;
 }
 
+// Opus RESTRICTED_LOWDELAY audio packet (modeled after Sunshine src/audio.cpp).
+message AudioFrame {
+  uint64 sequence = 1;
+  uint64 captured_at_micros = 2;
+  uint32 sample_rate = 3;
+  uint32 channels = 4;
+  bytes opus_data = 5;
+}
+
+message DisplayDescriptor {
+  uint32 index = 1;
+  string name = 2;
+  uint32 width = 3;
+  uint32 height = 4;
+  int32 origin_x = 5;
+  int32 origin_y = 6;
+  uint32 scale_percent = 7;
+  bool primary = 8;
+}
+
+message DisplayList {
+  repeated DisplayDescriptor displays = 1;
+  uint32 active_display_index = 2;
+}
+
+message SelectDisplay {
+  uint32 display_index = 1;
+}
+
 message KeyEvent {
   // Physical scancode (USB HID usage) and keysym so international keyboard
   // layouts (including ABNT2) work across both peers.
@@ -114,4 +171,58 @@ message PointerEvent {
   uint32 buttons = 4;
   int32 wheel_x = 5;
   int32 wheel_y = 6;
+}
+
+enum ClipboardFormat {
+  CLIPBOARD_FORMAT_UNSPECIFIED = 0;
+  CLIPBOARD_FORMAT_UTF8_TEXT = 1;
+  CLIPBOARD_FORMAT_HTML = 2;
+  CLIPBOARD_FORMAT_FILE_LIST = 3;
+}
+
+message ClipboardEvent {
+  ClipboardFormat format = 1;
+  bytes data = 2;
+  // SHA-256 digest of `data` used to suppress echo loops.
+  bytes content_sha256 = 3;
+}
+
+message FileTransferOffer {
+  uint64 transfer_id = 1;
+  string relative_path = 2;
+  uint64 total_bytes = 3;
+  bytes file_sha256 = 4;
+  uint64 resume_offset = 5;
+}
+
+message FileTransferChunk {
+  uint64 transfer_id = 1;
+  uint64 offset = 2;
+  bytes data = 3;
+  bool eof = 4;
+}
+
+message FileTransferAck {
+  uint64 transfer_id = 1;
+  uint64 next_offset = 2;
+  bool completed = 3;
+  bool verified = 4;
+}
+
+message ChatMessage {
+  uint64 message_id = 1;
+  string sender_name = 2;
+  uint64 sent_at_micros = 3;
+  string body = 4;
+}
+
+message TerminalData {
+  uint32 session_id = 1;
+  bytes data = 2;
+}
+
+message TerminalResize {
+  uint32 session_id = 1;
+  uint32 cols = 2;
+  uint32 rows = 3;
 }

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/*", "agent", "client", "relay", "server"]
+members = ["crates/*", "agent", "client", "quicksupport", "relay", "server"]
 
 [workspace.package]
 version = "0.1.0"
@@ -20,6 +20,8 @@ omegadesk-transport = { path = "crates/transport" }
 omegadesk-noise = { path = "crates/noise" }
 omegadesk-tun = { path = "crates/tun" }
 omegadesk-mesh = { path = "crates/mesh" }
+omegadesk-session = { path = "crates/session" }
+omegadesk-quicksupport = { path = "quicksupport" }
 omegadesk-relay = { path = "relay" }
 omegadesk-server = { path = "server" }
 
