@@ -23,5 +23,8 @@ windows = { workspace = true, features = [
 [target.'cfg(windows)'.build-dependencies]
 cc = "1"
 
+[target.'cfg(windows)'.dev-dependencies]
+windows = { workspace = true, features = ["Win32_Foundation", "Win32_Graphics_Gdi"] }
+
 [lints]
 workspace = true

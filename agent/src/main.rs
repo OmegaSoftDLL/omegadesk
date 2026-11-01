@@ -17,6 +17,8 @@
 //! On startup the agent prints its access password (and, on the local
 //! network, its TLS certificate fingerprint); the client requires it to connect.
 
+mod virtual_display;
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -87,6 +89,17 @@ struct Args {
     /// Mesh mode only: never attempt direct paths, send everything via the relays.
     #[arg(long)]
     relay_only: bool,
+
+    /// Plug a virtual monitor at this mode (`WxH` or `WxH@hz`, e.g.
+    /// `1920x1080@60`) on startup, for headless or unattended hosts. Installs
+    /// the signed IddCx driver on first use (needs administrator rights).
+    #[arg(long, value_name = "WxH@hz")]
+    virtual_display: Option<String>,
+
+    /// Privacy mode: with `--virtual-display`, blank the physical monitor so
+    /// only the remote operator sees the screen (restored on exit).
+    #[arg(long, requires = "virtual_display")]
+    privacy: bool,
 
     /// File holding the agent's persistent device identity. Defaults to the
     /// operating system credential store, falling back to
@@ -204,6 +217,13 @@ async fn run_share(args: Args) -> anyhow::Result<()> {
         endpoint
     };
     info!("access password: {}", config.password);
+
+    // Optional virtual monitor for headless hosts / privacy mode. Kept alive for
+    // the whole run: dropping it unplugs the monitor and restores the screen.
+    let _virtual_display = match args.virtual_display.as_deref() {
+        Some(value) => virtual_display::activate(value, args.privacy)?,
+        None => None,
+    };
 
     // Phase 1 serves one session at a time; concurrent session multiplexing lands in Phase 3.
     while let Some(incoming) = endpoint.accept().await {

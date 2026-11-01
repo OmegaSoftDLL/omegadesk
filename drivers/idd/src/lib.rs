@@ -192,12 +192,13 @@ impl ConnectorAllocator {
         true
     }
 
-    fn in_use(&self, index: u32) -> bool {
+    #[cfg(test)]
+    fn in_use(self, index: u32) -> bool {
         index < MAX_MONITORS && self.mask & (1u8 << index) != 0
     }
 
-    fn count(&self) -> u32 {
-        u32::from(self.mask.count_ones().min(MAX_MONITORS) as u8)
+    fn count(self) -> u32 {
+        self.mask.count_ones()
     }
 }
 
@@ -274,6 +275,13 @@ impl VirtualDisplay {
         imp::uninstall_driver()
     }
 
+    /// Returns how many virtual monitors are currently plugged in across the
+    /// process (`0..=`[`MAX_MONITORS`]).
+    #[must_use]
+    pub fn active_monitor_count() -> u32 {
+        with_allocator(|allocator| allocator.count())
+    }
+
     /// Hot-plugs a new virtual monitor at `mode` and returns its [`MonitorHandle`].
     ///
     /// The connector index is reserved for the returned handle and released when
@@ -285,10 +293,8 @@ impl VirtualDisplay {
     /// in use, [`Error::Unsupported`] off Windows, or [`Error::Driver`] if the
     /// plug-in IOCTL fails (the reserved connector is released first).
     pub fn plug_monitor(&self, mode: DisplayMode) -> Result<MonitorHandle> {
-        let index =
-            with_allocator(ConnectorAllocator::allocate).ok_or(Error::NoFreeConnector {
-                max: MAX_MONITORS,
-            })?;
+        let index = with_allocator(ConnectorAllocator::allocate)
+            .ok_or(Error::NoFreeConnector { max: MAX_MONITORS })?;
         match imp::plug_in(index, mode) {
             Ok(()) => Ok(MonitorHandle {
                 index,
@@ -412,8 +418,11 @@ mod imp {
     unsafe extern "C" {
         fn MonitorPlugIn(index: c_uint, edid: c_uint, retries: c_int) -> c_int;
         fn MonitorPlugOut(index: c_uint) -> c_int;
-        fn MonitorModesUpdate(index: c_uint, mode_count: c_uint, modes: *const MonitorMode)
-        -> c_int;
+        fn MonitorModesUpdate(
+            index: c_uint,
+            mode_count: c_uint,
+            modes: *const MonitorMode,
+        ) -> c_int;
         fn IsDeviceCreated(created: *mut c_int) -> c_int;
         fn GetLastMsg() -> *const c_char;
     }
@@ -642,7 +651,12 @@ mod tests {
 
     #[test]
     fn display_mode_accepts_common_resolutions() {
-        for (w, h, hz) in [(1920, 1080, 60), (2560, 1440, 120), (3840, 2160, 60), (640, 480, 1)] {
+        for (w, h, hz) in [
+            (1920, 1080, 60),
+            (2560, 1440, 120),
+            (3840, 2160, 60),
+            (640, 480, 1),
+        ] {
             let mode = DisplayMode::new(w, h, hz).unwrap_or_else(|_| unreachable!());
             assert_eq!((mode.width(), mode.height(), mode.refresh_hz()), (w, h, hz));
         }
@@ -703,10 +717,16 @@ mod tests {
     #[cfg(not(windows))]
     #[test]
     fn operations_are_windows_only_off_windows() {
-        assert!(matches!(VirtualDisplay::is_installed(), Err(Error::Unsupported)));
+        assert!(matches!(
+            VirtualDisplay::is_installed(),
+            Err(Error::Unsupported)
+        ));
         assert!(matches!(VirtualDisplay::install(), Err(Error::Unsupported)));
         assert!(matches!(VirtualDisplay::open(), Err(Error::Unsupported)));
-        assert!(matches!(VirtualDisplay::uninstall(), Err(Error::Unsupported)));
+        assert!(matches!(
+            VirtualDisplay::uninstall(),
+            Err(Error::Unsupported)
+        ));
     }
 
     /// Windows integration test: installs the signed driver, plugs a
@@ -718,13 +738,15 @@ mod tests {
     #[cfg(windows)]
     #[test]
     #[ignore = "needs administrator privileges and modifies system display devices"]
+    #[allow(
+        unsafe_code,
+        reason = "Win32 EnumDisplayDevices probe in an ignored integration test"
+    )]
     fn windows_install_plug_enumerate_unplug_uninstall()
     -> core::result::Result<(), Box<dyn std::error::Error>> {
         use std::{thread::sleep, time::Duration};
 
-        use windows::Win32::Graphics::Gdi::{
-            DISPLAY_DEVICEW, EnumDisplayDevicesW, EDD_GET_DEVICE_INTERFACE_NAME,
-        };
+        use windows::Win32::Graphics::Gdi::{DISPLAY_DEVICEW, EnumDisplayDevicesW};
         use windows::core::PCWSTR;
 
         fn attached_display_count() -> u32 {
@@ -737,14 +759,7 @@ mod tests {
                 };
                 // SAFETY: `device.cb` is initialized; `EnumDisplayDevicesW`
                 // fills `device` for adapter `index` and returns 0 at the end.
-                let ok = unsafe {
-                    EnumDisplayDevicesW(
-                        PCWSTR::null(),
-                        index,
-                        &raw mut device,
-                        EDD_GET_DEVICE_INTERFACE_NAME,
-                    )
-                };
+                let ok = unsafe { EnumDisplayDevicesW(PCWSTR::null(), index, &raw mut device, 0) };
                 if !ok.as_bool() {
                     break;
                 }
@@ -761,7 +776,10 @@ mod tests {
         let monitor = display.plug_monitor(DisplayMode::new(1920, 1080, 60)?)?;
         sleep(Duration::from_secs(3)); // let Windows attach the monitor
         let after = attached_display_count();
-        assert!(after > before, "expected a new display device after plug-in");
+        assert!(
+            after > before,
+            "expected a new display device after plug-in"
+        );
 
         monitor.unplug()?;
         VirtualDisplay::uninstall()?;
