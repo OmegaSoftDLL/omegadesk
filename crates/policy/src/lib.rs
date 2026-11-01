@@ -29,7 +29,8 @@ pub mod posture;
 pub mod rmm_policy;
 
 pub use hujson::{
-    AclRuleV2, CompiledFilterRule, FilterProto, HuJsonError, PolicyNode, PolicyV2, sanitize_hujson,
+    AclRuleV2, CompiledFilterRule, FilterProto, HuJsonError, PolicyNode, PolicyV2, SshAclRule,
+    SshAction, sanitize_hujson,
 };
 pub use mfa::{
     BruteForceGuard, ConnectionMfaChallenge, FederatedIdentityClaim, IdentityProviderKind,
