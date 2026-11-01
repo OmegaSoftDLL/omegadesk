@@ -1659,6 +1659,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "omegadesk-mesh"
+version = "0.1.0"
+dependencies = [
+ "omegadesk-identity",
+ "omegadesk-tun",
+ "proptest",
+ "rand_core 0.6.4",
+ "ring",
+ "sha2",
+ "thiserror 2.0.21",
+ "x25519-dalek",
+ "zeroize",
+]
+
+[[package]]
+name = "omegadesk-noise"
+version = "0.1.0"
+dependencies = [
+ "omegadesk-identity",
+ "proptest",
+ "rand_core 0.6.4",
+ "ring",
+ "sha2",
+ "thiserror 2.0.21",
+ "x25519-dalek",
+ "zeroize",
+]
+
+[[package]]
 name = "omegadesk-protocol"
 version = "0.1.0"
 dependencies = [
@@ -1668,6 +1697,40 @@ dependencies = [
  "prost-build",
  "protox",
  "thiserror 2.0.21",
+]
+
+[[package]]
+name = "omegadesk-relay"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "omegadesk-identity",
+ "ring",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "omegadesk-server"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "data-encoding",
+ "omegadesk-identity",
+ "omegadesk-mesh",
+ "omegadesk-noise",
+ "omegadesk-relay",
+ "omegadesk-tun",
+ "rand_core 0.6.4",
+ "sha2",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -1685,6 +1748,16 @@ dependencies = [
  "tokio",
  "tracing",
  "windows",
+]
+
+[[package]]
+name = "omegadesk-tun"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "proptest",
+ "thiserror 2.0.21",
+ "tokio",
 ]
 
 [[package]]
@@ -2689,6 +2762,7 @@ version = "1.54.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b52fd3255258d26fac7264ab5a76b53c13367136dc011d3d6ad4f8ed070396a3"
 dependencies = [
+ "bytes",
  "libc",
  "mio",
  "pin-project-lite",

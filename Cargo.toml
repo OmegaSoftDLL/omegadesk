@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/*", "agent", "client"]
+members = ["crates/*", "agent", "client", "relay", "server"]
 
 [workspace.package]
 version = "0.1.0"
@@ -17,6 +17,11 @@ omegadesk-capture = { path = "crates/capture" }
 omegadesk-codec = { path = "crates/codec" }
 omegadesk-input = { path = "crates/input" }
 omegadesk-transport = { path = "crates/transport" }
+omegadesk-noise = { path = "crates/noise" }
+omegadesk-tun = { path = "crates/tun" }
+omegadesk-mesh = { path = "crates/mesh" }
+omegadesk-relay = { path = "relay" }
+omegadesk-server = { path = "server" }
 
 anyhow = "1"
 bytes = "1"
@@ -31,12 +36,13 @@ proptest = "1"
 protox = "0.7"
 quinn = { version = "0.11", default-features = false, features = ["log", "runtime-tokio", "rustls-ring"] }
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring"] }
+ring = "0.17"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 softbuffer = "0.4"
 rand_core = { version = "0.6", features = ["getrandom"] }
 sha2 = "0.10"
 thiserror = "2"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 windows = "0.62"
