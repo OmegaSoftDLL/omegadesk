@@ -88,6 +88,13 @@ struct Args {
     /// Mesh mode only: never attempt direct paths, send everything via the relays.
     #[arg(long)]
     relay_only: bool,
+
+    /// File holding the agent's persistent device identity. Defaults to the
+    /// operating system credential store, falling back to
+    /// `<config>/omegadesk/agent.key` when that store is unavailable (SSH or
+    /// service sessions).
+    #[arg(long, env = "OMEGADESK_AGENT_KEY_FILE")]
+    key_file: Option<std::path::PathBuf>,
 }
 
 #[tokio::main]
@@ -108,8 +115,11 @@ async fn main() -> anyhow::Result<()> {
         None => password::generate(),
     };
     // Persistent device identity: keeps the same DeviceId across restarts.
-    let store =
-        omegadesk_identity::default_store("agent").context("failed to open device key store")?;
+    let (store, fallback) = omegadesk_identity::resolve_store("agent", args.key_file.as_deref())
+        .context("failed to open device key store")?;
+    if let Some(note) = fallback {
+        warn!("{note}");
+    }
     let identity = omegadesk_identity::DeviceIdentity::load_or_create(store.as_ref())
         .context("failed to load or create device identity")?;
     info!("device ID: {}", identity.id());

@@ -56,6 +56,12 @@ struct Args {
     #[arg(long)]
     relay_only: bool,
 
+    /// File holding the client's persistent device identity. Defaults to the
+    /// operating system credential store, falling back to
+    /// `<config>/omegadesk/client.key` when that store is unavailable.
+    #[arg(long, env = "OMEGADESK_CLIENT_KEY_FILE")]
+    key_file: Option<std::path::PathBuf>,
+
     /// Access password printed by the agent on startup.
     #[arg(long, env = "OMEGADESK_PASSWORD")]
     password: String,
@@ -79,8 +85,11 @@ fn main() -> anyhow::Result<()> {
     let event_loop = EventLoop::<window::UserEvent>::with_user_event()
         .build()
         .context("failed to create window event loop")?;
-    let store =
-        omegadesk_identity::default_store("client").context("failed to open device key store")?;
+    let (store, fallback) = omegadesk_identity::resolve_store("client", args.key_file.as_deref())
+        .context("failed to open device key store")?;
+    if let Some(note) = fallback {
+        tracing::warn!("{note}");
+    }
     let identity = omegadesk_identity::DeviceIdentity::load_or_create(store.as_ref())
         .context("failed to load or create device identity")?;
     tracing::info!("device ID: {}", identity.id());
