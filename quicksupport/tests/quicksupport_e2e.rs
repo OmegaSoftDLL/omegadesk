@@ -355,17 +355,17 @@ async fn host_checks_the_password_then_asks_for_consent() {
     assert_eq!(asked.len(), 1);
     assert_eq!(asked[0].device_name, "tech-client");
     assert!(asked[0].device_id.is_some());
+    // The video stream is opened by the host once the session is accepted.
+    let _video = tokio::time::timeout(Duration::from_secs(10), connection.accept_uni())
+        .await
+        .expect("no video stream")
+        .unwrap();
     let catalog = tokio::time::timeout(Duration::from_secs(10), control_reader.next())
         .await
         .expect("display catalog timed out")
         .unwrap()
         .expect("host closed the control stream");
     assert!(matches!(catalog.payload, Some(Payload::DisplayList(_))));
-    // The video stream is opened by the host once the session is accepted.
-    let _video = tokio::time::timeout(Duration::from_secs(10), connection.accept_uni())
-        .await
-        .expect("no video stream")
-        .unwrap();
     connection.close(0u32.into(), b"done");
     let result = outcome(serving).await;
     assert!(
