@@ -1,7 +1,7 @@
 //! Session authorization beyond the access password: the coordinator's policy decision for
 //! the connecting peer, posture checks, per-connection TOTP step-up, DLP limits, `.odrec`
-//! recording and the audit stream. `session::handshake` calls [`AccessControl::authorize`]
-//! once; the returned [`SessionAccess`] is then consulted by the video and control loops.
+//! recording and the audit stream. `session::handshake` calls `AccessControl::authorize`
+//! once; the returned `SessionAccess` is then consulted by the video and control loops.
 //!
 //! Where the decision comes from: on the mesh the coordinator compiles the tenant's `HuJSON`
 //! policy per node and ships, inside the netmap, a [`SessionDecision`] for every peer that may
@@ -829,7 +829,7 @@ pub fn totp_uri(agent_name: &str, secret_base32: &str) -> String {
 ///
 /// # Errors
 ///
-/// Returns the I/O error produced by the writer.
+/// Returns the writer's I/O error.
 pub fn write_line(mut writer: impl Write, text: &str) -> std::io::Result<()> {
     writer.write_all(text.as_bytes())?;
     writer.write_all(b"\n")
@@ -945,6 +945,7 @@ mod tests {
     async fn connect_pair(
         access: Arc<AccessControl>,
         peer: PeerInfo,
+        password: &str,
     ) -> (
         SendStream,
         EnvelopeReader,
@@ -956,7 +957,7 @@ mod tests {
         let config = Arc::new(SessionConfig {
             name: "test-agent".to_owned(),
             device_public_key: DeviceIdentity::generate().public().signing_key_bytes(),
-            password: "correct-horse".to_owned(),
+            password: password.to_owned(),
             monitor: 0,
             encoder: EncoderChoice::Software,
             settings: EncoderSettings {
@@ -990,6 +991,7 @@ mod tests {
         let secret = fresh_secret();
         let access = access(&dir, Some(&secret));
         let client = DeviceIdentity::generate();
+        let password = random_hex(16);
         let decision = SessionDecision {
             allowed: true,
             require_mfa: true,
@@ -1006,9 +1008,9 @@ mod tests {
             },
         };
         let (mut send, mut recv, connection, agent) =
-            connect_pair(Arc::clone(&access), peer(&client, decision)).await;
+            connect_pair(Arc::clone(&access), peer(&client, decision), &password).await;
 
-        send_envelope(&mut send, &hello(&client, "correct-horse"))
+        send_envelope(&mut send, &hello(&client, &password))
             .await
             .unwrap();
         let Some(Envelope {
@@ -1127,11 +1129,16 @@ mod tests {
         let secret = fresh_secret();
         let access = access(&dir, Some(&secret));
         let client = DeviceIdentity::generate();
+        let password = random_hex(16);
 
         // Policy denies the session.
-        let (mut send, mut recv, conn, agent) =
-            connect_pair(Arc::clone(&access), peer(&client, SessionDecision::DENIED)).await;
-        send_envelope(&mut send, &hello(&client, "correct-horse"))
+        let (mut send, mut recv, conn, agent) = connect_pair(
+            Arc::clone(&access),
+            peer(&client, SessionDecision::DENIED),
+            &password,
+        )
+        .await;
+        send_envelope(&mut send, &hello(&client, &password))
             .await
             .unwrap();
         expect_error(&mut recv, &conn, ErrorCode::PolicyDenied).await;
@@ -1148,8 +1155,8 @@ mod tests {
                 min_version: (10, 0, 22_000),
             });
         let (mut send, mut recv, conn, agent) =
-            connect_pair(Arc::clone(&access), peer(&client, strict)).await;
-        send_envelope(&mut send, &hello(&client, "correct-horse"))
+            connect_pair(Arc::clone(&access), peer(&client, strict), &password).await;
+        send_envelope(&mut send, &hello(&client, &password))
             .await
             .unwrap();
         let message = expect_error(&mut recv, &conn, ErrorCode::PostureRejected).await;
@@ -1161,8 +1168,8 @@ mod tests {
         allow.allowed = true;
         let impostor = DeviceIdentity::generate();
         let (mut send, mut recv, conn, agent) =
-            connect_pair(Arc::clone(&access), peer(&client, allow.clone())).await;
-        send_envelope(&mut send, &hello(&impostor, "correct-horse"))
+            connect_pair(Arc::clone(&access), peer(&client, allow.clone()), &password).await;
+        send_envelope(&mut send, &hello(&impostor, &password))
             .await
             .unwrap();
         expect_error(&mut recv, &conn, ErrorCode::Unauthorized).await;
@@ -1176,10 +1183,11 @@ mod tests {
             let access = Arc::clone(&access);
             let client = &client;
             let mfa = mfa.clone();
+            let password = password.clone();
             async move {
                 let (mut send, mut recv, conn, agent) =
-                    connect_pair(access, peer(client, mfa)).await;
-                send_envelope(&mut send, &hello(client, "correct-horse"))
+                    connect_pair(access, peer(client, mfa), &password).await;
+                send_envelope(&mut send, &hello(client, &password))
                     .await
                     .unwrap();
                 for _ in 0..count {
@@ -1225,7 +1233,7 @@ mod tests {
         let peer = peer(&client, decision);
         let remote: SocketAddr = "127.0.0.1:4242".parse().unwrap();
         let mut streams = Loopback::open().await;
-        let Some(Payload::Hello(hello_msg)) = hello(&client, "x").payload else {
+        let Some(Payload::Hello(hello_msg)) = hello(&client, &random_hex(16)).payload else {
             unreachable!()
         };
         let session = access
