@@ -30,7 +30,7 @@ data-encoding = "2"
 ed25519-dalek = { version = "2", features = ["rand_core", "zeroize"] }
 keyring = { version = "3", features = ["apple-native", "windows-native"] }
 openh264 = "0.9"
-prost = "0.13"
+prost = "0.14"
 prost-build = "0.13"
 proptest = "1"
 protox = "0.7"
