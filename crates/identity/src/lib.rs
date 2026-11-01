@@ -23,7 +23,9 @@ use sha2::{Digest, Sha256};
 use x25519_dalek::{PublicKey as ExchangePublicKey, StaticSecret};
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
-pub use store::{FileStore, KeyStore, KeyringStore, MemoryStore, StoreError, default_store};
+pub use store::{
+    FileStore, KeyStore, KeyringStore, MemoryStore, StoreError, default_store, resolve_store,
+};
 pub use vault::{
     CredentialVault, EnvelopeRecord, PBKDF2_ITERATIONS, VAULT_KEY_LEN, VaultError,
     derive_master_kek,

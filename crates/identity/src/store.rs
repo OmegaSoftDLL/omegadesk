@@ -63,6 +63,37 @@ pub fn default_store(account: &str) -> Result<Box<dyn KeyStore>, StoreError> {
     }
 }
 
+/// Opens `path` when given, otherwise the [`default_store`]; when the OS
+/// credential store exists but cannot be used in this context (Windows
+/// Credential Manager returns `ERROR_NO_SUCH_LOGON_SESSION` inside SSH and
+/// service sessions, Keychain is locked on headless macOS) the identity falls
+/// back to `<config>/omegadesk/<account>.key` so the device keeps a stable ID.
+/// Returns the store and a note describing the fallback, if one happened.
+///
+/// # Errors
+///
+/// Returns an error if no store can be opened or read.
+pub fn resolve_store(
+    account: &str,
+    path: Option<&Path>,
+) -> Result<(Box<dyn KeyStore>, Option<String>), StoreError> {
+    if let Some(path) = path {
+        return Ok((Box::new(FileStore::new(path)), None));
+    }
+    let store = default_store(account)?;
+    match store.load() {
+        Ok(_) => Ok((store, None)),
+        Err(error) => {
+            let fallback = FileStore::in_config_dir(account)?;
+            let note = format!(
+                "OS credential store unavailable ({error}); using {}",
+                fallback.path().display()
+            );
+            Ok((Box::new(fallback), Some(note)))
+        }
+    }
+}
+
 /// Operating system credential store: Windows Credential Manager and macOS Keychain.
 #[derive(Debug)]
 pub struct KeyringStore {
@@ -194,6 +225,20 @@ impl KeyStore for MemoryStore {
 mod tests {
     use super::{FileStore, KeyStore};
     use crate::DeviceIdentity;
+
+    #[test]
+    fn explicit_key_file_bypasses_the_os_store() {
+        let directory =
+            std::env::temp_dir().join(format!("omegadesk-identity-resolve-{}", std::process::id()));
+        let path = directory.join("node.key");
+        let (store, note) = super::resolve_store("ignored", Some(&path)).unwrap();
+        assert!(note.is_none(), "an explicit file is not a fallback");
+        let first = DeviceIdentity::load_or_create(store.as_ref()).unwrap();
+        let (again, _) = super::resolve_store("ignored", Some(&path)).unwrap();
+        let second = DeviceIdentity::load_or_create(again.as_ref()).unwrap();
+        assert_eq!(first.id(), second.id());
+        let _ = std::fs::remove_dir_all(directory);
+    }
 
     #[test]
     fn file_store_round_trip() {
