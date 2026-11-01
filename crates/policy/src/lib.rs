@@ -26,6 +26,7 @@ pub mod hujson;
 pub mod mfa;
 pub mod pam;
 pub mod posture;
+pub mod rmm_policy;
 
 pub use hujson::{
     AclRuleV2, CompiledFilterRule, FilterProto, HuJsonError, PolicyNode, PolicyV2, sanitize_hujson,
@@ -41,6 +42,11 @@ pub use pam::{
 pub use posture::{
     DevicePostureReport, GeoLocationRule, Ipv4Cidr, NetworkRangeRule, OsFamily,
     OsVersionRequirement, PosturePolicy, PostureViolation, ProcessRequirement,
+};
+pub use rmm_policy::{
+    AlertRecord, AlertSeverity, AlertState, AlertTemplate, CheckEvaluationOutcome, CheckEvaluator,
+    CheckKind, EffectiveRmmPolicy, RmmCapabilityFlags, RmmCheck, RmmPolicyLayer, ScopedRmmRole,
+    TemplateAction, resolve_effective_rmm_policy,
 };
 
 /// Policy and authorization errors.
