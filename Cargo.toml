@@ -47,7 +47,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 windows = "0.62"
 winit = { version = "0.30", default-features = false, features = ["rwh_06", "x11", "wayland", "wayland-dlopen"] }
-x25519-dalek = { version = "2", features = ["static_secrets", "zeroize"] }
+x25519-dalek = { version = "3", features = ["static_secrets", "zeroize"] }
 zeroize = { version = "1", features = ["derive"] }
 
 [workspace.lints.rust]
