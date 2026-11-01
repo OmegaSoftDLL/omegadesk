@@ -188,6 +188,12 @@ pub async fn run(connection: Connection, config: Arc<SessionConfig>) -> anyhow::
     result
 }
 
+async fn open_video_stream(connection: &Connection) -> anyhow::Result<SendStream> {
+    let mut stream = connection.open_uni().await?;
+    stream.write(&[]).await?;
+    Ok(stream)
+}
+
 async fn serve(connection: &Connection, config: &Arc<SessionConfig>) -> anyhow::Result<()> {
     let (mut control_send, control_recv) = connection.accept_bi().await?;
     let mut control = EnvelopeReader::new(control_recv);
@@ -201,7 +207,7 @@ async fn serve(connection: &Connection, config: &Arc<SessionConfig>) -> anyhow::
     }
 
     // Dedicated unidirectional stream for video so large keyframes do not block control messages.
-    let mut video_send = connection.open_uni().await?;
+    let mut video_send = open_video_stream(connection).await?;
     let state = Arc::new(SessionState {
         keyframe_requested: AtomicBool::new(true),
         ..SessionState::default()
