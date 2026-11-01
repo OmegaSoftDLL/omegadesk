@@ -700,6 +700,41 @@ mod tests {
     }
 
     #[test]
+    fn derp_region_selector_picks_nearest_with_hysteretic_home_stickiness() {
+        let mut selector = DerpRegionSelector::new(vec![
+            DerpRegion {
+                region_id: 1,
+                region_code: "gru".to_owned(),
+                region_name: "Sao Paulo".to_owned(),
+                https_port: 443,
+                avoid: false,
+            },
+            DerpRegion {
+                region_id: 2,
+                region_code: "iad".to_owned(),
+                region_name: "Ashburn".to_owned(),
+                https_port: 443,
+                avoid: false,
+            },
+        ]);
+
+        // Initial probe: GRU is 40 ms, IAD is 110 ms -> GRU becomes preferred home region.
+        let mut rtts = HashMap::from([(1u16, 40u32), (2u16, 110u32)]);
+        assert_eq!(selector.pick_nearest_region(&rtts), Some(1));
+        assert_eq!(selector.preferred_region_id(), Some(1));
+
+        // Slight jitter: Region 2 drops to 32 ms (only 8 ms faster than GRU's 40 ms).
+        // Hysteresis (requires >= 15 ms improvement) keeps GRU as home region.
+        rtts.insert(2, 32);
+        assert_eq!(selector.pick_nearest_region(&rtts), Some(1));
+
+        // Major route change: Region 2 drops to 20 ms (20 ms faster than GRU's 40 ms) -> switches!
+        rtts.insert(2, 20);
+        assert_eq!(selector.pick_nearest_region(&rtts), Some(2));
+        assert_eq!(selector.preferred_region_id(), Some(2));
+    }
+
+    #[test]
     fn relay_frames_encode_and_decode_round_trip() {
         let frames = vec![
             RelayFrame::ServerKey {
@@ -731,5 +766,89 @@ mod tests {
             let decoded = RelayFrame::decode(&wire).unwrap();
             assert_eq!(decoded, frame);
         }
+    }
+}
+
+/// Minimum RTT improvement in milliseconds required to switch away from an established
+/// preferred ("home") relay region (`Tailscale` `net/netcheck/netcheck.go` hysteresis).
+pub const DERP_HOME_STICKINESS_MS: u32 = 15;
+
+/// Descriptor for a geographic relay region over HTTPS port 443 (`docs/plan.md` §2.2 line 40,
+/// modeled after `Tailscale` `tailcfg.DERPRegion`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DerpRegion {
+    /// Numeric region identifier (e.g., `1` for `"gru"`).
+    pub region_id: u16,
+    /// Short IATA-style code (e.g., `"gru"`, `"iad"`, `"fra"`).
+    pub region_code: String,
+    /// Human-readable geographic name.
+    pub region_name: String,
+    /// HTTPS relay port (defaults to `443`).
+    pub https_port: u16,
+    /// Whether this region is marked for drain/avoidance unless no other region responds.
+    pub avoid: bool,
+}
+
+/// Nearest-region selector with home-region hysteresis (`docs/plan.md` §2.2 line 40,
+/// modeled after `Tailscale` `net/netcheck`).
+#[derive(Debug, Clone, Default)]
+pub struct DerpRegionSelector {
+    regions: Vec<DerpRegion>,
+    preferred_region: Option<u16>,
+}
+
+impl DerpRegionSelector {
+    /// Creates a new [`DerpRegionSelector`] from the configured [`DerpRegion`] catalog.
+    #[must_use]
+    pub const fn new(regions: Vec<DerpRegion>) -> Self {
+        Self {
+            regions,
+            preferred_region: None,
+        }
+    }
+
+    /// Returns the currently selected preferred ("home") region ID, if any.
+    #[must_use]
+    pub const fn preferred_region_id(&self) -> Option<u16> {
+        self.preferred_region
+    }
+
+    /// Selects the lowest-latency relay region from `measured_rtts_ms` (`region_id -> rtt_ms`),
+    /// applying [`DERP_HOME_STICKINESS_MS`] hysteresis so a node does not flap between
+    /// regions on minor latency jitter before emitting [`RelayFrame::NotePreferred`].
+    pub fn pick_nearest_region(&mut self, measured_rtts_ms: &HashMap<u16, u32>) -> Option<u16> {
+        let best_candidate = self
+            .regions
+            .iter()
+            .filter(|r| !r.avoid)
+            .filter_map(|r| {
+                measured_rtts_ms
+                    .get(&r.region_id)
+                    .map(|&rtt| (r.region_id, rtt))
+            })
+            .min_by_key(|&(_, rtt)| rtt)
+            .or_else(|| {
+                self.regions
+                    .iter()
+                    .filter_map(|r| {
+                        measured_rtts_ms
+                            .get(&r.region_id)
+                            .map(|&rtt| (r.region_id, rtt))
+                    })
+                    .min_by_key(|&(_, rtt)| rtt)
+            });
+
+        let (candidate_id, candidate_rtt) = best_candidate?;
+
+        if let Some(current_id) = self.preferred_region
+            && current_id != candidate_id
+            && let Some(&current_rtt) = measured_rtts_ms.get(&current_id)
+            && current_rtt.saturating_sub(candidate_rtt) < DERP_HOME_STICKINESS_MS
+        {
+            return Some(current_id);
+        }
+
+        self.preferred_region = Some(candidate_id);
+        Some(candidate_id)
     }
 }

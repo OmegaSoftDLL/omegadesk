@@ -597,6 +597,117 @@ impl Coordinator {
     }
 }
 
+/// Named CIDR subnet carved out of the root `100.64.0.0/10` mesh space (`tonarino/innernet`
+/// hierarchical CIDR model, `docs/references.md` line 55).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CidrSubnet {
+    /// Human-readable CIDR block name (e.g., `"infra"`, `"developers"`, `"ci-runners"`).
+    pub name: String,
+    /// Network base address in host byte order.
+    pub network_u32: u32,
+    /// Prefix length (`10..=30`).
+    pub prefix_len: u8,
+    /// Next host offset to allocate within this subnet.
+    next_host_offset: u32,
+}
+
+impl CidrSubnet {
+    /// Returns the bitmask for `prefix_len`.
+    #[must_use]
+    pub const fn mask(prefix_len: u8) -> u32 {
+        if prefix_len == 0 {
+            0
+        } else {
+            !0u32 << (32 - prefix_len)
+        }
+    }
+
+    /// Returns `true` if `other_net / other_prefix` overlaps with `self`.
+    #[must_use]
+    pub const fn overlaps(&self, other_net: u32, other_prefix: u8) -> bool {
+        let min_prefix = if self.prefix_len < other_prefix {
+            self.prefix_len
+        } else {
+            other_prefix
+        };
+        let mask = Self::mask(min_prefix);
+        (self.network_u32 & mask) == (other_net & mask)
+    }
+}
+
+/// Hierarchical CIDR allocator modeled after `tonarino/innernet` (`docs/references.md` line 55),
+/// allowing operators to partition the root `100.64.0.0/10` CGNAT space into non-overlapping
+/// named subnets (`infra`, `prod`, `dev`) and allocate deterministic host IPv4 addresses.
+#[derive(Debug, Clone, Default)]
+pub struct HierarchicalCidrAllocator {
+    subnets: HashMap<String, CidrSubnet>,
+}
+
+impl HierarchicalCidrAllocator {
+    /// Root `100.64.0.0/10` network in host byte order.
+    pub const ROOT_NET_U32: u32 = u32::from_be_bytes([100, 64, 0, 0]);
+    /// Root prefix length (`/10`).
+    pub const ROOT_PREFIX_LEN: u8 = 10;
+
+    /// Creates an empty [`HierarchicalCidrAllocator`] rooted at `100.64.0.0/10`.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Carves a new non-overlapping child subnet `network/prefix_len` under the `100.64.0.0/10`
+    /// root block. Returns `false` if the block is outside `100.64.0.0/10`, has an invalid prefix,
+    /// or overlaps with an existing child CIDR.
+    pub fn create_subnet(
+        &mut self,
+        name: impl Into<String>,
+        network: Ipv4Addr,
+        prefix_len: u8,
+    ) -> bool {
+        if !(11..=30).contains(&prefix_len) {
+            return false;
+        }
+        let mask = CidrSubnet::mask(prefix_len);
+        let net_u32 = u32::from(network) & mask;
+        let root_mask = CidrSubnet::mask(Self::ROOT_PREFIX_LEN);
+        if (net_u32 & root_mask) != Self::ROOT_NET_U32 {
+            return false;
+        }
+        let name = name.into();
+        if self.subnets.contains_key(&name)
+            || self
+                .subnets
+                .values()
+                .any(|existing| existing.overlaps(net_u32, prefix_len))
+        {
+            return false;
+        }
+        self.subnets.insert(
+            name.clone(),
+            CidrSubnet {
+                name,
+                network_u32: net_u32,
+                prefix_len,
+                next_host_offset: 1,
+            },
+        );
+        true
+    }
+
+    /// Allocates the next available host [`Ipv4Addr`] inside the named child subnet.
+    pub fn allocate_host_ip(&mut self, subnet_name: &str) -> Option<Ipv4Addr> {
+        let subnet = self.subnets.get_mut(subnet_name)?;
+        let host_bits = 32 - subnet.prefix_len;
+        let max_host = (1u32 << host_bits) - 2; // exclude broadcast
+        if subnet.next_host_offset > max_host {
+            return None;
+        }
+        let ip = Ipv4Addr::from(subnet.network_u32 + subnet.next_host_offset);
+        subnet.next_host_offset += 1;
+        Some(ip)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::{Duration, Instant};
@@ -851,5 +962,29 @@ mod tests {
             }
         }
         assert!(upgraded);
+    }
+
+    #[test]
+    fn innernet_hierarchical_cidr_allocator_prevents_overlap() {
+        let mut tree = HierarchicalCidrAllocator::new();
+        assert!(tree.create_subnet("infra", Ipv4Addr::new(100, 64, 1, 0), 24));
+        assert!(tree.create_subnet("developers", Ipv4Addr::new(100, 64, 2, 0), 24));
+        // Overlapping 100.64.1.128/25 inside 100.64.1.0/24 must be rejected
+        assert!(!tree.create_subnet("overlap", Ipv4Addr::new(100, 64, 1, 128), 25));
+        // Outside 100.64.0.0/10 must be rejected
+        assert!(!tree.create_subnet("invalid", Ipv4Addr::new(192, 168, 1, 0), 24));
+
+        assert_eq!(
+            tree.allocate_host_ip("infra"),
+            Some(Ipv4Addr::new(100, 64, 1, 1))
+        );
+        assert_eq!(
+            tree.allocate_host_ip("infra"),
+            Some(Ipv4Addr::new(100, 64, 1, 2))
+        );
+        assert_eq!(
+            tree.allocate_host_ip("developers"),
+            Some(Ipv4Addr::new(100, 64, 2, 1))
+        );
     }
 }

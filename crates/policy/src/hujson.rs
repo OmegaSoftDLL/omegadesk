@@ -179,6 +179,34 @@ pub struct CompiledFilterRule {
     pub proto: FilterProto,
 }
 
+/// Action taken when a mesh SSH rule matches (`Tailscale` SSH & `Headscale` `policy/v2`,
+/// `docs/references.md` line 50).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SshAction {
+    /// Immediately authorize the mesh SSH session over the authenticated WireGuard identity.
+    Accept,
+    /// Require an interactive step-up identity check every `check_period_secs` seconds.
+    Check {
+        /// Re-authentication interval in seconds (default 12 hours = `43_200`).
+        check_period_secs: u64,
+    },
+}
+
+/// Mesh SSH authorization rule (`Tailscale` SSH `ssh` policy block, `docs/references.md` line 50).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SshAclRule {
+    /// Action (`Accept` vs `Check`).
+    pub action: SshAction,
+    /// Source identity selectors (`"group:ops"`, `"autogroup:member"`, user email).
+    pub sources: Vec<String>,
+    /// Destination node selectors (`"tag:prod"`, `"autogroup:self"`).
+    pub destinations: Vec<String>,
+    /// Target OS usernames allowed on the destination host (`"root"`, `"ubuntu"`, `"autogroup:nonroot"`).
+    pub users: Vec<String>,
+    /// Whether the SSH terminal session must be recorded to an `.odrec` / `.cast` audit log.
+    pub record_session: bool,
+}
+
 /// Declarative `policy/v2` structure ported from `Headscale/hscontrol/policy/v2/policy.go`.
 #[derive(Debug, Clone, Default)]
 pub struct PolicyV2 {
@@ -190,6 +218,8 @@ pub struct PolicyV2 {
     pub hosts: HashMap<String, IpAddr>,
     /// Ordered ACL grant rules.
     pub acls: Vec<AclRuleV2>,
+    /// Ordered Mesh SSH authorization rules (`Tailscale` SSH).
+    pub ssh: Vec<SshAclRule>,
 }
 
 impl PolicyV2 {
@@ -278,6 +308,62 @@ impl PolicyV2 {
         }
 
         Ok(compiled)
+    }
+
+    /// Evaluates `Tailscale`-style Mesh SSH rules (`self.ssh`) for an SSH connection from
+    /// `source_node` to `target_node` requesting OS login as `ssh_user` (`docs/references.md` line 50).
+    ///
+    /// Returns `Ok(Some((action, record_session)))` if a rule permits the login, or `Ok(None)`
+    /// if no rule matches.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HuJsonError`] if a rule references an undefined group.
+    pub fn evaluate_ssh_access(
+        &self,
+        source_node: &PolicyNode,
+        target_node: &PolicyNode,
+        ssh_user: &str,
+    ) -> Result<Option<(SshAction, bool)>, HuJsonError> {
+        for rule in &self.ssh {
+            let user_ok = rule.users.iter().any(|u| {
+                u == "*"
+                    || u == ssh_user
+                    || (u == "autogroup:nonroot" && ssh_user != "root" && !ssh_user.is_empty())
+            });
+            if !user_ok {
+                continue;
+            }
+
+            let mut dst_matches = false;
+            let mut is_self_rule = false;
+            for dst_sel in &rule.destinations {
+                let allow_self = dst_sel == "autogroup:self";
+                if self.node_matches_selector(target_node, dst_sel, allow_self)? {
+                    dst_matches = true;
+                    is_self_rule |= allow_self;
+                    break;
+                }
+            }
+            if !dst_matches {
+                continue;
+            }
+
+            if is_self_rule
+                && (!source_node.tags.is_empty()
+                    || !target_node.tags.is_empty()
+                    || source_node.user != target_node.user)
+            {
+                continue;
+            }
+
+            for src_sel in &rule.sources {
+                if self.node_matches_selector(source_node, src_sel, false)? {
+                    return Ok(Some((rule.action, rule.record_session)));
+                }
+            }
+        }
+        Ok(None)
     }
 
     fn node_matches_selector(
@@ -453,6 +539,30 @@ mod tests {
         assert_eq!(
             rules[0].src_ips,
             vec![IpAddr::V4(Ipv4Addr::new(100, 64, 0, 1))]
+        );
+
+        // Tailscale Mesh SSH rule evaluation (`Check` mode + session recording)
+        policy.ssh.push(SshAclRule {
+            action: SshAction::Check {
+                check_period_secs: 43_200,
+            },
+            sources: vec!["group:ops".to_owned()],
+            destinations: vec!["tag:prod".to_owned()],
+            users: vec!["autogroup:nonroot".to_owned(), "root".to_owned()],
+            record_session: true,
+        });
+
+        let ssh_decision = policy
+            .evaluate_ssh_access(&alice_laptop, &prod_srv, "ubuntu")
+            .unwrap();
+        assert_eq!(
+            ssh_decision,
+            Some((
+                SshAction::Check {
+                    check_period_secs: 43_200
+                },
+                true
+            ))
         );
     }
 }

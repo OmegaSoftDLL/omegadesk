@@ -13,9 +13,160 @@
 //!   requiring a central coordinator.
 
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::time::{Duration, Instant};
 
 use omegadesk_identity::{DeviceId, DeviceIdentity, DevicePublic, IdentityError};
+
+/// Default inactivity timeout before an on-demand (`lazyconn`) peer tunnel is put back
+/// to sleep (`NetBird` `client/internal/lazyconn/inactivity`, 15 minutes).
+pub const DEFAULT_LAZY_CONN_INACTIVITY_THRESHOLD: Duration = Duration::from_secs(15 * 60);
+
+/// Per-peer state in [`LazyConnManager`] (`docs/plan.md` §2.2 line 43, modeled after
+/// `NetBird` `client/internal/lazyconn/manager/manager.go`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LazyPeerState {
+    /// Tunnel is idle/sleeping with only an activity watcher armed.
+    Sleeping,
+    /// Outbound traffic or HA-group activation woke the peer; tunnel is active.
+    Active {
+        /// Timestamp of the most recent packet activity on this peer tunnel.
+        last_activity: Instant,
+    },
+    /// Peer is excluded from lazy connection management and maintains a permanent tunnel.
+    ExcludedPermanent,
+}
+
+/// On-demand (`lazyconn`) peer tunnel lifecycle manager (`docs/plan.md` §2.2 line 43,
+/// ported from `NetBird` `client/internal/lazyconn/manager/manager.go`).
+///
+/// Keeps mesh peer tunnels in [`LazyPeerState::Sleeping`] until outbound packets target
+/// the peer (or a co-member of its High-Availability route group wakes up), and transitions
+/// idle tunnels back to [`LazyPeerState::Sleeping`] once `inactivity_threshold` elapses.
+#[derive(Debug, Clone)]
+pub struct LazyConnManager {
+    inactivity_threshold: Duration,
+    peers: HashMap<DeviceId, LazyPeerState>,
+    ha_groups: HashMap<String, Vec<DeviceId>>,
+}
+
+impl LazyConnManager {
+    /// Creates a new [`LazyConnManager`] with the given `inactivity_threshold`.
+    #[must_use]
+    pub fn new(inactivity_threshold: Duration) -> Self {
+        Self {
+            inactivity_threshold: inactivity_threshold.max(Duration::from_secs(1)),
+            peers: HashMap::new(),
+            ha_groups: HashMap::new(),
+        }
+    }
+
+    /// Registers a managed peer in [`LazyPeerState::Sleeping`] (unless already excluded).
+    pub fn register_lazy_peer(&mut self, peer: DeviceId) {
+        self.peers.entry(peer).or_insert(LazyPeerState::Sleeping);
+    }
+
+    /// Updates the set of peers excluded from lazy connection management (permanent tunnels),
+    /// matching `NetBird` `Manager.ExcludePeer`.
+    pub fn set_excluded_peers(&mut self, excluded: &HashSet<DeviceId>, now: Instant) {
+        for (&peer, state) in &mut self.peers {
+            if excluded.contains(&peer) {
+                *state = LazyPeerState::ExcludedPermanent;
+            } else if *state == LazyPeerState::ExcludedPermanent {
+                *state = LazyPeerState::Active { last_activity: now };
+            }
+        }
+        for &peer in excluded {
+            self.peers.insert(peer, LazyPeerState::ExcludedPermanent);
+        }
+    }
+
+    /// Registers a High-Availability (`HA`) route group so waking any peer in `group_id`
+    /// simultaneously activates all peers in the group (`NetBird` `UpdateRouteHAMap`).
+    pub fn set_ha_group(&mut self, group_id: impl Into<String>, members: Vec<DeviceId>) {
+        self.ha_groups.insert(group_id.into(), members);
+    }
+
+    /// Records packet activity for `peer` at `now`, waking `peer` (and any co-members of its
+    /// HA groups) from [`LazyPeerState::Sleeping`] to [`LazyPeerState::Active`].
+    ///
+    /// Returns the list of peers that transitioned from `Sleeping` to `Active`.
+    pub fn on_peer_activity(&mut self, peer: DeviceId, now: Instant) -> Vec<DeviceId> {
+        let mut woken = Vec::new();
+        let mut targets = vec![peer];
+        for members in self.ha_groups.values() {
+            if members.contains(&peer) {
+                for &m in members {
+                    if !targets.contains(&m) {
+                        targets.push(m);
+                    }
+                }
+            }
+        }
+
+        for target in targets {
+            match self.peers.get_mut(&target) {
+                Some(LazyPeerState::ExcludedPermanent) => {}
+                Some(state @ LazyPeerState::Sleeping) => {
+                    *state = LazyPeerState::Active { last_activity: now };
+                    woken.push(target);
+                }
+                Some(LazyPeerState::Active { last_activity }) => {
+                    *last_activity = now;
+                }
+                None => {
+                    self.peers
+                        .insert(target, LazyPeerState::Active { last_activity: now });
+                    woken.push(target);
+                }
+            }
+        }
+        woken
+    }
+
+    /// Evaluates inactivity timeouts at `now`, putting any [`LazyPeerState::Active`] peer
+    /// back to [`LazyPeerState::Sleeping`] if neither it nor any peer in its HA group has
+    /// had activity within `inactivity_threshold`.
+    pub fn expire_inactive_peers(&mut self, now: Instant) -> Vec<DeviceId> {
+        let threshold = self.inactivity_threshold;
+        let is_recently_active =
+            |peer_id: DeviceId, map: &HashMap<DeviceId, LazyPeerState>| match map.get(&peer_id) {
+                Some(LazyPeerState::ExcludedPermanent) => true,
+                Some(LazyPeerState::Active { last_activity }) => {
+                    now.saturating_duration_since(*last_activity) < threshold
+                }
+                Some(LazyPeerState::Sleeping) | None => false,
+            };
+
+        let mut to_sleep = Vec::new();
+        for (&peer, &state) in &self.peers {
+            if let LazyPeerState::Active { last_activity } = state
+                && now.saturating_duration_since(last_activity) >= threshold
+            {
+                let kept_awake_by_ha = self.ha_groups.values().any(|members| {
+                    members.contains(&peer)
+                        && members
+                            .iter()
+                            .any(|&m| m != peer && is_recently_active(m, &self.peers))
+                });
+                if !kept_awake_by_ha {
+                    to_sleep.push(peer);
+                }
+            }
+        }
+
+        for &peer in &to_sleep {
+            self.peers.insert(peer, LazyPeerState::Sleeping);
+        }
+        to_sleep
+    }
+
+    /// Returns the current [`LazyPeerState`] of `peer`.
+    #[must_use]
+    pub fn peer_state(&self, peer: DeviceId) -> Option<LazyPeerState> {
+        self.peers.get(&peer).copied()
+    }
+}
 
 /// Certificate signed by a tenant authority binding a node's [`DeviceId`], groups, and
 /// peer-relay capability (`Nebula` model, `docs/plan.md` §2.2 line 44).
@@ -273,5 +424,44 @@ mod tests {
         assert_eq!(route.next_hop, node_b_relay);
         assert_eq!(route.hops, vec![node_b_relay, node_c]);
         assert_eq!(route.total_rtt_ms, 35);
+    }
+
+    #[test]
+    fn netbird_lazyconn_wakes_ha_group_and_sleeps_after_inactivity() {
+        let t0 = Instant::now();
+        let peer_a = DeviceIdentity::generate().id();
+        let peer_b = DeviceIdentity::generate().id();
+        let peer_permanent = DeviceIdentity::generate().id();
+
+        let mut lazy = LazyConnManager::new(Duration::from_secs(60));
+        lazy.register_lazy_peer(peer_a);
+        lazy.register_lazy_peer(peer_b);
+        lazy.set_ha_group("ha-exit-1", vec![peer_a, peer_b]);
+        lazy.set_excluded_peers(&HashSet::from([peer_permanent]), t0);
+
+        assert_eq!(lazy.peer_state(peer_a), Some(LazyPeerState::Sleeping));
+        assert_eq!(
+            lazy.peer_state(peer_permanent),
+            Some(LazyPeerState::ExcludedPermanent)
+        );
+
+        // Outbound packet to peer_a wakes both peer_a and HA-group partner peer_b.
+        let woken = lazy.on_peer_activity(peer_a, t0);
+        assert_eq!(woken.len(), 2);
+        assert!(matches!(
+            lazy.peer_state(peer_b),
+            Some(LazyPeerState::Active { .. })
+        ));
+
+        // After 70 seconds of silence, both peer_a and peer_b go back to sleep, while
+        // peer_permanent stays ExcludedPermanent.
+        let slept = lazy.expire_inactive_peers(t0 + Duration::from_secs(70));
+        assert_eq!(slept.len(), 2);
+        assert_eq!(lazy.peer_state(peer_a), Some(LazyPeerState::Sleeping));
+        assert_eq!(lazy.peer_state(peer_b), Some(LazyPeerState::Sleeping));
+        assert_eq!(
+            lazy.peer_state(peer_permanent),
+            Some(LazyPeerState::ExcludedPermanent)
+        );
     }
 }
