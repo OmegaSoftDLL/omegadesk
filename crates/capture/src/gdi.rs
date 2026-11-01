@@ -8,6 +8,12 @@
 //!   top-down 32-bit BGRA scanlines via `GetDIBits` (`biHeight = -height`).
 //! - Used automatically by [`super::open_display`] when DXGI Desktop Duplication
 //!   is unavailable (e.g., nested RDP sessions, Hyper-V basic video, or headless GPUs).
+//!
+//! Differences from RustDesk: GDI has no change notification, so a static
+//! desktop is polled at most every [`crate::POLL_INTERVAL`] (paced across calls by
+//! [`crate::PollPacer`]) within the timeout given by the caller instead of spinning
+//! on `BitBlt`, and the bitmap is deselected from the memory DC before
+//! `GetDIBits`, as the Win32 contract requires.
 
 #![allow(
     unsafe_code,
@@ -15,7 +21,6 @@
 )]
 
 use std::mem::size_of;
-use std::ptr::null_mut;
 use std::time::{Duration, Instant};
 
 use windows::Win32::Graphics::Gdi::{
@@ -27,7 +32,7 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::core::PCWSTR;
 
-use crate::{CaptureError, Capturer, DisplayBounds, Frame};
+use crate::{CaptureError, Capturer, DisplayBounds, Frame, PollAction, PollPacer};
 
 const BYTES_PER_PIXEL: usize = 4;
 
@@ -40,6 +45,7 @@ pub struct GdiCapturer {
     old_obj: HGDIOBJ,
     bounds: DisplayBounds,
     last_frame: Vec<u8>,
+    pacer: PollPacer,
 }
 
 // SAFETY: Each `GdiCapturer` owns its private GDI device contexts (`screen_dc`, `mem_dc`)
@@ -122,12 +128,44 @@ impl GdiCapturer {
             old_obj,
             bounds,
             last_frame: Vec::new(),
+            pacer: PollPacer::new(),
         })
     }
 }
 
 impl Capturer for GdiCapturer {
-    fn next_frame(&mut self, _timeout: Duration) -> Result<Option<Frame>, CaptureError> {
+    fn next_frame(&mut self, timeout: Duration) -> Result<Option<Frame>, CaptureError> {
+        let deadline = Instant::now() + timeout;
+        let mut polled = false;
+        loop {
+            let now = Instant::now();
+            match self.pacer.plan(now, deadline, polled) {
+                PollAction::Capture => {
+                    self.pacer.mark_polled(now);
+                    polled = true;
+                    if let Some(frame) = self.capture_once()? {
+                        return Ok(Some(frame));
+                    }
+                }
+                PollAction::Wait(wait) => std::thread::sleep(wait),
+                PollAction::Timeout => return Ok(None),
+            }
+        }
+    }
+
+    fn size(&self) -> (u32, u32) {
+        (self.bounds.width, self.bounds.height)
+    }
+
+    fn bounds(&self) -> DisplayBounds {
+        self.bounds
+    }
+}
+
+impl GdiCapturer {
+    /// Copies the desktop once and returns `Ok(None)` when it is identical to
+    /// the previous copy.
+    fn capture_once(&mut self) -> Result<Option<Frame>, CaptureError> {
         let width_i32 =
             i32::try_from(self.bounds.width).map_err(|_| CaptureError::Os("bad width".into()))?;
         let height_i32 =
@@ -179,8 +217,15 @@ impl Capturer for GdiCapturer {
             bmiColors: [RGBQUAD::default()],
         };
 
+        // `GetDIBits` requires that the bitmap is not selected into a device
+        // context, so restore the original object around the call and select
+        // the capture bitmap back for the next `BitBlt`.
+        // SAFETY: `mem_dc` and `old_obj` are the handles paired in `open`.
+        unsafe {
+            let _ = SelectObject(self.mem_dc, self.old_obj);
+        }
         // SAFETY: `bgra` is allocated with `byte_len` bytes matching `bmiHeader`, and
-        // `self.mem_dc`/`self.bitmap` are valid GDI handles.
+        // `self.mem_dc`/`self.bitmap` are valid GDI handles with the bitmap unselected.
         let lines = unsafe {
             GetDIBits(
                 self.mem_dc,
@@ -192,6 +237,13 @@ impl Capturer for GdiCapturer {
                 DIB_RGB_COLORS,
             )
         };
+        // SAFETY: `mem_dc` and `bitmap` are valid handles owned by `self`.
+        let reselected = unsafe { SelectObject(self.mem_dc, self.bitmap.into()) };
+        if reselected.is_invalid() {
+            return Err(CaptureError::Os(
+                "SelectObject failed after GetDIBits".into(),
+            ));
+        }
         if lines == 0 {
             return Err(CaptureError::Os("GetDIBits returned 0 scanlines".into()));
         }
@@ -208,14 +260,6 @@ impl Capturer for GdiCapturer {
             captured_at: Instant::now(),
             gpu_texture: None,
         }))
-    }
-
-    fn size(&self) -> (u32, u32) {
-        (self.bounds.width, self.bounds.height)
-    }
-
-    fn bounds(&self) -> DisplayBounds {
-        self.bounds
     }
 }
 
@@ -287,7 +331,6 @@ fn query_monitor(target_index: u32) -> Result<([u16; 32], DisplayBounds), Captur
         // SAFETY: `Anonymous1.Anonymous2.dmPosition` is valid for display devices returned by
         // `EnumDisplaySettingsExW`.
         let pos = unsafe { dm.Anonymous1.Anonymous2.dmPosition };
-        let _ = null_mut::<u8>();
         return Ok((
             dd.DeviceName,
             DisplayBounds {

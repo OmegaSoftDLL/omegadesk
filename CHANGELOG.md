@@ -28,8 +28,15 @@ All notable changes to OmegaDesk are documented here. The format follows [Keep a
 - The build plan (`docs/plan.md`) and the README no longer mark Phases 2–7 as done. The 2026-11-01 audit found that the crates added for those phases are not used by any binary, that 78 Copilot Code Review findings on PRs #17–#24 were merged without a fix, and that several claims (IronRDP, IddCx driver, MCP server, Linux/macOS capture, SSO/WebAuthn) describe data types rather than working features. Each item now carries an honest status and its known defects.
 - `release-plz.toml` covers every workspace crate, so the lockstep version applies to the crates added for Phases 2–7.
 
+### Removed
+
+- `client/src/pacer.rs`, a frame pacer that was never called (`#[allow(dead_code)]`); the client bounds latency with its 3-frame decode queue and latest-frame presentation.
+
 ### Fixed
 
+- GDI capture fallback no longer busy-polls a static desktop: it honors the timeout given by the caller, polls `BitBlt` at 30 Hz, and deselects the bitmap before `GetDIBits` as Win32 requires.
+- GDI capture is tried when DXGI reports no output for the requested display, so GDI-only displays (basic display adapter, nested RDP) can be shared.
+- HDR FP16 tone mapping uses the exact sRGB transfer function instead of a 1/2.2 gamma that lifted dark pixels.
 - Horizontal mouse wheel direction in the Windows client (`winit` sign inversion relative to `MOUSEEVENTF_HWHEEL`).
 - Keys and mouse buttons no longer stay pressed on the remote machine when the session drops or the client loses focus.
 - The agent never re-sends an old screen image after losing access to the display (lock screen, UAC).

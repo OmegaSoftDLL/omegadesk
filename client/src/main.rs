@@ -11,8 +11,6 @@
 
 mod keymap;
 mod network;
-#[allow(dead_code)]
-mod pacer;
 mod stats;
 mod win_hook;
 mod window;

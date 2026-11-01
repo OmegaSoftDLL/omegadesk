@@ -128,12 +128,17 @@ pub fn open_display(index: u32) -> Result<Box<dyn Capturer>, CaptureError> {
         if !service_desktop::input_desktop_selected() {
             let _ = service_desktop::select_input_desktop();
         }
+        // `DisplayNotFound` from DXGI only means that no DXGI output with that
+        // index is attached to the desktop; GDI-only displays (basic display
+        // adapter, nested RDP sessions, some virtual machines) still exist for
+        // `EnumDisplayDevicesW`, so the fallback is tried for every DXGI error
+        // (matching RustDesk `libs/scrap/src/dxgi/mod.rs` `CapturerGDI` fallback).
         match dxgi::DxgiCapturer::open(index) {
             Ok(capturer) => Ok(Box::new(capturer)),
-            Err(CaptureError::DisplayNotFound(missing)) => {
-                Err(CaptureError::DisplayNotFound(missing))
-            }
-            Err(_dxgi_err) => Ok(Box::new(gdi::GdiCapturer::open(index)?)),
+            Err(dxgi_error) => match gdi::GdiCapturer::open(index) {
+                Ok(capturer) => Ok(Box::new(capturer)),
+                Err(gdi_error) => Err(resolve_fallback_error(index, &dxgi_error, &gdi_error)),
+            },
         }
     }
     #[cfg(not(windows))]
@@ -190,10 +195,12 @@ pub fn tone_map_hdr_fp16_to_bgra8(rgba_fp16_le: &[u8], sdr_white_nits: f32) -> V
         let b_lin = f16_to_f32(u16::from_le_bytes([px[4], px[5]])).max(0.0) * white_scale;
         let a_lin = f16_to_f32(u16::from_le_bytes([px[6], px[7]])).clamp(0.0, 1.0);
 
-        // Reinhard luminance-preserving tone map + linear-to-sRGB transfer function (gamma ~1/2.2).
+        // Reinhard tone map followed by the exact sRGB transfer function
+        // (IEC 61966-2-1: linear segment below 0.0031308, offset 1/2.4 power
+        // curve above it), so dark pixels are not lifted by a plain gamma.
         let map_channel = |c: f32| -> u8 {
             let mapped = c / (1.0 + c);
-            let srgb = mapped.powf(1.0 / 2.2).clamp(0.0, 1.0);
+            let srgb = linear_to_srgb(mapped).clamp(0.0, 1.0);
             #[allow(
                 clippy::cast_possible_truncation,
                 clippy::cast_sign_loss,
@@ -220,9 +227,176 @@ pub fn tone_map_hdr_fp16_to_bgra8(rgba_fp16_le: &[u8], sdr_white_nits: f32) -> V
     bgra
 }
 
+/// Chooses the error reported when both the DXGI and the GDI backends failed
+/// to open display `index`: the display is only "not found" when both backends
+/// agree; otherwise both failures are kept so the actionable one is not hidden.
+#[must_use]
+pub fn resolve_fallback_error(
+    index: u32,
+    dxgi_error: &CaptureError,
+    gdi_error: &CaptureError,
+) -> CaptureError {
+    match (dxgi_error, gdi_error) {
+        (CaptureError::DisplayNotFound(_), CaptureError::DisplayNotFound(_)) => {
+            CaptureError::DisplayNotFound(index)
+        }
+        _ => CaptureError::Os(format!(
+            "display {index}: DXGI failed ({dxgi_error}); GDI failed ({gdi_error})"
+        )),
+    }
+}
+
+/// Paces polling backends that cannot signal screen changes (GDI `BitBlt`):
+/// at most one capture per [`POLL_INTERVAL`], across calls, while never
+/// exceeding the timeout the caller gave to one `next_frame` call.
+#[derive(Debug, Default)]
+pub struct PollPacer {
+    next_poll_at: Option<Instant>,
+}
+
+/// Minimum interval between two polls of a change-blind capture backend (30 Hz).
+pub const POLL_INTERVAL: Duration = Duration::from_millis(33);
+
+/// What a polling backend should do next (see [`PollPacer::plan`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PollAction {
+    /// Capture the screen now.
+    Capture,
+    /// Sleep for this long, then call [`PollPacer::plan`] again.
+    Wait(Duration),
+    /// The call's timeout is exhausted: return `None` to the caller.
+    Timeout,
+}
+
+impl PollPacer {
+    /// Creates a pacer that allows an immediate first poll.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Decides the next step at `now` for a call whose budget ends at
+    /// `deadline`; `polled_this_call` tells whether this call already captured once.
+    #[must_use]
+    pub fn plan(&self, now: Instant, deadline: Instant, polled_this_call: bool) -> PollAction {
+        if let Some(next) = self.next_poll_at
+            && now < next
+        {
+            if now >= deadline {
+                return PollAction::Timeout;
+            }
+            return PollAction::Wait(next.min(deadline).saturating_duration_since(now));
+        }
+        if polled_this_call && now >= deadline {
+            return PollAction::Timeout;
+        }
+        PollAction::Capture
+    }
+
+    /// Records that a poll happened at `now`.
+    pub fn mark_polled(&mut self, now: Instant) {
+        self.next_poll_at = Some(now + POLL_INTERVAL);
+    }
+}
+
+/// Exact sRGB electro-optical transfer function inverse (IEC 61966-2-1):
+/// `12.92 * c` for `c <= 0.0031308`, otherwise `1.055 * c^(1/2.4) - 0.055`.
+#[must_use]
+pub fn linear_to_srgb(linear: f32) -> f32 {
+    let c = linear.max(0.0);
+    if c <= 0.003_130_8 {
+        12.92 * c
+    } else {
+        1.055 * c.powf(1.0 / 2.4) - 0.055
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fallback_error_keeps_the_actionable_backend_failure() {
+        let both_missing = resolve_fallback_error(
+            2,
+            &CaptureError::DisplayNotFound(2),
+            &CaptureError::DisplayNotFound(2),
+        );
+        assert!(matches!(both_missing, CaptureError::DisplayNotFound(2)));
+
+        let gdi_failed = resolve_fallback_error(
+            0,
+            &CaptureError::DisplayNotFound(0),
+            &CaptureError::Os("CreateDCW failed for display".into()),
+        );
+        let text = gdi_failed.to_string();
+        assert!(text.contains("CreateDCW failed"), "{text}");
+        assert!(text.contains("DXGI failed"), "{text}");
+    }
+
+    #[test]
+    fn poll_pacer_limits_polls_to_30_hz_and_honors_the_call_timeout() {
+        let t0 = Instant::now();
+        let mut pacer = PollPacer::new();
+        let deadline = t0 + Duration::from_millis(100);
+
+        // First poll is immediate; an unchanged screen then waits one interval.
+        assert_eq!(pacer.plan(t0, deadline, false), PollAction::Capture);
+        pacer.mark_polled(t0);
+        assert_eq!(
+            pacer.plan(t0, deadline, true),
+            PollAction::Wait(POLL_INTERVAL)
+        );
+        // After the interval the next poll is allowed, still inside the budget.
+        let t1 = t0 + POLL_INTERVAL;
+        assert_eq!(pacer.plan(t1, deadline, true), PollAction::Capture);
+        pacer.mark_polled(t1);
+        // A late poll inside the budget is allowed once the interval elapsed...
+        let t2 = t0 + Duration::from_millis(90);
+        assert_eq!(pacer.plan(t2, deadline, true), PollAction::Capture);
+        pacer.mark_polled(t2);
+        // ...but the following wait never extends past the deadline...
+        assert_eq!(
+            pacer.plan(t2, deadline, true),
+            PollAction::Wait(Duration::from_millis(10))
+        );
+        // ...and once the deadline passes the call returns without another capture.
+        assert_eq!(pacer.plan(deadline, deadline, true), PollAction::Timeout);
+
+        // A new call right after the deadline must not poll before the interval
+        // elapsed, so two back-to-back calls cannot exceed 30 Hz.
+        let next_deadline = deadline + Duration::from_millis(100);
+        assert_eq!(
+            pacer.plan(deadline, next_deadline, false),
+            PollAction::Wait(t2 + POLL_INTERVAL - deadline)
+        );
+        assert_eq!(
+            pacer.plan(t2 + POLL_INTERVAL, next_deadline, false),
+            PollAction::Capture
+        );
+
+        // A zero timeout still polls exactly once when the interval allows it.
+        let mut fresh = PollPacer::new();
+        assert_eq!(fresh.plan(t0, t0, false), PollAction::Capture);
+        fresh.mark_polled(t0);
+        assert_eq!(fresh.plan(t0, t0, true), PollAction::Timeout);
+    }
+
+    #[test]
+    fn srgb_transfer_keeps_dark_pixels_dark() {
+        // FP16 0x1400 = 2^-10 (about 0.00098 linear): the sRGB linear segment
+        // encodes it as 3/255, where a 1/2.2 gamma would have produced 11/255.
+        let mut raw = Vec::new();
+        for _ in 0..3 {
+            raw.extend_from_slice(&0x1400u16.to_le_bytes());
+        }
+        raw.extend_from_slice(&0x3C00u16.to_le_bytes());
+        let bgra = tone_map_hdr_fp16_to_bgra8(&raw, 80.0);
+        assert_eq!(&bgra[..3], &[3, 3, 3]);
+        assert_eq!(linear_to_srgb(0.0), 0.0);
+        assert!((linear_to_srgb(1.0) - 1.0).abs() < 1e-6);
+        assert!((linear_to_srgb(0.5) - 0.735_357).abs() < 1e-5);
+    }
 
     #[test]
     fn hdr_fp16_scrgb_tone_maps_to_bgra8() {
