@@ -1,0 +1,183 @@
+name: Release
+
+# Automated release pipeline (modeled after Devolutions/IronRDP and EasyTier):
+# 1. On pushes to `main`, `release-plz` updates or opens a release PR with
+#    `git-cliff` changelog notes (`cliff.toml`), and creates the `v*` GitHub
+#    Release once a release PR is merged.
+# 2. When a `v*` release is published (or manually dispatched with a tag),
+#    multiplatform archives of `omegadesk-agent` and `omegadesk-client` with
+#    `.sha256` sidecars are built on Windows, Linux, and macOS and attached to
+#    the GitHub Release.
+on:
+  push:
+    branches: [main]
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release tag to build and attach binaries for (e.g. v0.1.0)"
+        required: false
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: release-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  release-plz:
+    name: Release PR and tag (release-plz)
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install
+
+      - name: Install release-plz and git-cliff
+        uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
+        with:
+          tool: release-plz,git-cliff
+
+      - name: Run release-plz
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          release-plz release-pr --git-token "$GITHUB_TOKEN"
+          release-plz release --git-token "$GITHUB_TOKEN"
+
+  build-binaries:
+    name: Build binaries (${{ matrix.os_arch }})
+    if: >-
+      github.event_name == 'release' ||
+      (github.event_name == 'workflow_dispatch' && inputs.tag != '')
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            os_arch: windows-x86_64
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            os_arch: linux-x86_64
+          - runner: macos-latest
+            target: aarch64-apple-darwin
+            os_arch: macos-aarch64
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.release.tag_name || inputs.tag }}
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          rustup toolchain install
+          rustup target add "$TARGET"
+        shell: bash
+
+      - name: Build release binaries
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          cargo build --locked --release --target "$TARGET" -p omegadesk-agent -p omegadesk-client
+        shell: bash
+
+      - name: Package release archive
+        env:
+          TAG_NAME: ${{ github.event.release.tag_name || inputs.tag }}
+          TARGET: ${{ matrix.target }}
+          OS_ARCH: ${{ matrix.os_arch }}
+          RUNNER_OS_NAME: ${{ runner.os }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$TAG_NAME" =~ ^[A-Za-z0-9._-]+$ ]]; then
+            echo "::error::invalid tag name"
+            exit 1
+          fi
+          ext=""
+          if [[ "$RUNNER_OS_NAME" == "Windows" ]]; then
+            ext=".exe"
+          fi
+          mkdir -p release-assets stage
+          cp "target/${TARGET}/release/omegadesk-agent${ext}" "stage/omegadesk-agent${ext}"
+          cp "target/${TARGET}/release/omegadesk-client${ext}" "stage/omegadesk-client${ext}"
+          cp LICENSE README.md stage/
+          archive="omegadesk-${TAG_NAME}-${OS_ARCH}.tar.gz"
+          tar -C stage -czf "release-assets/${archive}" \
+            "omegadesk-agent${ext}" \
+            "omegadesk-client${ext}" \
+            LICENSE \
+            README.md
+          (
+            cd release-assets
+            if command -v sha256sum >/dev/null 2>&1; then
+              sha256sum "$archive" > "${archive}.sha256"
+            else
+              shasum -a 256 "$archive" > "${archive}.sha256"
+            fi
+          )
+        shell: bash
+
+      - name: Upload release asset artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-assets-${{ matrix.os_arch }}
+          path: release-assets/*
+          if-no-files-found: error
+          retention-days: 1
+          overwrite: true
+
+  publish-binaries:
+    name: Attach binaries to GitHub Release
+    needs: [build-binaries]
+    if: >-
+      always() &&
+      needs.build-binaries.result == 'success' &&
+      (github.event_name == 'release' ||
+       (github.event_name == 'workflow_dispatch' && inputs.tag != ''))
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download release assets
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: release-assets-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Upload assets to GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG_NAME: ${{ github.event.release.tag_name || inputs.tag }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$TAG_NAME" =~ ^[A-Za-z0-9._-]+$ ]]; then
+            echo "::error::invalid tag name"
+            exit 1
+          fi
+          gh release upload "$TAG_NAME" release-assets/* --clobber
