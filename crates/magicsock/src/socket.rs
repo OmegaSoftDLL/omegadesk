@@ -11,7 +11,7 @@ use std::task::{Context, Poll};
 use std::time::Instant;
 
 use omegadesk_control::PeerInfo;
-use omegadesk_identity::DeviceId;
+use omegadesk_identity::{DeviceId, QuickSupportId};
 use omegadesk_mesh::{ConnectionPath, MeshError, MeshEvent, MeshNode, Transmit, TransmitTarget};
 use omegadesk_relay::RelayFrame;
 use omegadesk_tun::IpPacket;
@@ -194,6 +194,16 @@ impl MagicSocket {
             .peers
             .values()
             .find(|p| p.fqdn == wanted || p.hostname == wanted)
+            .cloned()
+    }
+
+    /// Peer that currently holds the QuickSupport ID `id`, if the netmap knows one.
+    #[must_use]
+    pub fn resolve_quicksupport(&self, id: QuickSupportId) -> Option<PeerInfo> {
+        self.lock()
+            .peers
+            .values()
+            .find(|p| p.quicksupport_id == Some(id))
             .cloned()
     }
 
@@ -724,6 +734,7 @@ mod tests {
             endpoints: vec![],
             tags: vec![],
             ephemeral: true,
+            quicksupport_id: None,
         }
     }
 

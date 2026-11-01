@@ -1,11 +1,14 @@
 //! Remote access session handling: handshake, video streaming, and control messages.
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use anyhow::bail;
 use omegadesk_codec::EncoderSettings;
+use omegadesk_identity::DeviceId;
 use omegadesk_input::{InputInjector, TargetDisplay};
 use omegadesk_protocol::v1::{
     Capabilities, Envelope, Error as ProtocolError, ErrorCode, HelloAck, Pong, VideoCodec,
@@ -38,17 +41,49 @@ mod close_code {
     pub(super) const REJECTED: u32 = 1;
 }
 
+/// What the connecting client declared about itself in `Hello`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerDescriptor {
+    /// Display name the client chose (`Hello.device_name`).
+    pub device_name: String,
+    /// Device identifier derived from the client's signing key, when the key
+    /// was well formed.
+    pub device_id: Option<DeviceId>,
+}
+
+/// Decides, once the client's access password has been verified and a codec
+/// negotiated, whether the session may start. The agent runs without a gate;
+/// QuickSupport plugs its remote-user consent prompt in here, so the end user
+/// is only asked about technicians who already know the temporary password.
+pub trait SessionGate: Send + Sync + std::fmt::Debug {
+    /// Returns `Err(reason)` to reject the session; `reason` is sent to the
+    /// client in the `Error` message.
+    fn authorize<'a>(
+        &'a self,
+        peer: &'a PeerDescriptor,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
+}
+
 /// Session configuration derived from CLI arguments.
 #[derive(Debug, Clone)]
-pub(crate) struct SessionConfig {
-    pub(crate) name: String,
+pub struct SessionConfig {
+    /// Machine name sent to the client in `HelloAck`.
+    pub name: String,
     /// Ed25519 signing public key of this device, sent in `HelloAck`.
-    pub(crate) device_public_key: [u8; 32],
-    pub(crate) password: String,
-    pub(crate) monitor: u32,
-    pub(crate) encoder: EncoderChoice,
-    pub(crate) settings: EncoderSettings,
-    pub(crate) input: bool,
+    pub device_public_key: [u8; 32],
+    /// Access password the client must present in `Hello`.
+    pub password: String,
+    /// Monitor index to share (`0` is the primary monitor).
+    pub monitor: u32,
+    /// Video encoder selection policy.
+    pub encoder: EncoderChoice,
+    /// Bitrate and frame-rate cap of the video encoder.
+    pub settings: EncoderSettings,
+    /// Whether remote keyboard and mouse events are injected.
+    pub input: bool,
+    /// Consulted after the password check and before `HelloAck`; `None` admits
+    /// every authenticated client.
+    pub gate: Option<Arc<dyn SessionGate>>,
 }
 
 /// Shared state between the blocking capture thread and the async control task.
@@ -70,7 +105,13 @@ impl SessionState {
 }
 
 /// Serves a single client connection from handshake to teardown.
-pub(crate) async fn run(connection: Connection, config: Arc<SessionConfig>) -> anyhow::Result<()> {
+///
+/// # Errors
+///
+/// Returns an error when the handshake fails (a wrong password is reported as
+/// [`crate::password::Rejected`], reachable through `downcast_ref`) or the
+/// session ends abnormally.
+pub async fn run(connection: Connection, config: Arc<SessionConfig>) -> anyhow::Result<()> {
     let result = serve(&connection, &config).await;
     let reason: &[u8] = if result.is_ok() { b"done" } else { b"error" };
     connection.close(close_code::NORMAL.into(), reason);
@@ -185,7 +226,7 @@ async fn handshake(
     if !crate::password::matches(&config.password, &hello.access_password) {
         tokio::time::sleep(WRONG_PASSWORD_DELAY).await;
         reject(control_send, ErrorCode::Unauthorized, "invalid password").await;
-        bail!("invalid access password");
+        return Err(crate::password::Rejected.into());
     }
     let client_decoders: Vec<VideoCodec> = hello
         .capabilities
@@ -201,6 +242,18 @@ async fn handshake(
         .await;
         bail!("no common video codec with client");
     };
+    if let Some(gate) = &config.gate {
+        let peer = PeerDescriptor {
+            device_name: hello.device_name.clone(),
+            device_id: <[u8; 32]>::try_from(hello.device_public_key.as_ref())
+                .ok()
+                .map(|key| DeviceId::from_signing_key(&key)),
+        };
+        if let Err(reason) = gate.authorize(&peer).await {
+            reject(control_send, ErrorCode::Unauthorized, &reason).await;
+            bail!("session declined: {reason}");
+        }
+    }
     info!(
         "client {:?} ({}) authorized, using {codec:?}",
         hello.device_name,

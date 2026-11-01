@@ -11,6 +11,7 @@
 //! [`DeviceId`] is derived from the signing public key, so it cannot be forged
 //! without possessing the corresponding private key.
 
+mod quicksupport_id;
 mod store;
 pub mod vault;
 
@@ -23,6 +24,7 @@ use sha2::{Digest, Sha256};
 use x25519_dalek::{PublicKey as ExchangePublicKey, StaticSecret};
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
+pub use quicksupport_id::{InvalidQuickSupportId, QUICKSUPPORT_ID_SPACE, QuickSupportId};
 pub use store::{
     FileStore, KeyStore, KeyringStore, MemoryStore, StoreError, default_store, resolve_store,
 };

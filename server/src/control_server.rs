@@ -30,7 +30,10 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
-use crate::{Coordinator, CoordinatorError, EnrollmentBundle, NetmapDelta, parse_endpoints};
+use crate::{
+    Coordinator, CoordinatorError, EnrollmentBundle, NetmapDelta, parse_endpoints,
+    parse_quicksupport_id,
+};
 
 /// Prologue mixed into every control-channel Noise handshake.
 pub const CONTROL_PROLOGUE: &[u8] = b"omegadesk-control-v1";
@@ -195,37 +198,48 @@ fn enroll(
             ),
         )));
     }
+    let to_error = |error: CoordinatorError| {
+        let code = match error {
+            CoordinatorError::MalformedPreAuthKey
+            | CoordinatorError::InvalidPreAuthKey
+            | CoordinatorError::PreAuthKeyAlreadyUsed
+            | CoordinatorError::PreAuthKeyExpired => control::ControlErrorCode::InvalidPreauthKey,
+            CoordinatorError::MalformedControlMessage(_) => {
+                control::ControlErrorCode::MalformedRequest
+            }
+            CoordinatorError::InvalidAclTag(_)
+            | CoordinatorError::UnknownNode(_)
+            | CoordinatorError::AddressPoolExhausted
+            | CoordinatorError::QuickSupportIdUnavailable => control::ControlErrorCode::Internal,
+        };
+        Box::new(error_envelope(code, error.to_string()))
+    };
+    let quicksupport = parse_quicksupport_id(&request.quicksupport_id).map_err(to_error)?;
     let mut guard = coordinator.lock().map_err(|_| {
         Box::new(error_envelope(
             control::ControlErrorCode::Internal,
             "coordinator unavailable",
         ))
     })?;
-    guard
-        .enroll_machine(
+    let endpoints = parse_endpoints(&request.endpoints);
+    match quicksupport {
+        Some(proposed) => guard.enroll_quicksupport(
             &request.preauth_key,
             peer,
             &request.hostname,
-            parse_endpoints(&request.endpoints),
+            endpoints,
+            proposed,
             unix_now(),
-        )
-        .map_err(|error| {
-            let code = match error {
-                CoordinatorError::MalformedPreAuthKey
-                | CoordinatorError::InvalidPreAuthKey
-                | CoordinatorError::PreAuthKeyAlreadyUsed
-                | CoordinatorError::PreAuthKeyExpired => {
-                    control::ControlErrorCode::InvalidPreauthKey
-                }
-                CoordinatorError::InvalidAclTag(_)
-                | CoordinatorError::UnknownNode(_)
-                | CoordinatorError::AddressPoolExhausted
-                | CoordinatorError::MalformedControlMessage(_) => {
-                    control::ControlErrorCode::Internal
-                }
-            };
-            Box::new(error_envelope(code, error.to_string()))
-        })
+        ),
+        None => guard.enroll_machine(
+            &request.preauth_key,
+            peer,
+            &request.hostname,
+            endpoints,
+            unix_now(),
+        ),
+    }
+    .map_err(to_error)
 }
 
 /// Serves one node connection from handshake to disconnect.
@@ -345,6 +359,30 @@ async fn serve_node(
                 let reply = envelope(control::control_envelope::Payload::Keepalive(keepalive));
                 outbound.send(reply).await?;
             }
+            Some(control::control_envelope::Payload::QuickSupportLookupRequest(request)) => {
+                // A malformed or unknown ID is answered with an empty response
+                // (not an error, which would end the control session).
+                let node = match request.quicksupport_id.parse() {
+                    Ok(id) => {
+                        let guard = coordinator
+                            .lock()
+                            .map_err(|_| anyhow::anyhow!("coordinator mutex poisoned"))?;
+                        guard
+                            .lookup_quicksupport(node_id, id)?
+                            .map(crate::NodeRecord::to_proto)
+                    }
+                    Err(_) => None,
+                };
+                let reply = envelope(
+                    control::control_envelope::Payload::QuickSupportLookupResponse(
+                        control::QuickSupportLookupResponse {
+                            quicksupport_id: request.quicksupport_id,
+                            node,
+                        },
+                    ),
+                );
+                outbound.send(reply).await?;
+            }
             Some(control::control_envelope::Payload::Error(error)) => {
                 anyhow::bail!("node reported error: {}", error.message);
             }
@@ -352,7 +390,8 @@ async fn serve_node(
                 control::control_envelope::Payload::EnrollRequest(_)
                 | control::control_envelope::Payload::EnrollResponse(_)
                 | control::control_envelope::Payload::NetmapBatch(_)
-                | control::control_envelope::Payload::RelayTicketResponse(_),
+                | control::control_envelope::Payload::RelayTicketResponse(_)
+                | control::control_envelope::Payload::QuickSupportLookupResponse(_),
             )
             | None => {}
         }
@@ -397,6 +436,7 @@ mod tests {
             endpoints: vec![],
             tags: vec![],
             ephemeral: false,
+            quicksupport_id: None,
         }
     }
 

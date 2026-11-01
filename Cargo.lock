@@ -1765,6 +1765,7 @@ dependencies = [
  "omegadesk-service",
  "omegadesk-transport",
  "rand_core 0.6.4",
+ "thiserror 2.0.21",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -1943,9 +1944,19 @@ name = "omegadesk-quicksupport"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "clap",
+ "omegadesk-agent",
+ "omegadesk-codec",
+ "omegadesk-control",
  "omegadesk-identity",
+ "omegadesk-magicsock",
+ "omegadesk-protocol",
+ "omegadesk-relay",
+ "omegadesk-server",
+ "omegadesk-transport",
  "rand_core 0.6.4",
  "thiserror 2.0.21",
+ "tokio",
  "tracing",
  "tracing-subscriber",
 ]

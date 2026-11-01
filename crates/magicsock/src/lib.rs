@@ -43,7 +43,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use omegadesk_control::{ControlClient, ControlConfig, ControlError, Enrollment, PeerInfo};
-use omegadesk_identity::{DeviceId, DeviceIdentity};
+use omegadesk_identity::{DeviceId, DeviceIdentity, QuickSupportId};
 use omegadesk_mesh::{ConnectionPath, MeshNode};
 use omegadesk_relay::RelayError;
 use omegadesk_transport::identity_tls::{
@@ -127,6 +127,7 @@ impl NodeConfig {
 pub struct Node {
     socket: Arc<MagicSocket>,
     endpoint: quinn::Endpoint,
+    control: Arc<control_link::SharedControl>,
     tasks: Vec<tokio::task::JoinHandle<()>>,
 }
 
@@ -164,11 +165,16 @@ impl Node {
         info!(
             fqdn = %self_node.fqdn,
             ipv4 = %self_node.ipv4,
+            quicksupport_id = ?self_node.quicksupport_id,
             peers = peers.len(),
             total_peers,
             relays = relays.len(),
             "enrolled in the mesh"
         );
+        // Re-enrollments propose the ID that was actually assigned.
+        if control_config.quicksupport_id.is_some() {
+            control_config.quicksupport_id = self_node.quicksupport_id;
+        }
 
         let stun_servers = if config.relay_only {
             Vec::new()
@@ -237,6 +243,7 @@ impl Node {
         Ok(Self {
             socket,
             endpoint,
+            control: control_link,
             tasks,
         })
     }
@@ -246,6 +253,14 @@ impl Node {
     #[must_use]
     pub fn self_info(&self) -> PeerInfo {
         self.socket.self_info()
+    }
+
+    /// The QuickSupport ID this node currently holds, if it enrolled as a
+    /// QuickSupport host. It can change after a coordinator reconnect when
+    /// another host took the number in the meantime.
+    #[must_use]
+    pub fn quicksupport_id(&self) -> Option<QuickSupportId> {
+        self.socket.self_info().quicksupport_id
     }
 
     /// Virtual address of this node on the mesh (`<mesh IPv4>:7070`).
@@ -306,6 +321,16 @@ impl Node {
         let peer = self
             .resolve(target)
             .ok_or_else(|| NodeError::UnknownPeer(target.to_owned()))?;
+        self.connect_peer(&peer).await
+    }
+
+    /// Opens a QUIC connection to `peer`, accepting only a certificate carrying
+    /// that peer's identity key.
+    ///
+    /// # Errors
+    ///
+    /// Returns the TLS configuration or QUIC error that aborted the connection.
+    pub async fn connect_peer(&self, peer: &PeerInfo) -> Result<quinn::Connection, NodeError> {
         let mut client_config = identity_client_config(peer.public.signing_key_bytes())?;
         client_config.transport_config(Arc::new(mesh_transport_config()));
         let addr = SocketAddr::new(IpAddr::V4(peer.ipv4), MESH_PORT);
@@ -313,6 +338,47 @@ impl Node {
             .endpoint
             .connect_with(client_config, addr, MESH_SERVER_NAME)?;
         Ok(connecting.await?)
+    }
+
+    /// Resolves the QuickSupport ID a technician typed: first in the local
+    /// netmap, then by asking the coordinator (the host may have enrolled a
+    /// moment ago and its `PeerUpserted` delta not arrived yet). A peer learned
+    /// from the coordinator is added to the netmap so [`Self::connect_peer`]
+    /// can reach it. `Ok(None)` when no host of this tenant holds the ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NodeError::Control`] if the coordinator is unreachable.
+    pub async fn lookup_quicksupport(
+        &self,
+        id: QuickSupportId,
+    ) -> Result<Option<PeerInfo>, NodeError> {
+        if let Some(peer) = self.socket.resolve_quicksupport(id) {
+            return Ok(Some(peer));
+        }
+        let handle = self.control.current().ok_or(ControlError::Closed)?;
+        let peer = handle.lookup_quicksupport(id).await?;
+        if let Some(peer) = &peer {
+            self.socket.upsert_peer(peer.clone());
+        }
+        Ok(peer)
+    }
+
+    /// Resolves a QuickSupport ID and connects to the host that holds it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NodeError::UnknownPeer`] when no host of this tenant holds
+    /// `id`, or the error that aborted the lookup or the connection.
+    pub async fn connect_quicksupport(
+        &self,
+        id: QuickSupportId,
+    ) -> Result<quinn::Connection, NodeError> {
+        let peer = self
+            .lookup_quicksupport(id)
+            .await?
+            .ok_or_else(|| NodeError::UnknownPeer(id.to_string()))?;
+        self.connect_peer(&peer).await
     }
 
     /// Stops every background task and closes the endpoint.

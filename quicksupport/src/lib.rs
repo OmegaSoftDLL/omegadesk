@@ -1,6 +1,7 @@
 //! QuickSupport single-executable core: 9-digit formatted ID, brute-force-resistant
 //! temporary password rotation, per-client permission flags, and layered remote-user
-//! consent.
+//! consent. With the `host` feature (on by default) the [`host`] module adds the
+//! mesh node and the session loop that the `omegadesk-quicksupport` binary runs.
 //!
 //! Reference implementations:
 //! - `ClassicOldSong_Apollo/src/crypto.h` (`enum class PERM: uint32_t` with 3 8-bit
@@ -10,11 +11,17 @@
 //!   `consentTimeout = 30`, `consentAutoAccept*`, and 5-minute `server_check_consentTimer`).
 //! - `rustdesk_rustdesk/src/server/connection.rs` (`check_update_temporary_password`
 //!   with `MAX_CONSECUTIVE_FAILURES = 10` automatic rotation).
+//! - `rustdesk_rustdesk/src/rendezvous_mediator.rs` and
+//!   `rustdesk_rustdesk-server/src/rendezvous_server.rs` (the node proposes its ID,
+//!   the server owns the registry; see [`omegadesk_identity::QuickSupportId`]).
+
+#[cfg(feature = "host")]
+pub mod host;
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use omegadesk_identity::DeviceId;
+use omegadesk_identity::{DeviceId, QuickSupportId};
 use rand_core::{OsRng, RngCore};
 use thiserror::Error;
 
@@ -167,18 +174,13 @@ impl Default for ClientPermissions {
     }
 }
 
-/// Formats a [`DeviceId`] as a human-friendly 9-digit QuickSupport ID (`NNN-NNN-NNN`).
+/// Formats the 9-digit QuickSupport ID a device proposes for itself
+/// (`NNN NNN NNN`). The coordinator may assign a different number when this
+/// one is taken; once enrolled, show the assigned one (`host::QuickSupportHost::id`)
+/// rather than this proposal.
 #[must_use]
 pub fn format_quicksupport_id(device_id: DeviceId) -> String {
-    let raw = device_id.as_bytes();
-    let prefix = u64::from_be_bytes([
-        raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7],
-    ]);
-    let numeric = prefix % 1_000_000_000;
-    let part1 = numeric / 1_000_000;
-    let part2 = (numeric / 1_000) % 1_000;
-    let part3 = numeric % 1_000;
-    format!("{part1:03}-{part2:03}-{part3:03}")
+    QuickSupportId::proposed_for(device_id).to_string()
 }
 
 /// Brute-force-resistant temporary password manager ported from
@@ -234,14 +236,29 @@ impl TemporaryPasswordGuard {
     /// Returns [`QuickSupportError::InvalidPassword`] when `candidate` does not match.
     pub fn verify(&mut self, candidate: &str) -> Result<(), QuickSupportError> {
         if !self.password.is_empty() && constant_time_matches(&self.password, candidate) {
-            self.consecutive_failures = 0;
+            self.record_success();
             return Ok(());
         }
+        self.record_failure();
+        Err(QuickSupportError::InvalidPassword)
+    }
+
+    /// Records a failed attempt verified elsewhere (the agent session handshake
+    /// compares the password itself and reports `password::Rejected`). Returns
+    /// `true` when this failure reached [`MAX_CONSECUTIVE_FAILURES`] and the
+    /// password was rotated, so the caller can show the new one.
+    pub fn record_failure(&mut self) -> bool {
         self.consecutive_failures = self.consecutive_failures.saturating_add(1);
         if self.consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
             self.rotate();
+            return true;
         }
-        Err(QuickSupportError::InvalidPassword)
+        false
+    }
+
+    /// Records a successful attempt verified elsewhere, resetting the failure counter.
+    pub const fn record_success(&mut self) {
+        self.consecutive_failures = 0;
     }
 
     fn generate_password(length: usize) -> String {
@@ -533,9 +550,28 @@ mod tests {
     fn formats_nine_digit_quicksupport_id() {
         let id = format_quicksupport_id(DeviceId::from_signing_key(&[0x42; 32]));
         assert_eq!(id.len(), 11);
-        assert_eq!(&id[3..4], "-");
-        assert_eq!(&id[7..8], "-");
-        assert!(id.chars().filter(|c| *c != '-').all(|c| c.is_ascii_digit()));
+        assert_eq!(&id[3..4], " ");
+        assert_eq!(&id[7..8], " ");
+        assert!(id.chars().filter(|c| *c != ' ').all(|c| c.is_ascii_digit()));
+        assert!(QuickSupportId::looks_like(&id));
+    }
+
+    #[test]
+    fn externally_verified_failures_rotate_after_ten_and_successes_reset() {
+        let mut guard = TemporaryPasswordGuard::new(6);
+        let initial = guard.password().to_owned();
+        for _ in 0..(MAX_CONSECUTIVE_FAILURES - 1) {
+            assert!(!guard.record_failure());
+        }
+        guard.record_success();
+        assert_eq!(guard.consecutive_failures(), 0);
+        assert_eq!(guard.password(), initial, "a success resets the count");
+        for _ in 0..(MAX_CONSECUTIVE_FAILURES - 1) {
+            assert!(!guard.record_failure());
+        }
+        assert!(guard.record_failure(), "the tenth failure rotates");
+        assert_ne!(guard.password(), initial);
+        assert_eq!(guard.consecutive_failures(), 0);
     }
 
     #[test]

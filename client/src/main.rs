@@ -9,6 +9,10 @@
 //! # Mesh (Phase 2): the agent's name, through the coordinator and relays.
 //! omegadesk-client office-pc.omega --server coord.example:8080 --server-key <128 hex> \
 //!     --preauth-key odk_... --password <password>
+//!
+//! # QuickSupport (Phase 3): the nine-digit ID the end user read aloud.
+//! omegadesk-client 123 456 789 --server coord.example:8080 --server-key <128 hex> \
+//!     --preauth-key odk_... --password <temporary password>
 //! ```
 //!
 //! The window title bar displays a live latency breakdown: host processing,
@@ -26,15 +30,18 @@ use std::sync::Arc;
 use anyhow::Context;
 use clap::Parser;
 use omegadesk_control::{ControlConfig, parse_server_key};
+use omegadesk_identity::QuickSupportId;
 use omegadesk_magicsock::NodeConfig;
 use winit::event_loop::EventLoop;
 
 #[derive(Debug, Parser)]
 #[command(version, about = "OmegaDesk remote desktop client")]
 struct Args {
-    /// Agent to connect to: `ip:port` on the local network, or the agent's
-    /// mesh name (`office-pc`, `office-pc.omega`) or mesh address with `--server`.
-    target: String,
+    /// Agent to connect to: `ip:port` on the local network; with `--server`,
+    /// the agent's mesh name (`office-pc`, `office-pc.omega`), its mesh address,
+    /// or a nine-digit QuickSupport ID (`123456789`, `123 456 789`, `123-456-789`).
+    #[arg(required = true, num_args = 1.., value_name = "TARGET")]
+    target: Vec<String>,
 
     /// Certificate fingerprint printed by the agent on startup (local network only).
     #[arg(long, required_unless_present = "server")]
@@ -94,6 +101,7 @@ fn main() -> anyhow::Result<()> {
         .context("failed to load or create device identity")?;
     tracing::info!("device ID: {}", identity.id());
     let device_public_key = identity.public().signing_key_bytes();
+    let target = args.target.join(" ");
     let route = if let (Some(server), Some(server_key), Some(preauth_key)) =
         (&args.server, &args.server_key, &args.preauth_key)
     {
@@ -105,17 +113,17 @@ fn main() -> anyhow::Result<()> {
                 preauth_key: preauth_key.clone(),
                 hostname: client_hostname(),
                 endpoints: Vec::new(),
+                quicksupport_id: None,
             });
             node_config.relay_only = args.relay_only;
             network::Route::Mesh(Box::new(network::MeshRoute {
                 identity: Arc::new(identity),
                 node_config,
-                name: args.target.clone(),
+                target: mesh_target(&target)?,
             }))
         }
     } else {
-        let address: SocketAddr = args
-            .target
+        let address: SocketAddr = target
             .parse()
             .context("without --server the target must be an `ip:port` address")?;
         network::Route::Lan {
@@ -139,6 +147,21 @@ fn main() -> anyhow::Result<()> {
     app.into_result()
 }
 
+/// Interprets the positional target in mesh mode: nine digits (with or
+/// without spaces or dashes) are a QuickSupport ID, anything else a name or
+/// mesh address. Several words that are not an ID are a usage error.
+fn mesh_target(target: &str) -> anyhow::Result<network::MeshTarget> {
+    if let Ok(id) = target.parse::<QuickSupportId>() {
+        return Ok(network::MeshTarget::QuickSupport(id));
+    }
+    if target.contains(char::is_whitespace) {
+        anyhow::bail!(
+            "`{target}` is neither a nine-digit QuickSupport ID nor a single mesh name or address"
+        );
+    }
+    Ok(network::MeshTarget::Name(target.to_owned()))
+}
+
 /// Name this client enrolls under: `<machine name>-client`, or `omegadesk-client`.
 fn client_hostname() -> String {
     std::env::var("COMPUTERNAME")
@@ -147,4 +170,35 @@ fn client_hostname() -> String {
             |_| "omegadesk-client".to_owned(),
             |name| format!("{name}-client"),
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mesh_target_tells_ids_from_names() {
+        let id: QuickSupportId = "123456789".parse().unwrap();
+        for spelling in ["123456789", "123 456 789", "123-456-789"] {
+            assert_eq!(
+                mesh_target(spelling).unwrap(),
+                network::MeshTarget::QuickSupport(id),
+                "{spelling}"
+            );
+        }
+        assert_eq!(
+            mesh_target("office-pc.omega").unwrap(),
+            network::MeshTarget::Name("office-pc.omega".to_owned())
+        );
+        assert_eq!(
+            mesh_target("100.64.0.7").unwrap(),
+            network::MeshTarget::Name("100.64.0.7".to_owned())
+        );
+        // Eight digits are not an ID, and two words are not a name.
+        assert_eq!(
+            mesh_target("12345678").unwrap(),
+            network::MeshTarget::Name("12345678".to_owned())
+        );
+        assert!(mesh_target("office pc").is_err());
+    }
 }

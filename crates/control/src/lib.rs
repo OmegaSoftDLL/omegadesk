@@ -13,7 +13,7 @@ use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
-use omegadesk_identity::{DeviceId, DeviceIdentity, DevicePublic, IdentityError};
+use omegadesk_identity::{DeviceId, DeviceIdentity, DevicePublic, IdentityError, QuickSupportId};
 use omegadesk_noise::{
     InitiatorHandshake, MAX_FRAME_CIPHERTEXT_LEN, NoiseError, NoiseReceiver, NoiseSender,
 };
@@ -127,6 +127,9 @@ pub struct PeerInfo {
     pub tags: Vec<String>,
     /// Whether the peer is removed when it disconnects.
     pub ephemeral: bool,
+    /// Nine-digit QuickSupport ID assigned by the coordinator; `None` for
+    /// agents and clients.
+    pub quicksupport_id: Option<QuickSupportId>,
 }
 
 impl PeerInfo {
@@ -168,6 +171,15 @@ impl PeerInfo {
             endpoints: parse_endpoints(&info.endpoints),
             tags: info.tags.clone(),
             ephemeral: info.ephemeral,
+            quicksupport_id: if info.quicksupport_id.is_empty() {
+                None
+            } else {
+                Some(
+                    info.quicksupport_id
+                        .parse()
+                        .map_err(|_| ControlError::Malformed("quicksupport id"))?,
+                )
+            },
         })
     }
 }
@@ -269,11 +281,20 @@ pub struct ControlConfig {
     pub hostname: String,
     /// Direct UDP endpoints known at startup.
     pub endpoints: Vec<SocketAddr>,
+    /// `Some` enrolls as a QuickSupport host proposing this nine-digit ID
+    /// (usually [`QuickSupportId::proposed_for`] the device, or the ID assigned
+    /// by a previous enrollment so a reconnect keeps the number the end user
+    /// read aloud). The coordinator keeps the proposal when it is free or
+    /// already bound to this device and assigns another one otherwise; the
+    /// result is `Enrollment::self_node.quicksupport_id`. QuickSupport hosts
+    /// are always ephemeral. `None` for agents and clients.
+    pub quicksupport_id: Option<QuickSupportId>,
 }
 
 enum Outbound {
     Message(Box<control::ControlEnvelope>),
     TicketRequest(oneshot::Sender<Vec<RelayGrant>>),
+    QuickSupportLookup(QuickSupportId, oneshot::Sender<Option<PeerInfo>>),
 }
 
 /// Handle to the control connection: sends updates and requests tickets.
@@ -315,6 +336,30 @@ impl ControlHandle {
             .map_err(|_| ControlError::Closed)?;
         match tokio::time::timeout(CONNECT_TIMEOUT, rx).await {
             Ok(Ok(grants)) => Ok(grants),
+            Ok(Err(_)) => Err(ControlError::Closed),
+            Err(_) => Err(ControlError::Timeout),
+        }
+    }
+
+    /// Asks the coordinator which node of this tenant currently holds the
+    /// QuickSupport ID `id`. `Ok(None)` when no such node exists (the ID
+    /// expired with its host or belongs to another tenant).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControlError::Closed`] if the connection is gone or
+    /// [`ControlError::Timeout`] if the coordinator does not answer in time.
+    pub async fn lookup_quicksupport(
+        &self,
+        id: QuickSupportId,
+    ) -> Result<Option<PeerInfo>, ControlError> {
+        let (tx, rx) = oneshot::channel();
+        self.outbound
+            .send(Outbound::QuickSupportLookup(id, tx))
+            .await
+            .map_err(|_| ControlError::Closed)?;
+        match tokio::time::timeout(CONNECT_TIMEOUT, rx).await {
+            Ok(Ok(peer)) => Ok(peer),
             Ok(Err(_)) => Err(ControlError::Closed),
             Err(_) => Err(ControlError::Timeout),
         }
@@ -402,6 +447,10 @@ impl ControlClient {
                 preauth_key: config.preauth_key.clone(),
                 hostname: config.hostname.clone(),
                 endpoints: config.endpoints.iter().map(ToString::to_string).collect(),
+                quicksupport_id: config
+                    .quicksupport_id
+                    .map(QuickSupportId::digits)
+                    .unwrap_or_default(),
             },
         ));
         writer
@@ -442,12 +491,20 @@ impl ControlClient {
         let (outbound_tx, outbound_rx) = mpsc::channel(64);
         let (events_tx, events_rx) = mpsc::channel(256);
         let (ticket_waiters_tx, ticket_waiters_rx) = mpsc::unbounded_channel();
-        tokio::spawn(writer_loop(writer, tx, outbound_rx, ticket_waiters_tx));
+        let (lookup_waiters_tx, lookup_waiters_rx) = mpsc::unbounded_channel();
+        tokio::spawn(writer_loop(
+            writer,
+            tx,
+            outbound_rx,
+            ticket_waiters_tx,
+            lookup_waiters_tx,
+        ));
         tokio::spawn(reader_loop(
             reader,
             rx,
             events_tx,
             ticket_waiters_rx,
+            lookup_waiters_rx,
             read_idle_timeout,
         ));
 
@@ -508,11 +565,15 @@ async fn read_control(
     Ok(control::ControlEnvelope::decode(plain.as_slice())?)
 }
 
+/// A pending QuickSupport lookup: the ID asked for and who waits for the answer.
+type LookupWaiter = (QuickSupportId, oneshot::Sender<Option<PeerInfo>>);
+
 async fn writer_loop(
     mut writer: OwnedWriteHalf,
     mut tx: NoiseSender,
     mut outbound: mpsc::Receiver<Outbound>,
     ticket_waiters: mpsc::UnboundedSender<oneshot::Sender<Vec<RelayGrant>>>,
+    lookup_waiters: mpsc::UnboundedSender<LookupWaiter>,
 ) {
     let mut keepalive = tokio::time::interval(KEEPALIVE_INTERVAL);
     keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -528,6 +589,16 @@ async fn writer_loop(
                     }
                     envelope(control::control_envelope::Payload::RelayTicketRequest(
                         control::RelayTicketRequest {},
+                    ))
+                }
+                Some(Outbound::QuickSupportLookup(id, waiter)) => {
+                    if lookup_waiters.send((id, waiter)).is_err() {
+                        break;
+                    }
+                    envelope(control::control_envelope::Payload::QuickSupportLookupRequest(
+                        control::QuickSupportLookupRequest {
+                            quicksupport_id: id.digits(),
+                        },
                     ))
                 }
                 None => break,
@@ -552,8 +623,13 @@ async fn reader_loop(
     mut rx: NoiseReceiver,
     events: mpsc::Sender<NetmapEvent>,
     mut ticket_waiters: mpsc::UnboundedReceiver<oneshot::Sender<Vec<RelayGrant>>>,
+    mut lookup_waiters: mpsc::UnboundedReceiver<LookupWaiter>,
     read_idle_timeout: Duration,
 ) {
+    // Lookups are answered in request order; waiters whose caller gave up
+    // (dropped receiver) are skipped when matching.
+    let mut pending_lookups: std::collections::VecDeque<LookupWaiter> =
+        std::collections::VecDeque::new();
     let reason = loop {
         let msg = match tokio::time::timeout(read_idle_timeout, read_control(&mut reader, &mut rx))
             .await
@@ -610,6 +686,25 @@ async fn reader_loop(
                     debug!("unsolicited relay ticket response");
                 }
             }
+            Some(control::control_envelope::Payload::QuickSupportLookupResponse(response)) => {
+                while let Ok(waiter) = lookup_waiters.try_recv() {
+                    pending_lookups.push_back(waiter);
+                }
+                let peer = response.node.as_ref().and_then(|info| {
+                    PeerInfo::from_proto(info)
+                        .inspect_err(|error| warn!(%error, "malformed QuickSupport lookup reply"))
+                        .ok()
+                });
+                let position = pending_lookups
+                    .iter()
+                    .position(|(id, _)| id.digits() == response.quicksupport_id);
+                if let Some((_, waiter)) = position.and_then(|index| pending_lookups.remove(index))
+                {
+                    let _ = waiter.send(peer);
+                } else {
+                    debug!("unsolicited QuickSupport lookup response");
+                }
+            }
             Some(control::control_envelope::Payload::Error(error)) => {
                 break format!("coordinator error: {}", error.message);
             }
@@ -618,7 +713,8 @@ async fn reader_loop(
                 | control::control_envelope::Payload::EnrollResponse(_)
                 | control::control_envelope::Payload::EndpointUpdate(_)
                 | control::control_envelope::Payload::RelayTicketRequest(_)
-                | control::control_envelope::Payload::Keepalive(_),
+                | control::control_envelope::Payload::Keepalive(_)
+                | control::control_envelope::Payload::QuickSupportLookupRequest(_),
             )
             | None => {}
         }
@@ -672,6 +768,7 @@ mod tests {
                 preauth_key: key.clone(),
                 hostname: "Alice Desk".into(),
                 endpoints: vec!["192.168.1.2:7070".parse().unwrap()],
+                quicksupport_id: None,
             },
         )
         .await
@@ -699,6 +796,7 @@ mod tests {
                 preauth_key: key,
                 hostname: "bob".into(),
                 endpoints: vec![],
+                quicksupport_id: None,
             },
         )
         .await
@@ -752,6 +850,89 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn quicksupport_hosts_get_an_id_that_peers_resolve_until_they_leave() {
+        let (addr, server_public, key, _coord) = start_coordinator([3u8; 32]).await;
+
+        let technician = Arc::new(DeviceIdentity::generate());
+        let (tech_ctl, _) = ControlClient::connect(
+            Arc::clone(&technician),
+            ControlConfig {
+                server_addr: addr.to_string(),
+                server_public,
+                preauth_key: key.clone(),
+                hostname: "tech".into(),
+                endpoints: vec![],
+                quicksupport_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        // Nothing holds the ID yet.
+        let wanted: QuickSupportId = "123 456 789".parse().unwrap();
+        assert_eq!(
+            tech_ctl.handle().lookup_quicksupport(wanted).await.unwrap(),
+            None
+        );
+
+        // The end user's machine enrolls proposing an ID; it comes back assigned.
+        let host = Arc::new(DeviceIdentity::generate());
+        let (host_ctl, enrollment) = ControlClient::connect(
+            Arc::clone(&host),
+            ControlConfig {
+                server_addr: addr.to_string(),
+                server_public,
+                preauth_key: key,
+                hostname: "QuickSupport".into(),
+                endpoints: vec![],
+                quicksupport_id: Some(wanted),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(enrollment.self_node.quicksupport_id, Some(wanted));
+        assert!(
+            enrollment.self_node.ephemeral,
+            "QuickSupport hosts are ephemeral"
+        );
+
+        // The technician resolves the ID through the coordinator...
+        let found = tech_ctl
+            .handle()
+            .lookup_quicksupport(wanted)
+            .await
+            .unwrap()
+            .expect("the host owns the ID");
+        assert_eq!(found.id(), host.id());
+        assert_eq!(found.quicksupport_id, Some(wanted));
+        // ...and concurrent lookups are matched by ID, not by arrival order.
+        let other: QuickSupportId = "987654321".parse().unwrap();
+        let handle = tech_ctl.handle();
+        let (missing, present) = tokio::join!(
+            handle.lookup_quicksupport(other),
+            handle.lookup_quicksupport(wanted)
+        );
+        assert_eq!(missing.unwrap(), None);
+        assert_eq!(present.unwrap().map(|p| p.id()), Some(host.id()));
+
+        // The host leaves: its ID expires immediately.
+        drop(host_ctl);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if tech_ctl
+                .handle()
+                .lookup_quicksupport(wanted)
+                .await
+                .unwrap()
+                .is_none()
+            {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "ID never expired");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    #[tokio::test]
     async fn rejects_bad_preauth_key_and_wrong_server_key() {
         let (addr, server_public, _key, _coord) = start_coordinator([1u8; 32]).await;
         let node = Arc::new(DeviceIdentity::generate());
@@ -763,6 +944,7 @@ mod tests {
                 preauth_key: "odk_nope_nope".into(),
                 hostname: "x".into(),
                 endpoints: vec![],
+                quicksupport_id: None,
             },
         )
         .await
@@ -785,6 +967,7 @@ mod tests {
                 preauth_key: "odk_x_y".into(),
                 hostname: "x".into(),
                 endpoints: vec![],
+                quicksupport_id: None,
             },
         )
         .await
@@ -825,6 +1008,7 @@ mod tests {
                 preauth_key: key,
                 hostname: "quiet".into(),
                 endpoints: vec![],
+                quicksupport_id: None,
             },
             Duration::from_millis(300),
         )

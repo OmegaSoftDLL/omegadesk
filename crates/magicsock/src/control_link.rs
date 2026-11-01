@@ -32,7 +32,7 @@ impl SharedControl {
         }
     }
 
-    fn current(&self) -> Option<ControlHandle> {
+    pub(crate) fn current(&self) -> Option<ControlHandle> {
         match self.handle.lock() {
             Ok(guard) => guard.clone(),
             Err(poisoned) => poisoned.into_inner().clone(),
@@ -66,7 +66,9 @@ impl TicketSource for SharedControl {
 /// re-enrollment before the resync is applied non-destructively.
 const SNAPSHOT_COMPLETION_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Runs until the driver goes away.
+/// Runs until the driver goes away. A QuickSupport host re-enrolls proposing
+/// the ID it was assigned, so the number the end user read aloud survives a
+/// coordinator reconnect unless another host took it in the meantime.
 pub(crate) async fn supervise(
     identity: Arc<DeviceIdentity>,
     mut config: ControlConfig,
@@ -85,6 +87,16 @@ pub(crate) async fn supervise(
             match ControlClient::connect(Arc::clone(&identity), config.clone()).await {
                 Ok((reconnected, enrollment)) => {
                     info!(fqdn = %enrollment.self_node.fqdn, "re-enrolled with the coordinator");
+                    if config.quicksupport_id.is_some() {
+                        if enrollment.self_node.quicksupport_id != config.quicksupport_id {
+                            warn!(
+                                previous = ?config.quicksupport_id,
+                                current = ?enrollment.self_node.quicksupport_id,
+                                "QuickSupport ID changed on re-enrollment"
+                            );
+                        }
+                        config.quicksupport_id = enrollment.self_node.quicksupport_id;
+                    }
                     let (handle, mut events) = reconnected.into_parts();
                     shared.set(Some(handle.clone()));
                     if !resync(&driver, &mut events, enrollment).await {
