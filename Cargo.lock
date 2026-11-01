@@ -1751,6 +1751,7 @@ name = "omegadesk-server"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bytes",
  "clap",
  "data-encoding",
  "omegadesk-identity",
@@ -1759,6 +1760,7 @@ dependencies = [
  "omegadesk-relay",
  "omegadesk-tun",
  "rand_core 0.6.4",
+ "ring",
  "sha2",
  "thiserror 2.0.21",
  "tokio",

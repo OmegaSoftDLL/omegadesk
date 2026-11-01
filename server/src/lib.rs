@@ -27,6 +27,7 @@ use rand_core::{OsRng, RngCore};
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 
+pub mod rmm;
 pub mod web_gateway;
 
 /// Base internal DNS suffix for all machines on the OmegaDesk mesh (`*.omega`).

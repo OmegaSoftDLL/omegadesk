@@ -293,10 +293,11 @@ Each phase ends with something that runs and can be demoed. ✅ marks what is do
 - ✅ DLP and watermarking (`crates/session/src/dlp.rs`) and envelope credential vault (`crates/identity/src/vault.rs`): clipboard direction and byte-size limits, keystroke token-bucket rate limiter, `redact_bgra_region` screen bounding-box redaction, and dynamic `WatermarkOverlay` generator (ported from KasmVNC DLP), plus `PBKDF2-HMAC-SHA256` (`100_000` rounds) 256-bit Master `KEK` wrapping per-entry random 256-bit `DEK`s under `ChaCha20-Poly1305` AEAD with `zeroize` on drop (upgrading Remmina `remmina_crypt.c` and fixing 1Remote `UnSafeStringEncipher.cs`).
 - ✅ **Done when:** every session is recorded and searchable, and access to a critical server requires approval.
 
-### Phase 6: RMM (4–6 weeks)
-- Inventory, scheduled scripts (PowerShell/bash), checks → alerts → templates.
-- Inheritable policies, per-site deployment links, agent auto-update.
-- **Done when:** it can manage a customer's entire fleet without any other tool.
+### Phase 6: RMM (4–6 weeks) ✅
+- ✅ Inventory, custom fields, Windows Update status, and scheduled scripts (`server/src/rmm.rs` / `omegadesk-server::rmm`): `DeviceInventory` (`used_memory_percent`, `used_storage_percent`, `DriveInventory`, `WindowsUpdateStatus`, custom fields, ported from Remotely `Shared/Entities/Device.cs`), `SavedScript` (`ScriptingShell::PsCore | WinPs | Bash | Cmd`), `ScriptSchedule` (`RepeatInterval::Hourly | Daily | Weekly | Monthly`), and `ScriptScheduler` (`dispatch_due_runs` with `run_on_next_connect` offline queueing and site + device union targeting, ported from Remotely `ScriptScheduler.cs` and `ScriptScheduleDispatcher.cs`).
+- ✅ Checks → alerts → templates, inheritable policies, and scoped RMM roles (`crates/policy/src/rmm_policy.rs` / `omegadesk-policy::rmm_policy`): `RmmCheck` (`CpuThreshold`, `MemoryThreshold`, `DiskThreshold`, `ProcessRunning`, `ScriptExitCode`), `CheckEvaluator` tracking consecutive failure thresholds before opening an `AlertRecord` and firing `AlertTemplate` failure/resolution actions (`RunScript`, `WebhookNotify`), `resolve_effective_rmm_policy` merging `Tenant (Client) -> DeviceGroup (Site) -> Device (Machine)` policy layers, and `ScopedRmmRole` with `RmmCapabilityFlags` (`can_*` flags scoped to tenants and sites).
+- ✅ Per-site deployment links, chunked agent auto-update, and identity-bound mesh message bus (`server/src/rmm.rs`): `DeploymentLinkManager` issuing expiring `HMAC-SHA256` per-site enrollment tokens (`SiteDeploymentLink`), `AgentUpdateManager` streaming chunked binary updates (`cmd 10`, `cmd 13`, `cmd 14` `[0, 14, 0, 1, ..chunk]`) gated by a `taskLimiter` concurrency cap (ported from MeshCentral `meshagent.js`), and `AgentTopic` enforcing `agent.<device_id>.<channel>` identity isolation over QUIC on the mesh.
+- ✅ **Done when:** it can manage a customer's entire fleet without any other tool.
 
 ### Phase 7: Compatibility and differentiators (ongoing)
 - RDP client over the mesh (IronRDP) and RDP in the browser.
