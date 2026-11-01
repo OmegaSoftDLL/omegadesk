@@ -5,6 +5,9 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use omegadesk_codec::DecodedImage;
+use omegadesk_protocol::v1::DisplayList;
+
+use crate::channels::displays::DisplayState;
 
 /// Most recently decoded video frame along with its per-stage latency measurements.
 #[derive(Debug)]
@@ -20,6 +23,7 @@ struct Inner {
     latest: Mutex<Option<LatestFrame>>,
     rtt_micros: AtomicU64,
     status: Mutex<String>,
+    displays: Mutex<DisplayState>,
 }
 
 /// Cheaply cloneable handle to shared client state.
@@ -58,6 +62,33 @@ impl Shared {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
+    }
+
+    /// Stores the agent's latest monitor catalog announcement.
+    pub(crate) fn set_displays(&self, list: DisplayList) {
+        self.0
+            .displays
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .update(list);
+    }
+
+    /// Snapshot of the agent's monitor catalog.
+    pub(crate) fn displays(&self) -> DisplayState {
+        self.0
+            .displays
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Agent index of the display being streamed.
+    pub(crate) fn active_display(&self) -> u32 {
+        self.0
+            .displays
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .active_index()
     }
 }
 

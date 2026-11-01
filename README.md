@@ -23,7 +23,7 @@ OmegaDesk is a remote desktop you run on your own infrastructure, as an alternat
 ## Status
 
 > [!WARNING]
-> OmegaDesk is in early development. **Phases 0 and 1** of the [roadmap](docs/plan.md) are done: it works on a local network today, connecting by IP address, certificate fingerprint and password. **Phase 2** (coordinator, relay and mesh) is implemented end to end: agent and client enroll with a coordinator and connect by name through NAT traversal or the relay, verified in-process and in a two-machine test over Tailscale (a clean test across two distinct public NATs is still pending). From **Phase 3**, QuickSupport works end to end (nine-digit ID, temporary password, console consent prompt), verified in-process. The **browser client** (Phase 4) connects through the coordinator's web gateway with keyboard, mouse and H.264 video, verified in-process; its latency against the native client is not measured yet. The rest of Phase 3 and the recording, RMM and compatibility layers (Phases 5–7) exist only as library crates that no binary uses yet; the plan lists their known defects. It is not ready for production use.
+> OmegaDesk is in early development. **Phases 0 and 1** of the [roadmap](docs/plan.md) are done: it works on a local network today, connecting by IP address, certificate fingerprint and password. **Phase 2** (coordinator, relay and mesh) is implemented end to end: agent and client enroll with a coordinator and connect by name through NAT traversal or the relay, verified in-process and in a two-machine test over Tailscale (a clean test across two distinct public NATs is still pending). From **Phase 3**, QuickSupport works end to end (nine-digit ID, temporary password, console consent prompt), and the native agent and client synchronize text clipboards, transfer files, switch monitors and adapt video quality. The **browser client** (Phase 4) connects through the coordinator's web gateway with keyboard, mouse and H.264 video, verified in-process; its latency against the native client is not measured yet. Audio, chat, terminal and LAN mode remain unwired, and the recording, RMM and compatibility layers (Phases 5–7) exist only as library crates that no binary uses yet; the plan lists their known defects. It is not ready for production use.
 
 What works today:
 
@@ -34,6 +34,10 @@ What works today:
 - **Native client** that shows a live latency breakdown in the title bar.
 - **Mesh mode**: a self-hosted coordinator (`omegadesk-server`) hands out addresses and names (`office-pc.omega`), nodes find each other with STUN and `disco` hole punching, fall back to a DERP-style relay (`omegadesk-relay`) in 1.5 s and upgrade to a direct path as soon as one validates. TLS is bound to the device identity the coordinator distributes, so there is no fingerprint to copy.
 - **QuickSupport**: the person who needs help runs one executable, reads a nine-digit ID and a temporary password to the technician and accepts a consent prompt; the technician connects with `omegadesk-client 123 456 789`. The ID lives in the coordinator only while the program runs, and ten wrong passwords rotate the password.
+- **Clipboard** text synchronized in both directions (SHA-256 echo suppression; `--no-clipboard` to disable).
+- **File transfer** in both directions on dedicated QUIC streams: `--send-file`, drag a file onto the client window, `--receive-dir` on either side. Transfers resume from a partial file and are SHA-256 verified before the file gets its final name; nothing is ever overwritten.
+- **Multi-monitor**: the agent lists its monitors; in the client press `Ctrl+Alt+Shift` + `1`..`9`, `N` (next) or `P` (previous) to switch the streamed display.
+- **Adaptive video quality**: the client acknowledges every frame and the agent lowers the bitrate first, then the frame rate, when the path congests (RustDesk `video_qos` model); `--bitrate-mbps` and `--fps` are the ceilings.
 
 First measurement (Intel Core Ultra 5 135U, 1920×1080, agent and client on the same machine): **60 fps and 24.5 ms end-to-end latency**. Host processing takes 15 ms (11 ms of it encoding), plus 0.2 ms network, 6 ms decode and 3 ms draw.
 
@@ -63,9 +67,14 @@ Useful flags:
 | `--no-input` | agent | Share the screen only; ignore keyboard and mouse |
 | `--password` / `OMEGADESK_PASSWORD` | agent, client | Fixed password (agent) or the password to send (client) |
 | `--view-only` | client | Watch only; do not send keyboard and mouse |
+| `--no-clipboard` | agent, client | Do not synchronize the text clipboard |
+| `--send-file PATH` | agent, client | Send a file to the peer right after connecting (repeatable); the client also sends files dropped on its window |
+| `--receive-dir DIR` | agent, client | Where received files are stored (default: `Downloads/OmegaDesk` under the user profile) |
 | `--server`, `--server-key`, `--preauth-key` | agent, client | Join the mesh through a coordinator (see below) |
 | `--relay-only` | agent, client | Mesh mode: never attempt direct paths |
 | `--web-listen`, `--web-root`, `--web-allowed-host`, `--web-behind-tls` | server | Serve the browser client and proxy browsers to agents (see below) |
+
+Keyboard shortcuts in the client window: `Ctrl+Alt+End` or `Ctrl+Alt+Delete` sends the Secure Attention Sequence to the remote machine; `Ctrl+Alt+Shift` + `1`..`9` streams the n-th remote monitor, `Ctrl+Alt+Shift+N` / `P` the next or previous one (the title bar shows `display 2/3`). Letters rather than arrows, because GPU vendor hotkeys (`Ctrl+Alt+Arrow` on Intel) intercept the arrow combinations before any window sees them.
 
 ### Mesh mode (coordinator and relay)
 
@@ -178,7 +187,7 @@ The full design, from the WireGuard mesh to the web client, is in [docs/plan.md]
 | 0 | Foundation: workspace, CI on three platforms, license policy, protocol, identity | ✅ Done |
 | 1 | First image on screen: capture, hardware encoding, QUIC, input, ≤ 30 ms on LAN | ✅ Done |
 | 2 | Mesh network and coordination server: NAT traversal, relay, internal DNS | 🔶 Agent and client join the mesh (`--server`), connect by `name.omega`, traverse NAT with STUN + `disco` and fall back to the relay in 1.5 s; verified in-process and in a two-machine test, clean two-public-NAT test pending |
-| 3 | Remote access product: Windows service, login/UAC screens, clipboard, files, audio | 🔶 QuickSupport works end to end (ID registry in the coordinator, ephemeral mesh node, temporary password, console consent), verified in-process; desktop switching, session channels, QoS/FEC and LAN mode are still library only; open findings: [#27](https://github.com/OmegaSoftDLL/omegadesk/issues/27) |
+| 3 | Remote access product: Windows service, login/UAC screens, clipboard, files, audio | 🔶 QuickSupport, text clipboard, resumable file transfer, multi-monitor switching and adaptive video QoS are wired end to end; Windows service and privacy mode exist but the service worker does not yet route the QUIC session; audio, chat, terminal, FEC and LAN mode remain unwired; open findings: [#27](https://github.com/OmegaSoftDLL/omegadesk/issues/27) |
 | 4 | Web dashboard and browser client | 🔶 Browser client works end to end through `omegadesk-server --web-listen` (WebSocket gateway on the mesh, WebCodecs H.264, keyboard and mouse, latency readout), verified in-process and in CI; the policy model and connection manager are still library only, no dashboard, no WebTransport, latency against the native client not measured; open findings: [#28](https://github.com/OmegaSoftDLL/omegadesk/issues/28) |
 | 5 | Security, session recording and privileged access | 🧩 Library only: recording, HuJSON policies, MFA, PAM, DLP and vault exist; no handshake consults them; open findings: [#29](https://github.com/OmegaSoftDLL/omegadesk/issues/29) |
 | 6 | Remote monitoring and management (RMM) | 🧩 Library only: in-memory RMM models; the agent reports nothing; open findings: [#30](https://github.com/OmegaSoftDLL/omegadesk/issues/30) |

@@ -147,6 +147,24 @@ impl VideoQosController {
         self.current_fps
     }
 
+    /// Lowest bitrate the controller will recommend, in kilobits per second.
+    #[must_use]
+    pub const fn min_bitrate_kbps(&self) -> u32 {
+        self.min_bitrate_kbps
+    }
+
+    /// Highest bitrate the controller will recommend, in kilobits per second.
+    #[must_use]
+    pub const fn max_bitrate_kbps(&self) -> u32 {
+        self.max_bitrate_kbps
+    }
+
+    /// Frame-rate cap the controller ramps toward, in frames per second.
+    #[must_use]
+    pub const fn target_fps_cap(&self) -> u32 {
+        self.target_fps_cap
+    }
+
     /// Baseline minimum one-way/round-trip delay observed over the recent window.
     #[must_use]
     pub fn baseline_delay_ms(&self) -> u32 {

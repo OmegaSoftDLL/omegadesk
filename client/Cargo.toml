@@ -17,6 +17,7 @@ omegadesk-identity.workspace = true
 omegadesk-input.workspace = true
 omegadesk-magicsock.workspace = true
 omegadesk-protocol.workspace = true
+omegadesk-session = { workspace = true, features = ["io"] }
 omegadesk-transport.workspace = true
 softbuffer.workspace = true
 tokio.workspace = true

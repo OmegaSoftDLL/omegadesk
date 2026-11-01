@@ -20,6 +20,7 @@ omegadesk-input.workspace = true
 omegadesk-magicsock.workspace = true
 omegadesk-protocol.workspace = true
 omegadesk-service.workspace = true
+omegadesk-session = { workspace = true, features = ["io"] }
 omegadesk-transport.workspace = true
 rand_core.workspace = true
 thiserror.workspace = true

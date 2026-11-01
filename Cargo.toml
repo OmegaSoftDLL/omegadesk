@@ -38,6 +38,8 @@ omegadesk-relay = { path = "relay" }
 omegadesk-server = { path = "server" }
 
 anyhow = "1"
+# Text-only OS clipboard (MIT OR Apache-2.0); `image-data` would pull the `image` crate.
+arboard = { version = "3.7", default-features = false }
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "ws"] }
 bytes = "1"
 clap = { version = "4", features = ["derive", "env"] }

@@ -3,10 +3,14 @@
 //! (`mDNS` + signed transcript + `TOFU`).
 
 pub mod channels;
+#[cfg(feature = "io")]
+pub mod clipboard_io;
 pub mod connection_manager;
 pub mod deskhub;
 pub mod dlp;
 pub mod fec;
+#[cfg(feature = "io")]
+pub mod file_io;
 pub mod lan;
 pub mod qos;
 

@@ -20,6 +20,7 @@
 mod virtual_display;
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Context;
@@ -67,6 +68,19 @@ struct Args {
     /// Share the screen only; ignore remote keyboard and mouse input.
     #[arg(long)]
     no_input: bool,
+
+    /// Do not synchronize the text clipboard with the client.
+    #[arg(long)]
+    no_clipboard: bool,
+
+    /// Directory where files sent by the client are stored
+    /// (default: `Downloads/OmegaDesk` under the user profile).
+    #[arg(long, default_value_os_t = omegadesk_session::file_io::default_receive_dir())]
+    receive_dir: PathBuf,
+
+    /// File to send to every client right after it connects (repeatable).
+    #[arg(long, action = clap::ArgAction::Append)]
+    send_file: Vec<PathBuf>,
 
     /// Machine name displayed to the connected client and, on the mesh, the
     /// name clients connect to (`<name>.omega`).
@@ -176,6 +190,10 @@ async fn run_share(args: Args) -> anyhow::Result<()> {
         },
         input: !args.no_input,
         gate: None,
+        clipboard: !args.no_clipboard,
+        file_transfer: true,
+        receive_dir: args.receive_dir,
+        send_files: args.send_file,
     });
 
     // Mesh mode keeps the `Node` alive for the whole run: dropping it stops

@@ -126,6 +126,17 @@ pub trait VideoEncoder: Send {
     /// Forces the next encoded frame to be an IDR keyframe (used when a new
     /// client joins or after packet/frame loss).
     fn request_keyframe(&mut self);
+
+    /// Changes the target bitrate of a running encoder without interrupting the
+    /// stream (RustDesk `Encoder::set_quality` / Sunshine dynamic bitrate).
+    ///
+    /// Returns `true` if the encoder applied the new bitrate live. The default
+    /// returns `false`, meaning the encoder cannot be retuned in place and the
+    /// caller must recreate it with new [`EncoderSettings`] (and send a keyframe).
+    fn set_bitrate(&mut self, bitrate_bps: u32) -> bool {
+        let _ = bitrate_bps;
+        false
+    }
 }
 
 /// Video decoder trait.
