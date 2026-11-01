@@ -757,7 +757,13 @@ impl AgentUpdateManager {
             return (Vec::new(), Vec::new());
         }
 
-        (self.start_transfer(device_id, image, now_ms), Vec::new())
+        let frames = self.start_transfer(device_id, image, now_ms);
+        // A transfer that fits in a single block completes inside `start_transfer` without ever
+        // occupying a slot. On the reconnect path the slot this agent held is now free, so
+        // waiting agents must be promoted here or they would stay queued with no later ACK or
+        // expiry able to release them.
+        let promoted = self.promote_waiting(now_ms);
+        (frames, promoted)
     }
 
     /// Processes a 4-byte `MeshCommand_AgentBinaryBlock` ACK (`[0, 14, 0, 1]`, `status == 1` in
@@ -1465,6 +1471,63 @@ mod tests {
         // A late ACK from the expired agent is ignored; its next hash report starts over.
         let (frames, _) = updater.handle_block_ack(dev1, &[0, 14, 0, 1], 300_000);
         assert_eq!(frames, Vec::<Bytes>::new());
+    }
+
+    /// Regression test for the Copilot finding on PR #37 (`rmm.rs:760`): when a reconnecting
+    /// agent restarts onto an image that fits in a single block, the transfer completes at once
+    /// and the slot it held must be handed to the waiting queue immediately.
+    #[test]
+    fn single_block_reconnect_restart_promotes_waiting_agents() {
+        let mut updater = AgentUpdateManager::new(1, 4);
+        updater.register_image(AgentBinaryImage::new(
+            "linux-x86_64",
+            "0.2.0",
+            Bytes::from_static(b"OMEGA_BIN_V2"),
+        ));
+        let dev1 = DeviceIdentity::generate().id();
+        let dev2 = DeviceIdentity::generate().id();
+        let old_hash = [0x11u8; 32];
+
+        updater.handle_agent_hash(dev1, "linux-x86_64", &old_hash, 0);
+        updater.handle_agent_hash(dev2, "linux-x86_64", &old_hash, 0);
+        assert_eq!((updater.active_count(), updater.queued_count()), (1, 1));
+
+        // The image is replaced with one that fits in a single 4-byte block.
+        let tiny = AgentBinaryImage::new("linux-x86_64", "0.3.0", Bytes::from_static(b"V3!"));
+        let tiny_hash = tiny.sha256_hash;
+        updater.register_image(tiny);
+
+        // dev1 reconnects: its restart completes immediately (cmd 10, 13, one block, cmd 13 end)
+        // and dev2 is promoted in the same call, also completing immediately.
+        let (restart, promoted) = updater.handle_agent_hash(dev1, "linux-x86_64", &old_hash, 100);
+        assert_eq!(restart.len(), 4);
+        assert_eq!(&restart[2][4..], b"V3!");
+        assert_eq!(&restart[3][4..], &tiny_hash);
+        assert_eq!(promoted.len(), 1);
+        assert_eq!(promoted[0].0, dev2);
+        assert_eq!(promoted[0].1.len(), 4);
+        assert_eq!(&promoted[0].1[3][4..], &tiny_hash);
+        assert_eq!((updater.active_count(), updater.queued_count()), (0, 0));
+
+        // The non-reconnect path behaves the same: a fresh single-block start never strands
+        // a queue that was filled while the slot was busy.
+        let mut updater = AgentUpdateManager::new(1, 4);
+        updater.register_image(AgentBinaryImage::new(
+            "linux-x86_64",
+            "0.2.0",
+            Bytes::from_static(b"OMEGA_BIN_V2"),
+        ));
+        updater.handle_agent_hash(dev1, "linux-x86_64", &old_hash, 0);
+        updater.handle_agent_hash(dev2, "linux-x86_64", &old_hash, 0);
+        updater.register_image(AgentBinaryImage::new(
+            "linux-x86_64",
+            "0.3.0",
+            Bytes::from_static(b"V3!"),
+        ));
+        let promoted = updater.cancel_transfer(dev1, 50);
+        assert_eq!(promoted.len(), 1);
+        assert_eq!(promoted[0].0, dev2);
+        assert_eq!((updater.active_count(), updater.queued_count()), (0, 0));
     }
 
     /// Regression test for #30 `rmm.rs:617`: an active transfer streams the image snapshot it
