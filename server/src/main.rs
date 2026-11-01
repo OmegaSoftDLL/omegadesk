@@ -673,15 +673,11 @@ async fn main() -> Result<()> {
     run_server(args).await
 }
 
-async fn run_server(args: Args) -> Result<()> {
-    let secret_hex = args
-        .ticket_secret_hex
-        .as_deref()
-        .context("--ticket-secret-hex (or OMEGADESK_RELAY_TICKET_SECRET) is required to serve")?;
-    let secret = decode_hex_32(secret_hex)
-        .context("ticket_secret_hex must be exactly 64 hex characters (32 bytes)")?;
-    let server_identity = Arc::new(load_identity(args.key_file.as_ref())?);
-    let mut coord = Coordinator::new(secret);
+fn configure_coordinator(
+    args: &Args,
+    secret: &[u8; 32],
+) -> Result<(Coordinator, Option<std::time::SystemTime>)> {
+    let mut coord = Coordinator::new(*secret);
     for spec in &args.relays {
         let relay = parse_relay(spec)?;
         info!(address = %relay.address, "relay registered");
@@ -730,6 +726,23 @@ async fn run_server(args: Args) -> Result<()> {
     } else {
         None
     };
+    info!(
+        bootstrap_preauth_key = %bootstrap_key,
+        quicksupport_preauth_key = %quicksupport_key,
+        "coordinator credentials created"
+    );
+    Ok((coord, policy_mtime))
+}
+
+async fn run_server(args: Args) -> Result<()> {
+    let secret_hex = args
+        .ticket_secret_hex
+        .as_deref()
+        .context("--ticket-secret-hex (or OMEGADESK_RELAY_TICKET_SECRET) is required to serve")?;
+    let secret = decode_hex_32(secret_hex)
+        .context("ticket_secret_hex must be exactly 64 hex characters (32 bytes)")?;
+    let server_identity = Arc::new(load_identity(args.key_file.as_ref())?);
+    let (coord, policy_mtime) = configure_coordinator(&args, &secret)?;
     let admin_token = args
         .admin_token
         .clone()
@@ -739,8 +752,6 @@ async fn run_server(args: Args) -> Result<()> {
         id = %server_identity.id(),
         tenant = %args.tenant,
         server_key = %public_key_hex(&server_identity),
-        bootstrap_preauth_key = %bootstrap_key,
-        quicksupport_preauth_key = %quicksupport_key,
         admin_token = %admin_token,
         "omegadesk-server initialized; nodes need --server-key and --preauth-key (or a deployment token)"
     );

@@ -306,6 +306,45 @@ pub async fn handle_connection(
     handle_connection_with(stream, server_id, coordinator, rmm).await
 }
 
+async fn read_enrollment(
+    reader: &mut OwnedReadHalf,
+    writer: &mut OwnedWriteHalf,
+    server_id: &Arc<DeviceIdentity>,
+) -> Result<((NoiseSender, NoiseReceiver), control::ControlEnvelope)> {
+    tokio::time::timeout(ENROLL_TIMEOUT, async {
+        let mut init_msg = vec![0u8; HANDSHAKE_INIT_LEN];
+        reader.read_exact(&mut init_msg).await?;
+        let (session, reply) = ResponderHandshake::accept(server_id, CONTROL_PROLOGUE, &init_msg)?;
+        writer.write_all(&reply).await?;
+        let (tx, mut rx) = session.split();
+        let first = read_control(reader, &mut rx).await?;
+        Ok::<_, anyhow::Error>(((tx, rx), first))
+    })
+    .await
+    .context("enrollment timeout")?
+}
+
+fn audit_disconnect(
+    coordinator: &Arc<Mutex<Coordinator>>,
+    node_id: DeviceId,
+    generation: u64,
+    peer_addr: &std::net::SocketAddr,
+    result: &Result<()>,
+) {
+    if let Ok(mut guard) = coordinator.lock() {
+        guard.handle_disconnect(node_id, generation);
+        guard.audit(
+            &Coordinator::audit_event(AuditKind::NodeDisconnected, AuditOutcome::Ok)
+                .actor(node_id.to_string())
+                .remote(peer_addr)
+                .detail(match result {
+                    Ok(()) => "closed".to_owned(),
+                    Err(error) => error.to_string(),
+                }),
+        );
+    }
+}
+
 /// Serves one node connection from handshake to disconnect, registering it
 /// with the shared [`RmmService`].
 ///
@@ -324,18 +363,7 @@ pub async fn handle_connection_with(
     let peer_addr = stream.peer_addr()?;
     let (mut reader, mut writer) = stream.into_split();
 
-    let (session, request) = tokio::time::timeout(ENROLL_TIMEOUT, async {
-        let mut init_msg = vec![0u8; HANDSHAKE_INIT_LEN];
-        reader.read_exact(&mut init_msg).await?;
-        let (session, reply) = ResponderHandshake::accept(&server_id, CONTROL_PROLOGUE, &init_msg)?;
-        writer.write_all(&reply).await?;
-        let (tx, mut rx) = session.split();
-        let first = read_control(&mut reader, &mut rx).await?;
-        Ok::<_, anyhow::Error>(((tx, rx), first))
-    })
-    .await
-    .context("enrollment timeout")??;
-    let (tx, mut rx) = session;
+    let ((tx, mut rx), request) = read_enrollment(&mut reader, &mut writer, &server_id).await?;
     let peer = *tx.peer_public();
     let node_id: DeviceId = peer.id();
 
@@ -426,18 +454,7 @@ pub async fn handle_connection_with(
     forwarder.abort();
     drop(outbound_tx);
     writer_task.abort();
-    if let Ok(mut guard) = coordinator.lock() {
-        guard.handle_disconnect(node_id, generation);
-        guard.audit(
-            &Coordinator::audit_event(AuditKind::NodeDisconnected, AuditOutcome::Ok)
-                .actor(node_id.to_string())
-                .remote(&peer_addr)
-                .detail(match &result {
-                    Ok(()) => "closed".to_owned(),
-                    Err(error) => error.to_string(),
-                }),
-        );
-    }
+    audit_disconnect(&coordinator, node_id, generation, &peer_addr, &result);
     if let Ok(mut guard) = rmm.lock() {
         guard.device_disconnected(node_id, generation, unix_now());
     }
