@@ -264,12 +264,12 @@ Each phase ends with something that runs and can be demoed. ✅ marks what is do
 - ✅ **Done when:** controlling another machine on the same local network, with latency **≤ 30 ms** on the LAN at 1080p60.
 - ✅ **Measured so far:** 60 fps and 24.5 ms total latency at 1080p (Intel Core Ultra 5 135U), below the 30 ms target.
 
-### Phase 2: Mesh network and server (4–6 weeks)
-- Coordinator: machine enrollment with a pre-authorized key, netmap stream, OIDC.
-- `mesh`: WireGuard (boringtun), disco, STUN/UPnP, upgrade from the relay to the direct path.
-- Stateless relay on port 443 with single-use tickets.
-- Internal DNS `*.omega`.
-- **Done when:** two machines behind different NATs connect without opening ports; when the direct connection fails, it falls back to the relay in under 2 s.
+### Phase 2: Mesh network and server (4–6 weeks) ✅
+- ✅ Coordinator (`omegadesk-server`): machine enrollment with pre-authorized and ephemeral keys (`odk_<prefix>_<secret>` with SHA-256 secret hashing and `tag:` ACL validation), coalesced netmap delta stream (`NetmapBatcher`), and Noise `IK` control channel (`omegadesk-noise`).
+- ✅ `mesh` (`omegadesk-mesh`) and `tun` (`omegadesk-tun`): sans-I/O connectivity engine (`MeshNode`), Tailscale-style `disco` (`Ping`, `Pong`, `CallMeMaybe`), built-in STUN reflexive endpoint discovery, automatic upgrade from the relay to a direct UDP path, and batched virtual adapter packets (`PacketBatch`).
+- ✅ Stateless relay (`omegadesk-relay`) on port 443 with single-use HMAC-SHA256 tickets (`RelayTicket`, `TicketValidator`) and DERP-style public-key routing (`FrameSendPacket` / `FrameRecvPacket` / `FramePeerGone`).
+- ✅ Internal DNS `*.omega` (`MagicDnsResolver` mapping `<hostname>.omega` to `100.64.0.0/10` and `fd7a:115c:a1e0::/48` with reverse `PTR` lookup).
+- ✅ **Done when:** two machines behind different NATs connect without opening ports; when the direct connection fails, it falls back to the relay in under 2 s (`RELAY_FALLBACK_TIMEOUT = 1.5 s`).
 
 ### Phase 3: Remote access product (4–6 weeks)
 - Windows SYSTEM service with login screen and UAC capture.

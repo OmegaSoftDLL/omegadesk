@@ -1,0 +1,22 @@
+[package]
+name = "omegadesk-relay"
+description = "Stateless DERP-style public-key packet relay with single-use HMAC tickets"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+omegadesk-identity.workspace = true
+ring.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true

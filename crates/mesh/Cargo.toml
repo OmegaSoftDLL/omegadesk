@@ -1,0 +1,25 @@
+[package]
+name = "omegadesk-mesh"
+description = "Sans-I/O mesh connectivity engine with Tailscale disco hole-punching and relay fallback"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+omegadesk-identity.workspace = true
+omegadesk-tun.workspace = true
+rand_core.workspace = true
+ring.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+x25519-dalek.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true
