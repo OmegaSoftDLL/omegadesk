@@ -26,12 +26,17 @@ pub const ODREC_MAGIC: [u8; 8] = *b"ODREC001";
 /// ported from `Ylianst_MeshCentral/meshrelay.js` lines 137–142.
 pub const ODREC_HEADER_LEN: usize = 16;
 
-/// Default minimum byte distance between automatically indexed keyframes (`16 KiB`),
-/// ported from `SessionRecording.js` line 96 (`KEYFRAME_CHAR_INTERVAL = 16384`).
+/// Minimum byte distance after which [`OdrecWriter::keyframe_hint_due`] asks the producer for a
+/// new recovery point (`16 KiB`), ported from `SessionRecording.js` line 96
+/// (`KEYFRAME_CHAR_INTERVAL = 16384`).
+///
+/// This is advisory only: like `Guacamole.SessionRecording._Frame.keyframe` ("purely advisory",
+/// `SessionRecording.js` lines 1291–1299) it never turns a delta frame into an index entry.
 pub const KEYFRAME_BYTE_INTERVAL: u64 = 16_384;
 
-/// Default minimum time distance in milliseconds between automatically indexed keyframes (`5000 ms`),
-/// ported from `SessionRecording.js` line 105 (`KEYFRAME_TIME_INTERVAL = 5000`).
+/// Minimum time distance in milliseconds after which [`OdrecWriter::keyframe_hint_due`] asks the
+/// producer for a new recovery point (`5000 ms`), ported from `SessionRecording.js` line 105
+/// (`KEYFRAME_TIME_INTERVAL = 5000`). Advisory only, see [`KEYFRAME_BYTE_INTERVAL`].
 pub const KEYFRAME_TIME_INTERVAL_MS: u64 = 5_000;
 
 /// Errors returned while encoding, decoding, or seeking session recordings.
@@ -239,10 +244,16 @@ impl OdrecWriter {
         }
     }
 
-    /// Appends a record to the `.odrec` stream and updates the keyframe index if
-    /// [`RecordFlags::KEYFRAME`] is set or if both [`KEYFRAME_BYTE_INTERVAL`] and
-    /// [`KEYFRAME_TIME_INTERVAL_MS`] have elapsed since the previous keyframe
-    /// (`SessionRecording.js` lines 96–105).
+    /// Appends a record to the `.odrec` stream and adds it to the keyframe index if, and only
+    /// if, [`RecordFlags::KEYFRAME`] is set.
+    ///
+    /// Elapsed time or byte distance never promote a delta frame to the index: a delta frame
+    /// still depends on earlier frames, so seeking to it would decode garbage. In
+    /// `Guacamole.SessionRecording` (`SessionRecording.js` lines 493–499 and 717–722) the
+    /// interval-based `frame.keyframe` flag is only advisory and a frame becomes seekable once
+    /// its full `clientState` snapshot has been stored; the equivalent here is the producer
+    /// requesting an IDR/recovery frame when [`Self::keyframe_hint_due`] returns `true` and
+    /// then flagging that record `KEYFRAME`.
     ///
     /// # Errors
     ///
@@ -251,17 +262,7 @@ impl OdrecWriter {
         let byte_offset = self.buffer.len() as u64;
         record.encode(&mut self.buffer)?;
 
-        let is_explicit_keyframe = record.flags.contains(RecordFlags::KEYFRAME);
-        let interval_reached = record.record_type == RecordType::FrameData
-            && (self.keyframes.is_empty()
-                || (byte_offset.saturating_sub(self.last_keyframe_byte_offset)
-                    >= KEYFRAME_BYTE_INTERVAL
-                    && record
-                        .timestamp_ms
-                        .saturating_sub(self.last_keyframe_timestamp_ms)
-                        >= KEYFRAME_TIME_INTERVAL_MS));
-
-        if is_explicit_keyframe || interval_reached {
+        if record.flags.contains(RecordFlags::KEYFRAME) {
             self.keyframes.push(KeyframeIndexEntry {
                 record_index: self.record_count,
                 timestamp_ms: record.timestamp_ms,
@@ -273,6 +274,23 @@ impl OdrecWriter {
 
         self.record_count += 1;
         Ok(byte_offset)
+    }
+
+    /// Returns `true` when the producer should emit a new recovery point (IDR keyframe or state
+    /// snapshot) for a frame stamped `timestamp_ms`: either no keyframe has been indexed yet, or
+    /// both [`KEYFRAME_BYTE_INTERVAL`] and [`KEYFRAME_TIME_INTERVAL_MS`] have elapsed since the
+    /// last indexed keyframe (`SessionRecording.js` lines 496–497).
+    ///
+    /// This is a hint for the encoder side only; it never affects the index or
+    /// [`Self::seek_keyframe`].
+    #[must_use]
+    pub fn keyframe_hint_due(&self, timestamp_ms: u64) -> bool {
+        if self.keyframes.is_empty() {
+            return true;
+        }
+        let bytes_since = (self.buffer.len() as u64).saturating_sub(self.last_keyframe_byte_offset);
+        let millis_since = timestamp_ms.saturating_sub(self.last_keyframe_timestamp_ms);
+        bytes_since >= KEYFRAME_BYTE_INTERVAL && millis_since >= KEYFRAME_TIME_INTERVAL_MS
     }
 
     /// Returns the indexed keyframes accumulated so far.
@@ -289,6 +307,9 @@ impl OdrecWriter {
 
     /// Finds the nearest keyframe at or before `target_timestamp_ms` using binary search
     /// (`O(log n)`), enabling instant timeline scrubbing (`SessionRecording.js`).
+    ///
+    /// Every entry returned was explicitly flagged [`RecordFlags::KEYFRAME`] by the producer,
+    /// so decoding can start at it without any earlier record.
     #[must_use]
     pub fn seek_keyframe(&self, target_timestamp_ms: u64) -> Option<KeyframeIndexEntry> {
         if self.keyframes.is_empty() {
@@ -623,6 +644,97 @@ mod tests {
         let records = parsed.unwrap_or_default();
         assert_eq!(records.len(), 6);
         assert_eq!(records[0], meta);
+    }
+
+    fn frame(flags: RecordFlags, timestamp_ms: u64, len: usize) -> OdrecRecord {
+        OdrecRecord {
+            record_type: RecordType::FrameData,
+            flags,
+            timestamp_ms,
+            payload: Bytes::from(vec![0x5A; len]),
+        }
+    }
+
+    /// Issue #29 `lib.rs:264`: elapsed time or bytes never make a delta frame seekable. Only
+    /// records explicitly flagged `KEYFRAME` enter the index; the intervals are a hint only.
+    #[test]
+    fn delta_frames_are_never_indexed_as_keyframes() {
+        let mut writer = OdrecWriter::new();
+        assert!(
+            writer.keyframe_hint_due(0),
+            "no keyframe yet: hint must be due"
+        );
+
+        // A delta frame that is the first frame must not be indexed just because it is first.
+        assert!(writer.append(&frame(RecordFlags::NONE, 0, 64)).is_ok());
+        assert_eq!(writer.keyframes(), []);
+        assert_eq!(writer.seek_keyframe(0), None);
+
+        assert!(
+            writer
+                .append(&frame(RecordFlags::KEYFRAME, 1_000, 64))
+                .is_ok()
+        );
+        assert_eq!(writer.keyframes().len(), 1);
+        assert!(!writer.keyframe_hint_due(1_000));
+
+        // Far beyond both intervals, a delta frame is still a delta frame.
+        let big_delta_len = usize::try_from(KEYFRAME_BYTE_INTERVAL).unwrap() * 2;
+        let late_ts = 1_000 + KEYFRAME_TIME_INTERVAL_MS * 4;
+        assert!(
+            writer
+                .append(&frame(RecordFlags::NONE, late_ts, big_delta_len))
+                .is_ok()
+        );
+        assert!(
+            writer
+                .append(&frame(RecordFlags::NONE, late_ts + 1_000, 64))
+                .is_ok()
+        );
+
+        assert_eq!(writer.keyframes().len(), 1);
+        let seek = writer.seek_keyframe(late_ts + 1_000).unwrap();
+        assert_eq!(seek.timestamp_ms, 1_000);
+        assert_eq!(seek.record_index, 1);
+        let records = parse_odrec_stream(writer.as_bytes()).unwrap();
+        assert!(
+            records[seek.record_index]
+                .flags
+                .contains(RecordFlags::KEYFRAME)
+        );
+
+        // The producer is told to generate a recovery point; once it does, the index grows.
+        assert!(writer.keyframe_hint_due(late_ts + 2_000));
+        assert!(
+            writer
+                .append(&frame(RecordFlags::KEYFRAME, late_ts + 2_000, 64))
+                .is_ok()
+        );
+        assert_eq!(writer.keyframes().len(), 2);
+        assert_eq!(
+            writer
+                .seek_keyframe(late_ts + 2_500)
+                .map(|k| k.record_index),
+            Some(4)
+        );
+    }
+
+    /// Companion to issue #29 `recording-player.ts:57`: the Rust parser rejects a trailing
+    /// partial header (1–15 bytes after the last complete record) instead of ignoring it.
+    #[test]
+    fn parse_odrec_stream_rejects_trailing_partial_header() {
+        let mut writer = OdrecWriter::new();
+        assert!(writer.append(&frame(RecordFlags::KEYFRAME, 0, 8)).is_ok());
+        let mut bytes = writer.as_bytes().to_vec();
+        bytes.extend_from_slice(&[0x00, 0x02, 0x00, 0x00, 0x00]);
+
+        assert_eq!(
+            parse_odrec_stream(&bytes),
+            Err(RecordingError::TruncatedRecord {
+                expected: ODREC_HEADER_LEN,
+                actual: 5,
+            })
+        );
     }
 
     #[test]
