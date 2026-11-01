@@ -138,6 +138,21 @@ pub struct Node {
     tasks: Vec<tokio::task::JoinHandle<()>>,
 }
 
+fn quic_endpoint(
+    identity: &DeviceIdentity,
+    socket: &Arc<MagicSocket>,
+) -> Result<quinn::Endpoint, NodeError> {
+    let mut server_config = identity_server_config(identity)?;
+    server_config.transport_config(Arc::new(mesh_transport_config()));
+    let runtime = quinn::default_runtime().ok_or(NodeError::NoRuntime)?;
+    Ok(quinn::Endpoint::new_with_abstract_socket(
+        quinn::EndpointConfig::default(),
+        Some(server_config),
+        Arc::clone(socket) as Arc<dyn quinn::AsyncUdpSocket>,
+        runtime,
+    )?)
+}
+
 impl Node {
     /// Enrolls with the coordinator, connects to the relays and starts the
     /// mesh driver. Returns once enrollment succeeded; relay and direct paths
@@ -243,15 +258,7 @@ impl Node {
             driver_rx,
         )));
 
-        let mut server_config = identity_server_config(&identity)?;
-        server_config.transport_config(Arc::new(mesh_transport_config()));
-        let runtime = quinn::default_runtime().ok_or(NodeError::NoRuntime)?;
-        let endpoint = quinn::Endpoint::new_with_abstract_socket(
-            quinn::EndpointConfig::default(),
-            Some(server_config),
-            Arc::clone(&socket) as Arc<dyn quinn::AsyncUdpSocket>,
-            runtime,
-        )?;
+        let endpoint = quic_endpoint(&identity, &socket)?;
 
         Ok(Self {
             socket,

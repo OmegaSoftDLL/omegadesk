@@ -455,6 +455,33 @@ struct NodeSession<'a> {
 }
 
 impl NodeSession<'_> {
+    async fn lookup_quicksupport(&self, request: control::QuickSupportLookupRequest) -> Result<()> {
+        // A malformed or unknown ID is answered with an empty response
+        // (not an error, which would end the control session).
+        let node = match request.quicksupport_id.parse() {
+            Ok(id) => {
+                let guard = self
+                    .coordinator
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("coordinator mutex poisoned"))?;
+                guard
+                    .lookup_quicksupport(self.node_id, id)?
+                    .map(crate::NodeRecord::to_proto)
+            }
+            Err(_) => None,
+        };
+        let reply = envelope(
+            control::control_envelope::Payload::QuickSupportLookupResponse(
+                control::QuickSupportLookupResponse {
+                    quicksupport_id: request.quicksupport_id,
+                    node,
+                },
+            ),
+        );
+        self.outbound.send(reply).await?;
+        Ok(())
+    }
+
     async fn serve(&self, reader: &mut OwnedReadHalf, rx: &mut NoiseReceiver) -> Result<()> {
         loop {
             let msg = tokio::time::timeout(IDLE_TIMEOUT, read_control(reader, rx))
@@ -525,29 +552,7 @@ impl NodeSession<'_> {
                     log_transitions(&transitions);
                 }
                 Some(control::control_envelope::Payload::QuickSupportLookupRequest(request)) => {
-                    // A malformed or unknown ID is answered with an empty response
-                    // (not an error, which would end the control session).
-                    let node = match request.quicksupport_id.parse() {
-                        Ok(id) => {
-                            let guard = self
-                                .coordinator
-                                .lock()
-                                .map_err(|_| anyhow::anyhow!("coordinator mutex poisoned"))?;
-                            guard
-                                .lookup_quicksupport(self.node_id, id)?
-                                .map(crate::NodeRecord::to_proto)
-                        }
-                        Err(_) => None,
-                    };
-                    let reply = envelope(
-                        control::control_envelope::Payload::QuickSupportLookupResponse(
-                            control::QuickSupportLookupResponse {
-                                quicksupport_id: request.quicksupport_id,
-                                node,
-                            },
-                        ),
-                    );
-                    self.outbound.send(reply).await?;
+                    self.lookup_quicksupport(request).await?;
                 }
                 Some(control::control_envelope::Payload::Error(error)) => {
                     anyhow::bail!("node reported error: {}", error.message);

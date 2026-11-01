@@ -693,6 +693,45 @@ async fn writer_loop(
     let _ = writer.shutdown().await;
 }
 
+async fn forward_netmap_batch(
+    events: &mpsc::Sender<NetmapEvent>,
+    batch: control::NetmapBatch,
+) -> bool {
+    for delta in batch.deltas {
+        let event = match delta.change {
+            Some(control::netmap_delta::Change::PeerUpserted(info)) => {
+                match PeerInfo::from_proto(&info) {
+                    Ok(peer) => NetmapEvent::PeerUpserted(Box::new(peer)),
+                    Err(error) => {
+                        warn!(%error, "ignoring malformed peer in netmap");
+                        continue;
+                    }
+                }
+            }
+            Some(control::netmap_delta::Change::EndpointsUpdated(update)) => {
+                let Ok(signing_key) = <[u8; 32]>::try_from(update.signing_key.as_ref()) else {
+                    continue;
+                };
+                NetmapEvent::EndpointsUpdated {
+                    signing_key,
+                    endpoints: parse_endpoints(&update.endpoints),
+                }
+            }
+            Some(control::netmap_delta::Change::PeerRemoved(key)) => {
+                let Ok(signing_key) = <[u8; 32]>::try_from(key.as_ref()) else {
+                    continue;
+                };
+                NetmapEvent::PeerRemoved { signing_key }
+            }
+            None => continue,
+        };
+        if events.send(event).await.is_err() {
+            return false;
+        }
+    }
+    true
+}
+
 async fn reader_loop(
     mut reader: OwnedReadHalf,
     mut rx: NoiseReceiver,
@@ -715,38 +754,8 @@ async fn reader_loop(
         };
         match msg.payload {
             Some(control::control_envelope::Payload::NetmapBatch(batch)) => {
-                for delta in batch.deltas {
-                    let event = match delta.change {
-                        Some(control::netmap_delta::Change::PeerUpserted(info)) => {
-                            match PeerInfo::from_proto(&info) {
-                                Ok(peer) => NetmapEvent::PeerUpserted(Box::new(peer)),
-                                Err(error) => {
-                                    warn!(%error, "ignoring malformed peer in netmap");
-                                    continue;
-                                }
-                            }
-                        }
-                        Some(control::netmap_delta::Change::EndpointsUpdated(update)) => {
-                            let Ok(signing_key) = <[u8; 32]>::try_from(update.signing_key.as_ref())
-                            else {
-                                continue;
-                            };
-                            NetmapEvent::EndpointsUpdated {
-                                signing_key,
-                                endpoints: parse_endpoints(&update.endpoints),
-                            }
-                        }
-                        Some(control::netmap_delta::Change::PeerRemoved(key)) => {
-                            let Ok(signing_key) = <[u8; 32]>::try_from(key.as_ref()) else {
-                                continue;
-                            };
-                            NetmapEvent::PeerRemoved { signing_key }
-                        }
-                        None => continue,
-                    };
-                    if events.send(event).await.is_err() {
-                        return;
-                    }
+                if !forward_netmap_batch(&events, batch).await {
+                    return;
                 }
             }
             Some(control::control_envelope::Payload::RelayTicketResponse(response)) => {
