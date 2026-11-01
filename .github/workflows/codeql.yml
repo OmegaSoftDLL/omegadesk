@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
   schedule:
     # Weekly, to pick up new queries even when the code does not change.
     - cron: "17 4 * * 1"
