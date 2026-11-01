@@ -10,9 +10,10 @@
 //!   is unavailable (e.g., nested RDP sessions, Hyper-V basic video, or headless GPUs).
 //!
 //! Differences from RustDesk: GDI has no change notification, so a static
-//! desktop is polled at [`POLL_INTERVAL`] within the timeout given by the caller
-//! instead of spinning on `BitBlt`, and the bitmap is deselected from the
-//! memory DC before `GetDIBits`, as the Win32 contract requires.
+//! desktop is polled at most every [`crate::POLL_INTERVAL`] (paced across calls by
+//! [`crate::PollPacer`]) within the timeout given by the caller instead of spinning
+//! on `BitBlt`, and the bitmap is deselected from the memory DC before
+//! `GetDIBits`, as the Win32 contract requires.
 
 #![allow(
     unsafe_code,
@@ -31,14 +32,9 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::core::PCWSTR;
 
-use crate::{CaptureError, Capturer, DisplayBounds, Frame};
+use crate::{CaptureError, Capturer, DisplayBounds, Frame, PollAction, PollPacer};
 
 const BYTES_PER_PIXEL: usize = 4;
-
-/// Interval between `BitBlt` polls while the desktop is unchanged (30 Hz).
-/// GDI cannot signal changes, so this bounds both the CPU cost of a static
-/// screen and the added latency when the screen changes again.
-pub const POLL_INTERVAL: Duration = Duration::from_millis(33);
 
 /// Windows GDI `BitBlt` capturer implementing [`Capturer`], modeled after
 /// RustDesk's `CapturerGDI` (`libs/scrap/src/dxgi/gdi.rs`).
@@ -49,6 +45,7 @@ pub struct GdiCapturer {
     old_obj: HGDIOBJ,
     bounds: DisplayBounds,
     last_frame: Vec<u8>,
+    pacer: PollPacer,
 }
 
 // SAFETY: Each `GdiCapturer` owns its private GDI device contexts (`screen_dc`, `mem_dc`)
@@ -131,6 +128,7 @@ impl GdiCapturer {
             old_obj,
             bounds,
             last_frame: Vec::new(),
+            pacer: PollPacer::new(),
         })
     }
 }
@@ -138,15 +136,20 @@ impl GdiCapturer {
 impl Capturer for GdiCapturer {
     fn next_frame(&mut self, timeout: Duration) -> Result<Option<Frame>, CaptureError> {
         let deadline = Instant::now() + timeout;
+        let mut polled = false;
         loop {
-            if let Some(frame) = self.capture_once()? {
-                return Ok(Some(frame));
+            let now = Instant::now();
+            match self.pacer.plan(now, deadline, polled) {
+                PollAction::Capture => {
+                    self.pacer.mark_polled(now);
+                    polled = true;
+                    if let Some(frame) = self.capture_once()? {
+                        return Ok(Some(frame));
+                    }
+                }
+                PollAction::Wait(wait) => std::thread::sleep(wait),
+                PollAction::Timeout => return Ok(None),
             }
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return Ok(None);
-            }
-            std::thread::sleep(remaining.min(POLL_INTERVAL));
         }
     }
 
