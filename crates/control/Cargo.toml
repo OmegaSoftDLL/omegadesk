@@ -1,0 +1,26 @@
+[package]
+name = "omegadesk-control"
+description = "Node-side client of the OmegaDesk coordinator: Noise IK control channel, enrollment, netmap stream and relay tickets"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+data-encoding.workspace = true
+omegadesk-identity.workspace = true
+omegadesk-noise.workspace = true
+omegadesk-protocol.workspace = true
+omegadesk-relay.workspace = true
+prost.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+omegadesk-server.workspace = true
+
+[lints]
+workspace = true

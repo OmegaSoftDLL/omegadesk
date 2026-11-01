@@ -22,6 +22,8 @@ omegadesk-noise = { path = "crates/noise" }
 omegadesk-tun = { path = "crates/tun" }
 omegadesk-mesh = { path = "crates/mesh" }
 omegadesk-mcp = { path = "crates/mcp" }
+omegadesk-control = { path = "crates/control" }
+omegadesk-magicsock = { path = "crates/magicsock" }
 omegadesk-policy = { path = "crates/policy" }
 omegadesk-rdp = { path = "crates/rdp" }
 omegadesk-recording = { path = "crates/recording" }
@@ -34,7 +36,8 @@ anyhow = "1"
 bytes = "1"
 clap = { version = "4", features = ["derive", "env"] }
 data-encoding = "2"
-ed25519-dalek = { version = "2", features = ["rand_core", "zeroize"] }
+if-addrs = "0.13"
+ed25519-dalek = { version = "2", features = ["rand_core", "zeroize", "pkcs8"] }
 keyring = { version = "3", features = ["apple-native", "windows-native"] }
 openh264 = "0.9"
 prost = "0.13"

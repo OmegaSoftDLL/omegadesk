@@ -904,6 +904,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e17592d60ebacc7d5e169f4663c5f84f9161cc90328abcfe8456f41e4dfcb284"
 
 [[package]]
+name = "if-addrs"
+version = "0.13.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "69b2eeee38fef3aa9b4cc5f1beea8a2444fc00e7377cafae396de3f5c2065e24"
+dependencies = [
+ "libc",
+ "windows-sys 0.59.0",
+]
+
+[[package]]
 name = "indexmap"
 version = "2.14.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1588,8 +1598,10 @@ dependencies = [
  "clap",
  "omegadesk-capture",
  "omegadesk-codec",
+ "omegadesk-control",
  "omegadesk-identity",
  "omegadesk-input",
+ "omegadesk-magicsock",
  "omegadesk-protocol",
  "omegadesk-transport",
  "rand_core 0.6.4",
@@ -1615,8 +1627,10 @@ dependencies = [
  "anyhow",
  "clap",
  "omegadesk-codec",
+ "omegadesk-control",
  "omegadesk-identity",
  "omegadesk-input",
+ "omegadesk-magicsock",
  "omegadesk-protocol",
  "omegadesk-transport",
  "softbuffer",
@@ -1634,6 +1648,22 @@ dependencies = [
  "openh264",
  "thiserror 2.0.21",
  "windows",
+]
+
+[[package]]
+name = "omegadesk-control"
+version = "0.1.0"
+dependencies = [
+ "data-encoding",
+ "omegadesk-identity",
+ "omegadesk-noise",
+ "omegadesk-protocol",
+ "omegadesk-relay",
+ "omegadesk-server",
+ "prost",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -1665,6 +1695,27 @@ dependencies = [
  "omegadesk-protocol",
  "thiserror 2.0.21",
  "windows",
+]
+
+[[package]]
+name = "omegadesk-magicsock"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "data-encoding",
+ "if-addrs",
+ "omegadesk-control",
+ "omegadesk-identity",
+ "omegadesk-mesh",
+ "omegadesk-relay",
+ "omegadesk-server",
+ "omegadesk-transport",
+ "omegadesk-tun",
+ "quinn",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -1818,6 +1869,7 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "data-encoding",
+ "omegadesk-identity",
  "omegadesk-protocol",
  "quinn",
  "rcgen",
