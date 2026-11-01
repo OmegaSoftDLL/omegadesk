@@ -1552,10 +1552,10 @@ mod tests {
             panic!("expected ScriptResults");
         };
         let rendered = render_results(&results, 2_000);
-        assert!(rendered.contains("run 9 s on srv-01"), "{rendered}");
-        assert!(rendered.contains("exit 2 in 42 ms"), "{rendered}");
-        assert!(rendered.contains("  | line2"), "{rendered}");
-        assert!(rendered.contains("  ! oops"), "{rendered}");
+        assert!(rendered.contains("run 9 s on srv-01"));
+        assert!(rendered.contains("exit 2 in 42 ms"));
+        assert!(rendered.contains("  | line2"));
+        assert!(rendered.contains("  ! oops"));
 
         assert_eq!(format_age(2_000, 0), "-");
         assert_eq!(format_age(2_000, 1_990), "10s");
