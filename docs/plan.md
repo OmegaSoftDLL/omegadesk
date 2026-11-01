@@ -253,6 +253,7 @@ Each phase ends with something that runs and can be demoed.
 Status legend:
 
 - ✅ implemented, wired into a binary and verified;
+- 🔶 implemented, field validation pending;
 - 🧩 library code exists but is not wired into any binary, or has the known defects listed below;
 - ⬜ not started.
 

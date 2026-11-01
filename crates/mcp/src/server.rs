@@ -201,6 +201,7 @@ struct ConfirmationState {
     device: String,
     arguments: BTreeMap<String, String>,
     expires_unix_secs: u64,
+    nonce: [u8; 16],
 }
 
 fn risk_name(level: RiskLevel) -> &'static str {
@@ -260,6 +261,7 @@ pub struct OmegaDeskMcpServer {
     options: ServerOptions,
     local_device: DeviceId,
     state_key: ring::hmac::Key,
+    used_nonces: Mutex<BTreeMap<[u8; 16], u64>>,
     started_at: Instant,
 }
 
@@ -298,6 +300,7 @@ impl OmegaDeskMcpServer {
             options,
             local_device,
             state_key,
+            used_nonces: Mutex::new(BTreeMap::new()),
             started_at: Instant::now(),
         })
     }
@@ -346,6 +349,16 @@ impl OmegaDeskMcpServer {
         ring::hmac::verify(&self.state_key, &payload, &tag).ok()?;
         let state: ConfirmationState = serde_json::from_slice(&payload).ok()?;
         (now_ms() / 1000 <= state.expires_unix_secs).then_some(state)
+    }
+
+    fn consume_nonce(&self, state: &ConfirmationState) -> bool {
+        let now = now_ms() / 1000;
+        let mut used = self
+            .used_nonces
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        used.retain(|_, expires| *expires >= now);
+        used.insert(state.nonce, state.expires_unix_secs).is_none()
     }
 
     fn confirmation_message(
@@ -462,6 +475,11 @@ impl OmegaDeskMcpServer {
                     "confirmation state does not match this action",
                 )));
             }
+            if !self.consume_nonce(&sealed_state) {
+                return Ok(Gate::Refused(refused(
+                    "confirmation state was already used; request a new operator approval",
+                )));
+            }
             let approved = Self::answer_from_responses(responses).unwrap_or(false);
             return Ok(self.record(device.id, tool, arguments, approved));
         }
@@ -483,11 +501,15 @@ impl OmegaDeskMcpServer {
                 CONFIRMATION_KEY.to_owned(),
                 InputRequest::Elicitation(request),
             );
+            let mut nonce = [0u8; 16];
+            ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut nonce)
+                .map_err(|error| ErrorData::internal_error(error.to_string(), None))?;
             let state = self.seal_state(&ConfirmationState {
                 tool: tool.to_owned(),
                 device: device.record.id.clone(),
                 arguments: arguments.clone(),
                 expires_unix_secs: now_ms() / 1000 + self.options.confirmation_timeout.as_secs(),
+                nonce,
             })?;
             return Ok(Gate::AskOperator(CallToolResponse::InputRequired(
                 InputRequiredResult::new(Some(requests), Some(state)),
@@ -758,5 +780,36 @@ impl ServerHandler for OmegaDeskMcpServer {
                  are only executed after the human operator approves them through this MCP \
                  host; emergency_stop halts everything until the server is restarted.",
             )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::directory::LocalOnlyDirectory;
+    use omegadesk_identity::DeviceIdentity;
+
+    #[test]
+    fn confirmation_nonces_are_single_use() {
+        let identity = DeviceIdentity::generate();
+        let server = OmegaDeskMcpServer::new(
+            McpTrustEngine::new(),
+            Arc::new(LocalOnlyDirectory::new(&identity, "test")),
+            Arc::new(SessionLauncher::new(
+                std::path::PathBuf::from("client"),
+                None,
+            )),
+            ServerOptions::default(),
+        )
+        .unwrap();
+        let state = ConfirmationState {
+            tool: "run_script".to_owned(),
+            device: "device".to_owned(),
+            arguments: BTreeMap::new(),
+            expires_unix_secs: u64::MAX,
+            nonce: [42; 16],
+        };
+        assert!(server.consume_nonce(&state));
+        assert!(!server.consume_nonce(&state));
     }
 }

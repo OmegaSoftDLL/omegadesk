@@ -39,8 +39,8 @@ Licenses verified against each repository's files on 2026-10-24.
 
 ## Crate dependencies added for Phase 7
 
-These crates.io dependencies were added to make Phase 7 real (all MIT or Apache-2.0,
-enforced by `cargo deny`):
+These crates.io dependencies were added to make Phase 7 real (all use licenses
+accepted by `cargo deny`):
 
 | Crate | Role | License |
 |---|---|---|

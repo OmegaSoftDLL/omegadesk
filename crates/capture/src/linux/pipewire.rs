@@ -272,29 +272,27 @@ fn run_capture(
     stop: &Arc<AtomicBool>,
     ready: &std::sync::mpsc::Sender<Ready>,
 ) {
-    let portal = {
-        let runtime = match tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-        {
-            Ok(runtime) => runtime,
-            Err(error) => {
-                let _ = ready.send(Err(CaptureError::Os(format!("tokio runtime: {error}"))));
-                return;
-            }
-        };
-        match runtime.block_on(async {
-            tokio::time::timeout(NEGOTIATION_TIMEOUT, negotiate_portal(index)).await
-        }) {
-            Ok(Ok(portal)) => portal,
-            Ok(Err(error)) => {
-                let _ = ready.send(Err(error));
-                return;
-            }
-            Err(_) => {
-                let _ = ready.send(Err(CaptureError::AccessLost));
-                return;
-            }
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            let _ = ready.send(Err(CaptureError::Os(format!("tokio runtime: {error}"))));
+            return;
+        }
+    };
+    let portal = match runtime.block_on(async {
+        tokio::time::timeout(NEGOTIATION_TIMEOUT, negotiate_portal(index)).await
+    }) {
+        Ok(Ok(portal)) => portal,
+        Ok(Err(error)) => {
+            let _ = ready.send(Err(error));
+            return;
+        }
+        Err(_) => {
+            let _ = ready.send(Err(CaptureError::AccessLost));
+            return;
         }
     };
 
@@ -335,6 +333,13 @@ fn run_capture(
                     if let Some(ready) = data.ready.take() {
                         let _ =
                             ready.send(Err(CaptureError::Os(format!("stream error: {message}"))));
+                    }
+                } else if old == pw::stream::StreamState::Streaming
+                    && new == pw::stream::StreamState::Unconnected
+                {
+                    data.slot.close("stream disconnected".to_owned());
+                    if let Some(ready) = data.ready.take() {
+                        let _ = ready.send(Err(CaptureError::AccessLost));
                     }
                 }
             })

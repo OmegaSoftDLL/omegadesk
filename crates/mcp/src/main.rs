@@ -105,8 +105,7 @@ async fn main() -> anyhow::Result<()> {
     policy
         .blocked_tools
         .extend(args.blocked_tools.iter().cloned());
-    let mut trust = McpTrustEngine::new();
-    trust.set_device_policy(identity.id(), policy);
+    let trust = McpTrustEngine::with_default_policy(policy);
 
     // Mesh mode keeps the node alive for the whole run.
     let mut mesh_node: Option<Arc<Node>> = None;

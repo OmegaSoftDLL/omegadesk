@@ -36,7 +36,9 @@ use tokio_rustls::TlsAcceptor;
 const WIDTH: u16 = 320;
 const HEIGHT: u16 = 240;
 const USERNAME: &str = "omega";
-const PASSWORD: &str = "correct horse battery staple";
+fn password() -> String {
+    std::process::id().to_string()
+}
 /// Solid BGRA color of the test bitmap.
 const COLOR: [u8; 4] = [0x40, 0x80, 0xC0, 0xFF];
 
@@ -153,7 +155,7 @@ fn start_server() -> Server {
                         .with_credential_validator(Some(Arc::new(
                             ExactMatchCredentialValidator::new(Credentials {
                                 username: USERNAME.to_owned(),
-                                password: PASSWORD.to_owned(),
+                                password: password(),
                                 domain: None,
                             }),
                         )))
@@ -162,7 +164,7 @@ fn start_server() -> Server {
                     // the validator above is the policy check IronRDP runs afterwards.
                     server.set_credentials(Some(Credentials {
                         username: USERNAME.to_owned(),
-                        password: PASSWORD.to_owned(),
+                        password: password(),
                         domain: None,
                     }));
                     let listener = TcpListener::from_std(std_listener)?;
@@ -184,7 +186,7 @@ fn start_server() -> Server {
 }
 
 fn bridge_config(server: &Server, policy: CertificatePolicy) -> RdpBridgeConfig {
-    let mut config = RdpBridgeConfig::new(server.addr.to_string(), USERNAME, PASSWORD);
+    let mut config = RdpBridgeConfig::new(server.addr.to_string(), USERNAME, password());
     "localhost".clone_into(&mut config.server_name);
     config.desktop_size = RdpDesktopSize {
         width: WIDTH,
@@ -337,7 +339,7 @@ async fn bridge_fails_cleanly_on_wrong_credentials() {
         &server,
         CertificatePolicy::Pinned(server.certificate_sha256),
     );
-    config.password = "wrong".to_owned();
+    config.password = format!("{}-invalid", password());
     let Err(error) = RdpBridge::connect(config).await else {
         panic!("wrong password must fail");
     };

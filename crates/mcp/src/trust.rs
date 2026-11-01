@@ -227,6 +227,15 @@ impl McpTrustEngine {
         Self::default()
     }
 
+    /// Creates a trust engine whose policy applies to every device without an override.
+    #[must_use]
+    pub fn with_default_policy(policy: TrustPolicy) -> Self {
+        Self {
+            default_policy: policy,
+            ..Self::default()
+        }
+    }
+
     /// Assigns a custom [`TrustPolicy`] to `device_id`.
     pub fn set_device_policy(&mut self, device_id: DeviceId, policy: TrustPolicy) {
         self.device_policies.insert(device_id, policy);
@@ -502,6 +511,30 @@ mod tests {
             engine
                 .authorize_tool_call(other, "read_file", &HashMap::new(), false, 200)
                 .is_ok()
+        );
+    }
+
+    #[test]
+    fn default_policy_applies_to_remote_devices_without_overrides() {
+        let remote = DeviceIdentity::generate().id();
+        let mut policy = TrustPolicy {
+            confirm_medium: false,
+            ..TrustPolicy::default()
+        };
+        policy.blocked_tools = vec!["stop_session".to_owned()];
+        let engine = McpTrustEngine::with_default_policy(policy);
+
+        assert_eq!(
+            engine
+                .assess_risk(remote, "start_session", &HashMap::new())
+                .recommendation,
+            TrustRecommendation::Proceed
+        );
+        assert_eq!(
+            engine
+                .assess_risk(remote, "stop_session", &HashMap::new())
+                .recommendation,
+            TrustRecommendation::Block
         );
     }
 }

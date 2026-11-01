@@ -146,8 +146,7 @@ impl SessionLauncher {
     }
 
     /// Command line (program and arguments) used to connect to `device`; the access
-    /// password travels in the `OMEGADESK_PASSWORD` environment variable, never in the
-    /// argument list.
+    /// password and pre-authorized key travel in environment variables, never in argv.
     ///
     /// # Errors
     ///
@@ -168,8 +167,6 @@ impl SessionLauncher {
             mesh.server.clone(),
             "--server-key".to_owned(),
             mesh.server_key.clone(),
-            "--preauth-key".to_owned(),
-            mesh.preauth_key.clone(),
         ];
         if mesh.relay_only {
             args.push("--relay-only".to_owned());
@@ -196,9 +193,14 @@ impl SessionLauncher {
         let (program, args) = command_line
             .split_first()
             .ok_or_else(|| SessionError::NoMesh(device.record.fqdn.clone()))?;
+        let mesh = self
+            .mesh
+            .as_ref()
+            .ok_or_else(|| SessionError::NoMesh(device.record.fqdn.clone()))?;
         let child = Command::new(OsStr::new(program))
             .args(args)
             .env("OMEGADESK_PASSWORD", password)
+            .env("OMEGADESK_PREAUTH_KEY", &mesh.preauth_key)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -339,6 +341,40 @@ where
     Ok((String::from_utf8_lossy(&output).into_owned(), truncated))
 }
 
+#[cfg(unix)]
+async fn terminate_process_group(child: &mut Child) -> std::io::Result<()> {
+    if let Some(pid) = child.id() {
+        // The process group can already be gone; both outcomes close the script's pipes.
+        let _ = Command::new("kill")
+            .arg("-KILL")
+            .arg(format!("-{pid}"))
+            .status()
+            .await?;
+    } else {
+        child.start_kill()?;
+    }
+    let _ = child.wait().await?;
+    Ok(())
+}
+
+#[cfg(windows)]
+async fn terminate_process_group(child: &mut Child) -> std::io::Result<()> {
+    if let Some(pid) = child.id() {
+        // `taskkill` also reports an already-exited process as an error, which is harmless.
+        let _ = Command::new("taskkill")
+            .arg("/PID")
+            .arg(pid.to_string())
+            .arg("/T")
+            .arg("/F")
+            .status()
+            .await?;
+    } else {
+        child.start_kill()?;
+    }
+    let _ = child.wait().await?;
+    Ok(())
+}
+
 impl ScriptRunner {
     /// Shell used to run scripts on this platform.
     #[must_use]
@@ -350,12 +386,12 @@ impl ScriptRunner {
         }
     }
 
-    /// Runs `command` through the platform shell, killing it at `timeout`
-    /// (clamped to [`Self::max_timeout`]).
+    /// Runs `command` through the platform shell, killing its whole process group or tree at
+    /// `timeout` (clamped to [`Self::max_timeout`]).
     ///
     /// # Errors
     ///
-    /// Returns the I/O error when the shell cannot be spawned or its output cannot be read.
+    /// Returns the I/O error when the shell cannot be spawned, signalled or read.
     pub async fn run(
         &self,
         command: &str,
@@ -365,14 +401,17 @@ impl ScriptRunner {
             .unwrap_or(self.default_timeout)
             .min(self.max_timeout);
         let (shell, shell_args) = Self::shell();
-        let mut child = Command::new(shell)
+        let mut process = Command::new(shell);
+        process
             .args(shell_args)
             .arg(command)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()?;
+            .kill_on_drop(true);
+        #[cfg(unix)]
+        process.process_group(0);
+        let mut child = process.spawn()?;
         let stdout = child
             .stdout
             .take()
@@ -384,41 +423,29 @@ impl ScriptRunner {
         let stdout_task = tokio::spawn(read_bounded(stdout, self.max_output_bytes));
         let stderr_task = tokio::spawn(read_bounded(stderr, self.max_output_bytes));
         let started = Instant::now();
-        let output = tokio::time::timeout(timeout, async {
-            let status = child.wait().await?;
-            let stdout = stdout_task
-                .await
-                .map_err(|error| std::io::Error::other(format!("stdout reader: {error}")))??;
-            let stderr = stderr_task
-                .await
-                .map_err(|error| std::io::Error::other(format!("stderr reader: {error}")))??;
-            Ok::<_, std::io::Error>((status, stdout, stderr))
-        })
-        .await;
+        let status = tokio::time::timeout(timeout, child.wait()).await;
+        let timed_out = status.is_err();
+        terminate_process_group(&mut child).await?;
+        let status = match status {
+            Ok(status) => Some(status?),
+            Err(_) => None,
+        };
+        let (stdout, stdout_truncated) = stdout_task
+            .await
+            .map_err(|error| std::io::Error::other(format!("stdout reader: {error}")))??;
+        let (stderr, stderr_truncated) = stderr_task
+            .await
+            .map_err(|error| std::io::Error::other(format!("stderr reader: {error}")))??;
         let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-        match output {
-            Ok(output) => {
-                let (status, (stdout, stdout_truncated), (stderr, stderr_truncated)) = output?;
-                Ok(ScriptOutcome {
-                    exit_code: status.code(),
-                    timed_out: false,
-                    duration_ms,
-                    stdout,
-                    stderr,
-                    stdout_truncated,
-                    stderr_truncated,
-                })
-            }
-            Err(_) => Ok(ScriptOutcome {
-                exit_code: None,
-                timed_out: true,
-                duration_ms,
-                stdout: String::new(),
-                stderr: String::new(),
-                stdout_truncated: false,
-                stderr_truncated: false,
-            }),
-        }
+        Ok(ScriptOutcome {
+            exit_code: status.and_then(|status| status.code()),
+            timed_out,
+            duration_ms,
+            stdout,
+            stderr,
+            stdout_truncated,
+            stderr_truncated,
+        })
     }
 }
 
@@ -463,6 +490,8 @@ mod tests {
         assert!(line.contains(&"--relay-only".to_owned()));
         assert!(line.contains(&"--view-only".to_owned()));
         assert!(line.iter().all(|arg| !arg.contains("password")));
+        assert!(line.iter().all(|arg| !arg.contains("preauth")));
+        assert!(line.iter().all(|arg| !arg.contains("odk_x_y")));
 
         let offline = SessionLauncher::new(PathBuf::from("omegadesk-client"), None);
         assert!(matches!(
@@ -498,5 +527,25 @@ mod tests {
         assert!(outcome.timed_out);
         assert_eq!(outcome.exit_code, None);
         assert!(outcome.duration_ms < 5_000);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timeout_kills_descendants_and_preserves_bounded_partial_output() {
+        let runner = ScriptRunner {
+            default_timeout: Duration::from_secs(10),
+            max_timeout: Duration::from_secs(10),
+            max_output_bytes: 64,
+        };
+        let outcome = runner
+            .run(
+                "printf mcp-before; sleep 30 & wait",
+                Some(Duration::from_millis(200)),
+            )
+            .await
+            .unwrap();
+        assert!(outcome.timed_out);
+        assert!(outcome.stdout.contains("mcp-before"));
+        assert!(!outcome.stdout_truncated);
     }
 }

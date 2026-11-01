@@ -79,6 +79,8 @@ jobs:
       - name: Test (Windows and macOS)
         if: matrix.os != 'ubuntu-latest'
         run: cargo test --workspace --all-features --locked
+      - name: Agent starts on every platform
+        run: cargo run -p omegadesk-agent --locked -- --help
 
   web:
     name: Browser client

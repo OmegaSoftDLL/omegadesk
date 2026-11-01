@@ -282,6 +282,14 @@ impl NetworkClient for NoKdcNetworkClient {
     }
 }
 
+#[derive(Debug)]
+struct RawFrame {
+    width: u32,
+    height: u32,
+    rgba: Vec<u8>,
+    captured_at: Instant,
+}
+
 /// Latest decoded frame shared between the session task and the capturer.
 #[derive(Debug, Default)]
 struct FrameSlot {
@@ -291,7 +299,7 @@ struct FrameSlot {
 
 #[derive(Debug, Default)]
 struct SlotState {
-    frame: Option<Frame>,
+    frame: Option<RawFrame>,
     size: (u32, u32),
     closed: Option<String>,
 }
@@ -305,27 +313,13 @@ impl FrameSlot {
         self.lock().size = (u32::from(width), u32::from(height));
     }
 
-    /// Converts the RGBA framebuffer to the BGRA [`Frame`] the capture pipeline expects
-    /// and replaces any frame the capturer has not consumed yet (latest frame wins, like
-    /// the client's presentation queue).
+    /// Publishes only the newest raw frame; RGBA conversion happens on the capture thread.
     fn publish(&self, image: &DecodedImage) {
-        let source = image.data();
-        let mut bgra = vec![0u8; source.len()];
-        let (dst_pixels, _) = bgra.as_chunks_mut::<4>();
-        let (src_pixels, _) = source.as_chunks::<4>();
-        for (dst, src) in dst_pixels.iter_mut().zip(src_pixels) {
-            dst[0] = src[2];
-            dst[1] = src[1];
-            dst[2] = src[0];
-            dst[3] = 0xFF;
-        }
-        let frame = Frame {
+        let frame = RawFrame {
             width: u32::from(image.width()),
             height: u32::from(image.height()),
-            bgra,
+            rgba: image.data().to_vec(),
             captured_at: Instant::now(),
-            #[cfg(windows)]
-            gpu_texture: None,
         };
         let mut state = self.lock();
         state.size = (frame.width, frame.height);
@@ -347,13 +341,36 @@ pub struct RdpBridgeCapturer {
     slot: Arc<FrameSlot>,
 }
 
+impl RdpBridgeCapturer {
+    fn into_frame(raw: &RawFrame) -> Frame {
+        let mut bgra = vec![0u8; raw.rgba.len()];
+        let (dst_pixels, _) = bgra.as_chunks_mut::<4>();
+        let (src_pixels, _) = raw.rgba.as_chunks::<4>();
+        for (dst, src) in dst_pixels.iter_mut().zip(src_pixels) {
+            dst[0] = src[2];
+            dst[1] = src[1];
+            dst[2] = src[0];
+            dst[3] = 0xFF;
+        }
+        Frame {
+            width: raw.width,
+            height: raw.height,
+            bgra,
+            captured_at: raw.captured_at,
+            #[cfg(windows)]
+            gpu_texture: None,
+        }
+    }
+}
+
 impl Capturer for RdpBridgeCapturer {
     fn next_frame(&mut self, timeout: Duration) -> Result<Option<Frame>, CaptureError> {
         let deadline = Instant::now() + timeout;
         let mut state = self.slot.lock();
         loop {
             if let Some(frame) = state.frame.take() {
-                return Ok(Some(frame));
+                drop(state);
+                return Ok(Some(Self::into_frame(&frame)));
             }
             if let Some(reason) = &state.closed {
                 return Err(CaptureError::Os(format!("RDP bridge: {reason}")));
@@ -760,27 +777,32 @@ async fn reactivate(
 mod tests {
     use super::*;
 
+    fn test_password() -> String {
+        std::process::id().to_string()
+    }
+
     #[test]
     fn config_defaults_derive_the_server_name_from_the_destination() {
-        let config = RdpBridgeConfig::new("office-pc.omega:3389", "alice", "pw");
+        let password = test_password();
+        let config = RdpBridgeConfig::new("office-pc.omega:3389", "alice", password.clone());
         assert_eq!(config.server_name, "office-pc.omega");
         assert_eq!(
-            RdpBridgeConfig::new("[fd7a::1]:3389", "a", "b").server_name,
+            RdpBridgeConfig::new("[fd7a::1]:3389", "a", test_password()).server_name,
             "fd7a::1"
         );
         assert_eq!(
-            RdpBridgeConfig::new("10.0.0.5", "a", "b").server_name,
+            RdpBridgeConfig::new("10.0.0.5", "a", test_password()).server_name,
             "10.0.0.5"
         );
         assert!(config.validate().is_ok());
         let debug = format!("{config:?}");
-        assert!(!debug.contains("pw"));
+        assert!(!debug.contains(&password));
         assert!(debug.contains("<redacted>"));
     }
 
     #[test]
     fn config_rejects_desktop_sizes_outside_the_rdpedisp_range() {
-        let mut config = RdpBridgeConfig::new("h:3389", "a", "b");
+        let mut config = RdpBridgeConfig::new("h:3389", "a", test_password());
         config.desktop_size = RdpDesktopSize {
             width: 199,
             height: 800,
