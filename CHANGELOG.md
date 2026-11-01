@@ -6,6 +6,7 @@ All notable changes to OmegaDesk are documented here. The format follows [Keep a
 
 ### Added
 
+- Per-Monitor V2 DPI awareness (`SetProcessDpiAwarenessContext`), `CapsLock`/`NumLock` toggle state synchronization, `Ctrl+Alt+Del` (`SendSAS` / `Ctrl+Alt+End` shortcut), Windows URO (UDP Receive Segment Coalescing) kill switch in `omegadesk-transport`, Windows low-level keyboard hook (`WH_KEYBOARD_LL`) for `Alt+Tab`/`Alt+Esc`/`LWin`/`RWin`, `AltGr` synthetic `ControlLeft` suppression, fractional scroll accumulation (`ScrollAccumulator`), and aspect-ratio preserving bilinear scaling in `omegadesk-client`.
 - Zero-copy D3D11 GPU encoding path in `omegadesk-codec` (`ID3D11VideoProcessor` BGRA→NV12 + `MFCreateDXGISurfaceBuffer` + `IMFDXGIDeviceManager`).
 - Hardware cursor capture and compositing (`MONOCHROME`, `COLOR`, `MASKED_COLOR`) and rotated monitor support (`90°`, `180°`, `270°`) in `omegadesk-capture`.
 - Hardware H.264 encoding through Media Foundation (Intel Quick Sync, NVIDIA NVENC, AMD AMF), with automatic fallback to OpenH264. Measured 60 fps and 24.5 ms end-to-end latency at 1080p.

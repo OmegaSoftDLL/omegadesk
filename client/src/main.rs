@@ -12,6 +12,7 @@
 mod keymap;
 mod network;
 mod stats;
+mod win_hook;
 mod window;
 
 use std::net::SocketAddr;
@@ -48,6 +49,7 @@ fn main() -> anyhow::Result<()> {
         )
         .init();
     let args = Args::parse();
+    win_hook::enable_dpi_awareness();
 
     let event_loop = EventLoop::<window::UserEvent>::with_user_event()
         .build()

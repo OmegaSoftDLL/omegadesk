@@ -1622,6 +1622,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "windows",
  "winit",
 ]
 
@@ -1682,6 +1683,8 @@ dependencies = [
  "sha2",
  "thiserror 2.0.21",
  "tokio",
+ "tracing",
+ "windows",
 ]
 
 [[package]]

@@ -7,6 +7,7 @@
 //! and the coordination server.
 
 mod pinned;
+mod uro;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -20,6 +21,7 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use sha2::{Digest, Sha256};
 
 pub use quinn::{Connection, Endpoint, RecvStream, SendStream};
+pub use uro::is_broken as is_uro_disabled;
 
 /// Application-Layer Protocol Negotiation identifier.
 pub const ALPN: &[u8] = b"omegadesk/1";
@@ -136,7 +138,19 @@ pub fn server_endpoint(bind: SocketAddr) -> Result<(Endpoint, String), Transport
     let mut config = quinn::ServerConfig::with_crypto(Arc::new(crypto));
     config.transport_config(Arc::new(transport_config()));
 
-    Ok((Endpoint::server(config, bind)?, fingerprint))
+    let std_socket = std::net::UdpSocket::bind(bind)?;
+    let runtime = quinn::default_runtime().ok_or_else(|| {
+        TransportError::Io(std::io::Error::other("no async runtime found for quinn"))
+    })?;
+    let socket = uro::wrap_udp_socket(std_socket, &runtime)?;
+    let endpoint = Endpoint::new_with_abstract_socket(
+        quinn::EndpointConfig::default(),
+        Some(config),
+        socket,
+        runtime,
+    )?;
+
+    Ok((endpoint, fingerprint))
 }
 
 /// Connects to the agent at `address`, accepting only a server certificate
@@ -170,7 +184,17 @@ pub async fn connect(
     } else {
         (std::net::Ipv4Addr::UNSPECIFIED, 0).into()
     };
-    let mut endpoint = Endpoint::client(bind)?;
+    let std_socket = std::net::UdpSocket::bind(bind)?;
+    let runtime = quinn::default_runtime().ok_or_else(|| {
+        TransportError::Io(std::io::Error::other("no async runtime found for quinn"))
+    })?;
+    let socket = uro::wrap_udp_socket(std_socket, &runtime)?;
+    let mut endpoint = Endpoint::new_with_abstract_socket(
+        quinn::EndpointConfig::default(),
+        None,
+        socket,
+        runtime,
+    )?;
     endpoint.set_default_client_config(config);
     let connection = endpoint.connect(address, "omegadesk")?.await?;
     Ok((endpoint, connection))
@@ -187,7 +211,7 @@ pub async fn send_envelope(
 ) -> Result<(), TransportError> {
     let mut buffer = BytesMut::new();
     encode_frame(envelope, &mut buffer)?;
-    stream.write_all(&buffer).await?;
+    stream.write_chunk(buffer.freeze()).await?;
     Ok(())
 }
 

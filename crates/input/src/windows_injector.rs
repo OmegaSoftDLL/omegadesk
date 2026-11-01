@@ -1,38 +1,47 @@
-//! Windows input injection using `SendInput`.
+//! Windows input injection using `SendInput` and `SendSAS`.
 //!
 //! References: `RustDesk` (`src/server/input_service.rs` for releasing stuck
-//! keys and `libs/enigo/src/win/win_impl.rs` for virtual desktop coordinates)
-//! and Apollo (`src/platform/windows/input.cpp` for `VK_PAUSE`).
+//! keys and synchronizing `CapsLock`/`NumLock`, `src/platform/windows.rs` for
+//! `SendSAS`, and `libs/enigo/src/win/win_impl.rs` for virtual desktop
+//! coordinates) and Apollo (`src/platform/windows/input.cpp` for `VK_PAUSE`).
 
-#![allow(unsafe_code, reason = "SendInput is a Win32 API")]
+#![allow(unsafe_code, reason = "SendInput and SendSAS are Win32 APIs")]
 
 use std::collections::BTreeSet;
 
 use omegadesk_protocol::v1::{KeyEvent, PointerEvent};
+use windows::Win32::Foundation::FreeLibrary;
+use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBD_EVENT_FLAGS, KEYBDINPUT,
+    GetKeyState, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBD_EVENT_FLAGS, KEYBDINPUT,
     KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, MOUSE_EVENT_FLAGS,
     MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
     MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN,
     MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL, MOUSEEVENTF_XDOWN,
-    MOUSEEVENTF_XUP, MOUSEINPUT, SendInput, VIRTUAL_KEY, VK_PAUSE,
+    MOUSEEVENTF_XUP, MOUSEINPUT, SendInput, VIRTUAL_KEY, VK_CAPITAL, VK_NUMLOCK, VK_PAUSE,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
 };
+use windows::core::{PCSTR, w};
 
-use crate::{InputError, InputInjector, TargetDisplay, buttons, hid_to_scancode};
+use crate::{
+    INJECTED_MARKER, InputError, InputInjector, TargetDisplay, buttons, hid_to_scancode, modifiers,
+};
 
 /// Win32 `XBUTTON1` and `XBUTTON2` values.
 const XBUTTON1: i32 = 1;
 const XBUTTON2: i32 = 2;
 
-/// USB HID usage code for Pause/Break, which has no single Set 1 scancode.
+/// USB HID usage codes for special keys.
+const HID_CAPS_LOCK: u32 = 0x39;
 const HID_PAUSE: u32 = 0x48;
-
-/// Marks events injected by OmegaDesk so hooks can distinguish them from local
-/// hardware input (matching RustDesk's `enigo` marker).
-const INJECTED_MARKER: usize = 0x4F4D_4547; // "OMEG"
+const HID_DELETE: u32 = 0x4C;
+const HID_NUM_LOCK: u32 = 0x53;
+const HID_LEFT_CTRL: u32 = 0xE0;
+const HID_LEFT_ALT: u32 = 0xE2;
+const HID_RIGHT_CTRL: u32 = 0xE4;
+const HID_RIGHT_ALT: u32 = 0xE6;
 
 #[derive(Debug, Default)]
 pub(crate) struct WindowsInjector {
@@ -147,6 +156,92 @@ impl WindowsInjector {
             ),
         }
     }
+
+    fn is_ctrl_alt_del(&self, event: &KeyEvent) -> bool {
+        if !event.pressed {
+            return false;
+        }
+        if event.modifiers & modifiers::CTRL_ALT_DEL != 0 {
+            return true;
+        }
+        let ctrl = self.pressed_keys.contains(&HID_LEFT_CTRL)
+            || self.pressed_keys.contains(&HID_RIGHT_CTRL)
+            || (event.modifiers & modifiers::CTRL != 0);
+        let alt = self.pressed_keys.contains(&HID_LEFT_ALT)
+            || self.pressed_keys.contains(&HID_RIGHT_ALT)
+            || (event.modifiers & modifiers::ALT != 0);
+        event.hid_usage == HID_DELETE && ctrl && alt
+    }
+}
+
+/// Returns whether a toggle lock key (`VK_CAPITAL` or `VK_NUMLOCK`) is currently toggled on.
+fn is_lock_key_toggled(vk: VIRTUAL_KEY) -> bool {
+    // SAFETY: `GetKeyState` takes a virtual-key code by value and returns a `SHORT`
+    // whose low-order bit indicates the toggle state.
+    let state = unsafe { GetKeyState(i32::from(vk.0)) };
+    (state & 1) != 0
+}
+
+/// Appends a press-and-release sequence for `hid_usage` if the client's desired
+/// lock state (`want_toggled`) differs from the host's current toggle state
+/// (referencing `RustDesk` `src/server/input_service.rs`).
+fn sync_single_lock_key(
+    inputs: &mut Vec<INPUT>,
+    vk: VIRTUAL_KEY,
+    hid_usage: u32,
+    want_toggled: bool,
+) {
+    if is_lock_key_toggled(vk) != want_toggled
+        && let (Some(down), Some(up)) = (keyboard(hid_usage, true), keyboard(hid_usage, false))
+    {
+        inputs.push(down);
+        inputs.push(up);
+    }
+}
+
+/// Synchronizes `CapsLock` and `NumLock` toggle states before injecting a key press
+/// when [`modifiers::LOCK_STATE_VALID`] is set.
+fn sync_lock_keys(inputs: &mut Vec<INPUT>, event: &KeyEvent) {
+    if !event.pressed || (event.modifiers & modifiers::LOCK_STATE_VALID == 0) {
+        return;
+    }
+    if event.hid_usage != HID_CAPS_LOCK {
+        sync_single_lock_key(
+            inputs,
+            VK_CAPITAL,
+            HID_CAPS_LOCK,
+            event.modifiers & modifiers::CAPS_LOCK != 0,
+        );
+    }
+    if event.hid_usage != HID_NUM_LOCK {
+        sync_single_lock_key(
+            inputs,
+            VK_NUMLOCK,
+            HID_NUM_LOCK,
+            event.modifiers & modifiers::NUM_LOCK != 0,
+        );
+    }
+}
+
+/// Invokes `SendSAS(FALSE)` from `sas.dll` to synthesize `Ctrl+Alt+Del` on
+/// Windows (referencing `RustDesk` `src/platform/windows.rs` and `FreeRDP`).
+fn trigger_sas() {
+    type SendSasFn = unsafe extern "system" fn(i32);
+
+    // SAFETY: `w!("sas.dll")` is a static null-terminated UTF-16 string.
+    let Ok(module) = (unsafe { LoadLibraryW(w!("sas.dll")) }) else {
+        return;
+    };
+    // SAFETY: `module` is a valid loaded library handle and `"SendSAS\0"` is null-terminated.
+    let proc = unsafe { GetProcAddress(module, PCSTR(c"SendSAS".as_ptr().cast())) };
+    if let Some(proc) = proc {
+        // SAFETY: `SendSAS` in `sas.dll` has signature `VOID WINAPI SendSAS(BOOL AsUser)`.
+        let send_sas: SendSasFn = unsafe { std::mem::transmute(proc) };
+        // SAFETY: `0` (`FALSE`) requests SAS generation as a service / system application.
+        unsafe { send_sas(0) };
+    }
+    // SAFETY: `module` was returned by `LoadLibraryW` above and is not used afterwards.
+    let _ = unsafe { FreeLibrary(module) };
 }
 
 impl InputInjector for WindowsInjector {
@@ -155,10 +250,15 @@ impl InputInjector for WindowsInjector {
     }
 
     fn key(&mut self, event: &KeyEvent) -> Result<(), InputError> {
-        let Some(input) = keyboard(event.hid_usage, event.pressed) else {
-            return Ok(());
-        };
-        send(&[input])?;
+        if self.is_ctrl_alt_del(event) {
+            trigger_sas();
+        }
+        let mut inputs = Vec::with_capacity(5);
+        sync_lock_keys(&mut inputs, event);
+        if let Some(input) = keyboard(event.hid_usage, event.pressed) {
+            inputs.push(input);
+        }
+        send(&inputs)?;
         if event.pressed {
             self.pressed_keys.insert(event.hid_usage);
         } else {
@@ -246,7 +346,10 @@ impl Drop for WindowsInjector {
 
 #[cfg(test)]
 mod tests {
-    use super::keyboard;
+    use omegadesk_protocol::v1::KeyEvent;
+
+    use super::{HID_DELETE, HID_LEFT_ALT, HID_LEFT_CTRL, WindowsInjector, keyboard};
+    use crate::modifiers;
 
     #[test]
     fn pause_uses_virtual_key() {
@@ -264,5 +367,25 @@ mod tests {
         let key = unsafe { input.Anonymous.ki };
         assert_eq!(key.wScan, 0x1E);
         assert_ne!(key.dwFlags.0 & 0x2, 0, "KEYEVENTF_KEYUP");
+    }
+
+    #[test]
+    fn detects_ctrl_alt_del_by_flag_or_chord() {
+        let mut injector = WindowsInjector::default();
+        assert!(injector.is_ctrl_alt_del(&KeyEvent {
+            hid_usage: HID_DELETE,
+            keysym: 0,
+            pressed: true,
+            modifiers: modifiers::CTRL_ALT_DEL,
+        }));
+
+        injector.pressed_keys.insert(HID_LEFT_CTRL);
+        injector.pressed_keys.insert(HID_LEFT_ALT);
+        assert!(injector.is_ctrl_alt_del(&KeyEvent {
+            hid_usage: HID_DELETE,
+            keysym: 0,
+            pressed: true,
+            modifiers: 0,
+        }));
     }
 }

@@ -488,19 +488,26 @@ impl DxgiCapturer {
         } else {
             &mut self.unrotated_scratch
         };
-        target.clear();
-        target.reserve(total_bytes);
-
         let base = mapped.pData.cast::<u8>().cast_const();
-        for row in 0..self.raw_height as usize {
-            // SAFETY: `Map` succeeded, so `base` points to `raw_height` rows of
-            // `RowPitch` bytes valid until `Unmap` below, and `row < raw_height`.
-            let start = unsafe { base.add(row * pitch) };
-            // SAFETY: the texture has `raw_width` x `raw_height` BGRA pixels
-            // (4 bytes each), so `RowPitch >= row_bytes` and `row_bytes` starting
-            // at `start` lie within the mapped subresource and are copied before `Unmap`.
-            let line = unsafe { std::slice::from_raw_parts(start, row_bytes) };
-            target.extend_from_slice(line);
+        if pitch == row_bytes {
+            target.resize(total_bytes, 0);
+            // SAFETY: `Map` succeeded and `pitch == row_bytes`, so `base` points
+            // to `total_bytes` contiguous BGRA bytes valid until `Unmap` below.
+            let slice = unsafe { std::slice::from_raw_parts(base, total_bytes) };
+            target.copy_from_slice(slice);
+        } else {
+            target.clear();
+            target.reserve(total_bytes);
+            for row in 0..self.raw_height as usize {
+                // SAFETY: `Map` succeeded, so `base` points to `raw_height` rows of
+                // `RowPitch` bytes valid until `Unmap` below, and `row < raw_height`.
+                let start = unsafe { base.add(row * pitch) };
+                // SAFETY: the texture has `raw_width` x `raw_height` BGRA pixels
+                // (4 bytes each), so `RowPitch >= row_bytes` and `row_bytes` starting
+                // at `start` lie within the mapped subresource and are copied before `Unmap`.
+                let line = unsafe { std::slice::from_raw_parts(start, row_bytes) };
+                target.extend_from_slice(line);
+            }
         }
 
         // SAFETY: pairs with the successful `Map` on subresource 0 above, after
@@ -564,7 +571,9 @@ impl Capturer for DxgiCapturer {
             }
 
             let mut bgra = self.last_desktop.clone();
-            blend_cursor(&mut bgra, self.width, self.height, &self.cursor);
+            if self.cursor.visible && self.cursor.shape.is_some() {
+                blend_cursor(&mut bgra, self.width, self.height, &self.cursor);
+            }
 
             let gpu_texture = if self.rotation == Rotation::Identity
                 && let Some(gpu_frame) = self.gpu_frame.clone()
