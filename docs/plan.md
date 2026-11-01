@@ -62,7 +62,7 @@ This plan brings together the code analysis of the 39 reference repositories (li
 | Processing time in every frame header and a latency panel in the client | Sunshine `frame_processing_latency`, Moonlight `ffmpeg.cpp` | Overlay: host, network, decode and render |
 | Quality control: measures delay, lowers bitrate first and then fps | RustDesk `video_qos.rs` | Combined with per-frame acknowledgements (from Selkies) |
 | Detects "looks like video" from the changed area; static content at lossless quality | KasmVNC `EncodeManager.cxx`, Selkies "paint-over" | Sharp text and smooth video |
-| Virtual display at the client's resolution and FPS, stable identity and headless mode | Apollo `virtual_display.cpp` | Our own IddCx driver (SudoVDA is GPL) |
+| Virtual display at the client's resolution and FPS, stable identity and headless mode | Apollo `virtual_display.cpp`, QuickDesk IddCx driver (MIT) | Vendored signed QuickDesk IddCx driver in `drivers/idd` (SudoVDA is GPL) |
 | Low-latency presentation: flip model, tearing allowed, 1 to 3 frame queue | Moonlight `d3d11va.cpp`, `pacer.cpp` | Native client |
 | Opus audio in `RESTRICTED_LOWDELAY` | Sunshine `audio.cpp` | Default |
 
@@ -310,7 +310,7 @@ Phases 2–7 were marked complete on 2026-11-01 by an automated agent; the audit
 
 ### Phase 7: Compatibility and differentiators (ongoing) ⬜
 - 🧩 `crates/rdp`: `RDCleanPath` and `DisplayControl` structures were re-typed from IronRDP with a custom byte encoding instead of IronRDP's DER, so they do not interoperate with Devolutions Gateway; `omegadesk-rdp` does not depend on any `ironrdp-*` crate and there is no RDP client or server.
-- 🧩 `drivers/idd` + `crates/capture/src/virtual_display.rs`: IOCTL constants, EDID synthesis and a placement model. The `.inf` is not installable (no `DDInstall`, service or WDF sections) and there is no driver code; building an IddCx driver needs a WDK project and Microsoft signing.
+- ✅ `drivers/idd`: a real, working IddCx virtual display. The MIT-licensed QuickDesk driver is vendored under `drivers/idd/vendor/` — the kernel driver ships **prebuilt and signed** (`quickdesk_display.dll/.cat/.inf`, not built in CI since it needs the WDK) and `build.rs` compiles the user-mode controller with the normal Windows SDK. `omegadesk-idd` exposes a safe API (`VirtualDisplay::install`/`open`/`is_installed`/`uninstall`, `plug_monitor`, `MonitorHandle::set_mode`/`unplug`) installed via the bundled `nefconw.exe`; Windows-only, with a clear `Unsupported` error elsewhere. Wired into the agent as `--virtual-display <WxH@hz>` (headless hosts) and a `--privacy` mode that blanks the physical monitor, backing the `crates/capture/src/virtual_display.rs` placement model with the driver.
 - 🧩 `crates/mcp`: only QuickDesk's trust policy was ported; there is no MCP server, transport or JSON-RPC.
 - ⬜ Linux (PipeWire/KMS) and macOS (ScreenCaptureKit) capture: only backend-selection enums exist; `open_display` returns `Unsupported` off Windows.
 - 🧩 `crates/mesh/src/peer_routing.rs` (link-state routing, relay certificates) and `VncCongestionController` are libraries with no consumer.

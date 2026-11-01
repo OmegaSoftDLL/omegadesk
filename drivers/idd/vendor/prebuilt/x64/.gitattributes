@@ -1,0 +1,8 @@
+# Prebuilt, signed virtual-display driver payload. These files must be stored
+# byte-for-byte: the catalog (.cat) signs the exact bytes of the .dll and .inf,
+# and any end-of-line normalization would invalidate the signature and stop
+# the driver from loading. Override the repository's `* text=auto eol=lf` rule.
+quickdesk_display.dll binary
+quickdesk_display.cat binary
+nefconw.exe          binary
+quickdesk_display.inf -text

@@ -182,7 +182,7 @@ The full design, from the WireGuard mesh to the web client, is in [docs/plan.md]
 | 4 | Web dashboard and browser client | 🔶 Browser client works end to end through `omegadesk-server --web-listen` (WebSocket gateway on the mesh, WebCodecs H.264, keyboard and mouse, latency readout), verified in-process and in CI; the policy model and connection manager are still library only, no dashboard, no WebTransport, latency against the native client not measured; open findings: [#28](https://github.com/OmegaSoftDLL/omegadesk/issues/28) |
 | 5 | Security, session recording and privileged access | 🧩 Library only: recording, HuJSON policies, MFA, PAM, DLP and vault exist; no handshake consults them; open findings: [#29](https://github.com/OmegaSoftDLL/omegadesk/issues/29) |
 | 6 | Remote monitoring and management (RMM) | 🧩 Library only: in-memory RMM models; the agent reports nothing; open findings: [#30](https://github.com/OmegaSoftDLL/omegadesk/issues/30) |
-| 7 | RDP/VNC compatibility, virtual displays, MCP server, Linux/macOS/mobile | ⬜ Not started in substance: no IronRDP dependency, no driver, no MCP server, no Linux/macOS capture; open findings: [#31](https://github.com/OmegaSoftDLL/omegadesk/issues/31), [#33](https://github.com/OmegaSoftDLL/omegadesk/issues/33) |
+| 7 | RDP/VNC compatibility, virtual displays, MCP server, Linux/macOS/mobile | 🔶 A real IddCx virtual display driver (`drivers/idd`, vendored signed QuickDesk driver) is wired into the agent (`--virtual-display <WxH@hz>`, `--privacy`); still no IronRDP dependency, no MCP server, no Linux/macOS capture; open findings: [#31](https://github.com/OmegaSoftDLL/omegadesk/issues/31), [#33](https://github.com/OmegaSoftDLL/omegadesk/issues/33) |
 
 ## Contributing
 

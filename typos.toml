@@ -9,6 +9,8 @@ extend-exclude = [
     "fuzz/Cargo.lock",
     "fuzz/corpus/**",
     "fuzz/artifacts/**",
+    # Vendored third-party driver kept verbatim (see drivers/idd/vendor/README.md).
+    "drivers/idd/vendor/**",
 ]
 
 [default]

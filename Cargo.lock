@@ -1758,6 +1758,7 @@ dependencies = [
  "omegadesk-capture",
  "omegadesk-codec",
  "omegadesk-control",
+ "omegadesk-idd",
  "omegadesk-identity",
  "omegadesk-input",
  "omegadesk-magicsock",
@@ -1831,7 +1832,10 @@ dependencies = [
 name = "omegadesk-idd"
 version = "0.1.0"
 dependencies = [
+ "cc",
  "thiserror 2.0.21",
+ "tracing",
+ "windows",
 ]
 
 [[package]]
