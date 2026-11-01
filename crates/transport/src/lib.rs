@@ -6,6 +6,7 @@
 //! Phase 2 peer authentication is bound to `omegadesk-identity` device keys
 //! and the coordination server.
 
+pub mod identity_tls;
 mod pinned;
 pub mod race;
 mod uro;
@@ -98,7 +99,26 @@ fn crypto_provider() -> Arc<rustls::crypto::CryptoProvider> {
     Arc::new(rustls::crypto::ring::default_provider())
 }
 
-fn transport_config() -> quinn::TransportConfig {
+/// Largest QUIC datagram sent over the mesh. Every datagram is wrapped in a
+/// 28-byte IPv4/UDP header plus the 76-byte mesh header and tag, and must fit
+/// a 1500-byte path without IP fragmentation; 1200 bytes (RFC 9000 §14.1) is
+/// the standard minimum that also avoids path-MTU probing over relays.
+pub const MESH_QUIC_MTU: u16 = 1200;
+
+/// Transport parameters for QUIC over the mesh socket: the session tuning of
+/// [`transport_config`] with the datagram size pinned to [`MESH_QUIC_MTU`].
+#[must_use]
+pub fn mesh_transport_config() -> quinn::TransportConfig {
+    let mut config = transport_config();
+    config.initial_mtu(MESH_QUIC_MTU);
+    config.min_mtu(MESH_QUIC_MTU);
+    config.mtu_discovery_config(None);
+    config
+}
+
+/// Low-latency transport parameters shared by every OmegaDesk QUIC endpoint.
+#[must_use]
+pub fn transport_config() -> quinn::TransportConfig {
     let mut config = quinn::TransportConfig::default();
     config.keep_alive_interval(Some(Duration::from_secs(2)));
     // Keep Quinn's 30 s default idle timeout so bursty packet loss does not tear down the session.

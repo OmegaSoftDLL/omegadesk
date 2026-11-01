@@ -16,6 +16,7 @@ pub mod vault;
 
 use std::fmt;
 
+use ed25519_dalek::pkcs8::EncodePrivateKey;
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use rand_core::OsRng;
 use sha2::{Digest, Sha256};
@@ -302,6 +303,17 @@ impl DeviceIdentity {
     #[must_use]
     pub fn exchange_secret(&self) -> &StaticSecret {
         &self.exchange
+    }
+
+    /// Ed25519 signing key as PKCS#8 v1 DER (RFC 8410), for TLS stacks that
+    /// derive the node's certificate from its identity. Empty on encoding failure,
+    /// which cannot happen for a valid key.
+    #[must_use]
+    pub fn signing_key_pkcs8_der(&self) -> Zeroizing<Vec<u8>> {
+        self.signing.to_pkcs8_der().map_or_else(
+            |_| Zeroizing::new(Vec::new()),
+            |doc| Zeroizing::new(doc.as_bytes().to_vec()),
+        )
     }
 
     /// Serializes private keys for storage in a [`KeyStore`].

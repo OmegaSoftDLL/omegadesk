@@ -1,0 +1,31 @@
+[package]
+name = "omegadesk-magicsock"
+description = "Mesh socket for OmegaDesk nodes: QUIC over the encrypted mesh with direct NAT traversal and relay fallback"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+data-encoding.workspace = true
+if-addrs.workspace = true
+omegadesk-control.workspace = true
+omegadesk-identity.workspace = true
+omegadesk-mesh.workspace = true
+omegadesk-relay.workspace = true
+omegadesk-transport.workspace = true
+omegadesk-tun.workspace = true
+quinn.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+omegadesk-server.workspace = true
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true

@@ -23,7 +23,7 @@ OmegaDesk is a remote desktop you run on your own infrastructure, as an alternat
 ## Status
 
 > [!WARNING]
-> OmegaDesk is in early development. **Phases 0 and 1** of the [roadmap](docs/plan.md) are done: it works on a local network today, connecting by IP address, certificate fingerprint and password. The mesh network, relay, coordinator, web client, recording, RMM and compatibility layers (Phases 2–7) exist only as library crates that no binary uses yet; the plan lists their known defects. It is not ready for production use.
+> OmegaDesk is in early development. **Phases 0 and 1** of the [roadmap](docs/plan.md) are done: it works on a local network today, connecting by IP address, certificate fingerprint and password. **Phase 2** (coordinator, relay and mesh) is implemented end to end: agent and client enroll with a coordinator and connect by name through NAT traversal or the relay, verified in-process; the test across two real NATs is still pending. The web client, recording, RMM and compatibility layers (Phases 3–7) exist only as library crates that no binary uses yet; the plan lists their known defects. It is not ready for production use.
 
 What works today:
 
@@ -32,6 +32,7 @@ What works today:
 - **QUIC transport** (TLS 1.3) with certificate pinning and a mandatory access password.
 - **Remote keyboard and mouse** using physical scancodes, so any keyboard layout works (ABNT2 included). Multi-monitor aware.
 - **Native client** that shows a live latency breakdown in the title bar.
+- **Mesh mode**: a self-hosted coordinator (`omegadesk-server`) hands out addresses and names (`office-pc.omega`), nodes find each other with STUN and `disco` hole punching, fall back to a DERP-style relay (`omegadesk-relay`) in 1.5 s and upgrade to a direct path as soon as one validates. TLS is bound to the device identity the coordinator distributes, so there is no fingerprint to copy.
 
 First measurement (Intel Core Ultra 5 135U, 1920×1080, agent and client on the same machine): **60 fps and 24.5 ms end-to-end latency**. Host processing takes 15 ms (11 ms of it encoding), plus 0.2 ms network, 6 ms decode and 3 ms draw.
 
@@ -61,6 +62,27 @@ Useful flags:
 | `--no-input` | agent | Share the screen only; ignore keyboard and mouse |
 | `--password` / `OMEGADESK_PASSWORD` | agent, client | Fixed password (agent) or the password to send (client) |
 | `--view-only` | client | Watch only; do not send keyboard and mouse |
+| `--server`, `--server-key`, `--preauth-key` | agent, client | Join the mesh through a coordinator (see below) |
+| `--relay-only` | agent, client | Mesh mode: never attempt direct paths |
+
+### Mesh mode (coordinator and relay)
+
+Run a relay (any machine with a public address; it answers STUN on the same UDP port) and a coordinator. Both need the same 32-byte ticket secret:
+
+```sh
+cargo run --release -p omegadesk-relay -- --listen 0.0.0.0:8443 --ticket-secret-hex <64 hex>
+# prints the relay public key
+cargo run --release -p omegadesk-server -- --listen 0.0.0.0:8080 --ticket-secret-hex <64 hex> \
+    --relay "relay.example:8443=<relay key>;stun=relay.example:8443"
+# prints server_key (128 hex) and bootstrap_preauth_key (odk_...)
+```
+
+Then enroll the agent and connect from the client by name:
+
+```sh
+cargo run --release -p omegadesk-agent -- --name office-pc --server coord.example:8080 --server-key <128 hex> --preauth-key odk_...
+cargo run --release -p omegadesk-client -- office-pc.omega --server coord.example:8080 --server-key <128 hex> --preauth-key odk_... --password <password>
+```
 
 ## Architecture
 
@@ -81,7 +103,13 @@ Useful flags:
 | [`omegadesk-capture`](crates/capture) | Screen capture (DXGI Desktop Duplication) |
 | [`omegadesk-codec`](crates/codec) | H.264 encoders (Media Foundation, OpenH264) and decoder |
 | [`omegadesk-input`](crates/input) | Keyboard and mouse injection (USB HID → scancodes) |
-| [`omegadesk-transport`](crates/transport) | QUIC transport with certificate pinning |
+| [`omegadesk-transport`](crates/transport) | QUIC transport with certificate pinning or identity-bound TLS |
+| [`omegadesk-noise`](crates/noise) | Noise `IK` control channel bound to device identities |
+| [`omegadesk-mesh`](crates/mesh) | Sans-I/O NAT traversal: STUN, `disco`, relay fallback, tunnel encryption |
+| [`omegadesk-control`](crates/control) | Node-side client of the coordinator (enrollment, netmap, tickets) |
+| [`omegadesk-magicsock`](crates/magicsock) | The mesh as a QUIC socket: direct or relayed, virtual peer addresses |
+| [`omegadesk-relay`](relay) | DERP-style packet relay with single-use tickets and STUN |
+| [`omegadesk-server`](server) | Coordinator: keys, tenants, netmap stream, `*.omega` names |
 | [`omegadesk-agent`](agent) | The service that shares a machine |
 | [`omegadesk-client`](client) | The app you use to connect |
 
@@ -89,11 +117,11 @@ The full design, from the WireGuard mesh to the web client, is in [docs/plan.md]
 
 ## Roadmap
 
-| Phase | Deliverable | Status (✅ done · 🧩 library only · ⬜ not started) |
+| Phase | Deliverable | Status (✅ done · 🔶 implemented, field validation pending · 🧩 library only · ⬜ not started) |
 |---|---|---|
 | 0 | Foundation: workspace, CI on three platforms, license policy, protocol, identity | ✅ Done |
 | 1 | First image on screen: capture, hardware encoding, QUIC, input, ≤ 30 ms on LAN | ✅ Done |
-| 2 | Mesh network and coordination server: NAT traversal, relay, internal DNS | 🧩 Library only: coordinator, relay, mesh engine and DNS exist; agent and client do not use them; open findings: [#26](https://github.com/OmegaSoftDLL/omegadesk/issues/26) |
+| 2 | Mesh network and coordination server: NAT traversal, relay, internal DNS | 🔶 Agent and client join the mesh (`--server`), connect by `name.omega`, traverse NAT with STUN + `disco` and fall back to the relay in 1.5 s; verified in-process, cross-NAT field test pending |
 | 3 | Remote access product: Windows service, login/UAC screens, clipboard, files, audio | 🧩 Library only: desktop switching, session channels, QoS/FEC, QuickSupport and LAN mode exist; nothing is wired into the agent; open findings: [#27](https://github.com/OmegaSoftDLL/omegadesk/issues/27) |
 | 4 | Web dashboard and browser client | 🧩 Library only: policy model, gateway and WebCodecs worker exist; the gateway never starts and the TypeScript is not built; open findings: [#28](https://github.com/OmegaSoftDLL/omegadesk/issues/28) |
 | 5 | Security, session recording and privileged access | 🧩 Library only: recording, HuJSON policies, MFA, PAM, DLP and vault exist; no handshake consults them; open findings: [#29](https://github.com/OmegaSoftDLL/omegadesk/issues/29) |

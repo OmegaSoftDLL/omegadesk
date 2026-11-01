@@ -60,9 +60,13 @@ message RelayInfo {
 message EnrollResponse {
   uint32 protocol_version = 1;
   NodeInfo self_node = 2;
-  // Every peer visible to this node (same tenant) at enrollment time.
+  // Every peer visible to this node (same tenant) at enrollment time. A large
+  // tenant is split: this message carries the first chunk and the rest follows
+  // as PeerUpserted deltas; peer_count is the size of the whole snapshot so the
+  // node knows when it is complete.
   repeated NodeInfo peers = 3;
   repeated RelayInfo relays = 4;
+  uint32 peer_count = 5;
 }
 
 message NetmapDelta {

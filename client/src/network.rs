@@ -2,11 +2,14 @@
 //! dedicated video decoder thread.
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::sync::mpsc as std_mpsc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, bail};
 use omegadesk_codec::{OpenH264Decoder, VideoDecoder};
+use omegadesk_identity::DeviceIdentity;
+use omegadesk_magicsock::{Node, NodeConfig};
 use omegadesk_protocol::PROTOCOL_VERSION;
 use omegadesk_protocol::v1::{
     Capabilities, Envelope, Hello, Ping, RequestKeyframe, VideoCodec, VideoFrame, envelope::Payload,
@@ -36,13 +39,33 @@ fn unix_micros() -> u64 {
         .map_or(0, |d| u64::try_from(d.as_micros()).unwrap_or(u64::MAX))
 }
 
+/// How the agent is reached.
+#[derive(Debug, Clone)]
+pub(crate) enum Route {
+    /// Phase 1: direct QUIC to an address, pinning the agent's certificate.
+    Lan {
+        address: SocketAddr,
+        fingerprint: String,
+    },
+    /// Phase 2: enroll in the mesh and connect to the agent by name; TLS is
+    /// bound to the agent identity distributed by the coordinator.
+    Mesh(Box<MeshRoute>),
+}
+
+/// Mesh enrollment parameters and the agent name to reach.
+#[derive(Debug, Clone)]
+pub(crate) struct MeshRoute {
+    pub(crate) identity: Arc<DeviceIdentity>,
+    pub(crate) node_config: NodeConfig,
+    pub(crate) name: String,
+}
+
 /// Connection parameters for reaching the remote agent.
 #[derive(Debug, Clone)]
 pub(crate) struct Target {
     /// Ed25519 signing public key of this client device, sent in `Hello`.
     pub(crate) device_public_key: [u8; 32],
-    pub(crate) address: SocketAddr,
-    pub(crate) fingerprint: String,
+    pub(crate) route: Route,
     pub(crate) password: String,
 }
 
@@ -93,11 +116,50 @@ async fn run(
     mut control_rx: mpsc::UnboundedReceiver<Envelope>,
     requests: mpsc::UnboundedSender<Envelope>,
 ) -> anyhow::Result<()> {
-    shared.set_status(format!("connecting to {}…", target.address));
-    let _ = proxy.send_event(UserEvent::Status);
-    let (_endpoint, connection) = connect(target.address, &target.fingerprint)
-        .await
-        .context("failed to connect to agent")?;
+    // Keeps the LAN endpoint or the mesh node alive for the whole session.
+    let (_endpoint, mesh_node, connection) = match &target.route {
+        Route::Lan {
+            address,
+            fingerprint,
+        } => {
+            shared.set_status(format!("connecting to {address}…"));
+            let _ = proxy.send_event(UserEvent::Status);
+            let (endpoint, connection) = connect(*address, fingerprint)
+                .await
+                .context("failed to connect to agent")?;
+            (Some(endpoint), None, connection)
+        }
+        Route::Mesh(mesh) => {
+            let MeshRoute {
+                identity,
+                node_config,
+                name,
+            } = mesh.as_ref();
+            shared.set_status("joining the mesh…".to_owned());
+            let _ = proxy.send_event(UserEvent::Status);
+            let node = Node::start(Arc::clone(identity), node_config.clone())
+                .await
+                .context("failed to join the mesh")?;
+            info!(
+                "enrolled as {} ({})",
+                node.self_info().fqdn,
+                node.self_info().ipv4
+            );
+            shared.set_status(format!("connecting to {name}…"));
+            let _ = proxy.send_event(UserEvent::Status);
+            let connection = wait_and_connect(&node, name)
+                .await
+                .with_context(|| format!("failed to connect to {name} through the mesh"))?;
+            if let Some(peer) = node.peer_at(connection.remote_address()) {
+                info!(
+                    "mesh path to {}: {:?}",
+                    peer.fqdn,
+                    node.peer_path(peer.id())
+                );
+            }
+            (None, Some(node), connection)
+        }
+    };
 
     let result = session(
         &connection,
@@ -110,7 +172,31 @@ async fn run(
     .await;
     connection.close(0u32.into(), b"done");
     log_connection(&connection);
+    if let Some(node) = &mesh_node
+        && let Some(peer) = node.peer_at(connection.remote_address())
+    {
+        info!(
+            "mesh path to {} at the end: {:?}",
+            peer.fqdn,
+            node.peer_path(peer.id())
+        );
+    }
+    drop(mesh_node);
     result
+}
+
+/// Waits (bounded) for the agent to appear in the netmap, then connects. The
+/// netmap snapshot arrives with the enrollment, but an agent that enrolls a
+/// moment later is only announced by a delta.
+async fn wait_and_connect(node: &Node, name: &str) -> anyhow::Result<Connection> {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while node.resolve(name).is_none() {
+        if Instant::now() >= deadline {
+            bail!("no agent named `{name}` is enrolled in this tenant");
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    Ok(node.connect(name).await?)
 }
 
 /// Logs the connection close reason and final QUIC path statistics.

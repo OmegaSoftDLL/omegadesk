@@ -312,6 +312,8 @@ pub struct MeshNode {
     local_identity: DeviceIdentity,
     local_candidates: Vec<SocketAddr>,
     stun_servers: Vec<SocketAddr>,
+    /// Never use direct paths: no pings, no pongs, direct datagrams dropped.
+    relay_only: bool,
     inflight_stun: HashMap<stun::TxId, (SocketAddr, Instant)>,
     reflexive: HashMap<SocketAddr, SocketAddr>,
     next_stun_at: Option<Instant>,
@@ -335,6 +337,7 @@ impl MeshNode {
             local_identity,
             local_candidates,
             stun_servers,
+            relay_only: false,
             inflight_stun: HashMap::new(),
             reflexive: HashMap::new(),
             next_stun_at: None,
@@ -343,6 +346,30 @@ impl MeshNode {
             transmits: VecDeque::new(),
             events: VecDeque::new(),
         }
+    }
+
+    /// Relay-only policy: the node never probes, answers or accepts a direct
+    /// path (every datagram arriving on the UDP socket other than STUN is
+    /// dropped, `CallMeMaybe` endpoints are ignored, no `Pong` is sent), so a
+    /// peer with direct candidates can never upgrade a path towards it.
+    pub fn set_relay_only(&mut self, relay_only: bool) {
+        self.relay_only = relay_only;
+        if relay_only {
+            self.local_candidates.clear();
+            self.stun_servers.clear();
+            self.reflexive.clear();
+            self.inflight_stun.clear();
+            self.next_stun_at = None;
+            for peer in self.peers_by_id.values_mut() {
+                peer.candidates.clear();
+            }
+        }
+    }
+
+    /// Whether the relay-only policy is active.
+    #[must_use]
+    pub fn relay_only(&self) -> bool {
+        self.relay_only
     }
 
     /// Local [`DeviceId`] of this node.
@@ -409,6 +436,11 @@ impl MeshNode {
     ) {
         let peer_id = peer_public.id();
         let peer_exchange = peer_public.exchange_key_bytes();
+        let candidates = if self.relay_only {
+            Vec::new()
+        } else {
+            candidates
+        };
 
         if let Some(existing) = self.peers_by_id.get_mut(&peer_id) {
             if existing.public.exchange_key_bytes() == peer_exchange {
@@ -730,6 +762,11 @@ impl MeshNode {
             self.handle_stun(datagram, now);
             return Ok(None);
         }
+        if from_udp.is_some() && self.relay_only {
+            // Relay-only: nothing but STUN is accepted on the UDP socket, so no
+            // Pong ever validates a direct path towards this node.
+            return Ok(None);
+        }
         if DiscoMessage::looks_like_disco(datagram) {
             let (sender_exchange, msg) =
                 DiscoMessage::open(datagram, self.local_identity.exchange_secret())?;
@@ -872,9 +909,12 @@ impl MeshNode {
                 payload: sealed_cmm,
             });
         }
-        // 2. Direct UDP Ping to every known candidate of the peer.
-        for candidate in candidates {
-            self.send_ping(peer_id, candidate, now);
+        // 2. Direct UDP Ping to every known candidate of the peer (never in
+        //    relay-only mode).
+        if !self.relay_only {
+            for candidate in candidates {
+                self.send_ping(peer_id, candidate, now);
+            }
         }
         if let Some(peer) = self.peers_by_id.get_mut(&peer_id) {
             peer.next_probe_at = now + interval;
@@ -930,6 +970,11 @@ impl MeshNode {
                 self.handle_pong(peer_id, from_udp, tx_id, src, now);
             }
             DiscoMessage::CallMeMaybe { my_numbers, .. } => {
+                let my_numbers = if self.relay_only {
+                    Vec::new()
+                } else {
+                    my_numbers
+                };
                 if let Some(peer) = self.peers_by_id.get_mut(&peer_id) {
                     for addr in &my_numbers {
                         if !peer.candidates.contains(addr) {
@@ -1460,5 +1505,111 @@ mod tests {
         );
         alice.remove_peer(bob_pub.id());
         assert_eq!(alice.peer_path(bob_pub.id()), None);
+    }
+
+    /// Delivers every queued transmit of `from` to `to`: direct ones as if
+    /// they arrived from `from_addr`, relayed ones through the relay.
+    fn deliver_everything(
+        from: &mut MeshNode,
+        from_addr: SocketAddr,
+        to: &mut MeshNode,
+        now: Instant,
+    ) {
+        while let Some(tx) = from.poll_transmit() {
+            let via = match tx.target {
+                TransmitTarget::DirectUdp(_) => Some(from_addr),
+                TransmitTarget::Relay(_) => None,
+            };
+            to.handle_receive(via, &tx.payload, now).unwrap();
+        }
+    }
+
+    /// Sends one data packet from `from` to `to` and asserts it rides the relay.
+    fn relayed_round_trip(
+        from: &mut MeshNode,
+        to: &mut MeshNode,
+        to_pub: &DevicePublic,
+        now: Instant,
+    ) {
+        let pkt = sample_packet();
+        from.encapsulate(to_pub.id(), &pkt, now).unwrap();
+        let data = from.poll_transmit().unwrap();
+        assert_eq!(
+            data.target,
+            TransmitTarget::Relay(to_pub.exchange_key_bytes())
+        );
+        let (_, received) = to
+            .handle_receive(None, &data.payload, now)
+            .unwrap()
+            .unwrap();
+        assert_eq!(received, pkt);
+    }
+
+    #[test]
+    fn relay_only_node_never_validates_a_direct_path_even_with_a_normal_peer() {
+        let now = Instant::now();
+        let alice_id = DeviceIdentity::generate();
+        let bob_id = DeviceIdentity::generate();
+        let alice_pub = alice_id.public();
+        let bob_pub = bob_id.public();
+        let alice_addr: SocketAddr = "198.51.100.10:51820".parse().unwrap();
+        let bob_addr: SocketAddr = "203.0.113.20:51820".parse().unwrap();
+        // Alice is relay-only but still has an address a peer could reach;
+        // Bob is a normal node that knows it from the netmap.
+        let mut alice = MeshNode::new(alice_id, vec![alice_addr], vec![]);
+        alice.set_relay_only(true);
+        assert!(alice.relay_only());
+        assert!(alice.local_endpoints().is_empty(), "nothing is advertised");
+        let mut bob = MeshNode::new(bob_id, vec![bob_addr], vec![]);
+        alice.upsert_peer(bob_pub, vec![bob_addr], now);
+        bob.upsert_peer(alice_pub, vec![alice_addr], now);
+
+        // Alice never sends anything directly, even though Bob's candidate is
+        // known; Bob's direct pings are dropped and his CallMeMaybe endpoints
+        // ignored, so no Pong ever comes back.
+        for _ in 0..3 {
+            while let Some(tx) = alice.poll_transmit() {
+                assert!(matches!(tx.target, TransmitTarget::Relay(_)), "{tx:?}");
+                bob.handle_receive(None, &tx.payload, now).unwrap();
+            }
+            deliver_everything(&mut bob, bob_addr, &mut alice, now);
+        }
+        assert!(
+            alice.poll_transmit().is_none(),
+            "no Pong, no ping from Alice"
+        );
+        assert!(matches!(
+            alice.peer_path(bob_pub.id()),
+            Some(ConnectionPath::Relayed { .. })
+        ));
+        assert!(matches!(
+            bob.peer_path(alice_pub.id()),
+            Some(ConnectionPath::Relayed { .. })
+        ));
+
+        // Bob gives up on the direct path within the budget, and data still
+        // flows over the relay in both directions.
+        bob.handle_timeout(now + RELAY_FALLBACK_TIMEOUT);
+        assert!(
+            drain_events(&mut bob).contains(&MeshEvent::FallbackToRelay {
+                peer: alice_pub.id()
+            })
+        );
+        assert!(alice.peer_ready(bob_pub.id()) && bob.peer_ready(alice_pub.id()));
+        // The fallback re-probes; deliver those first so only data is left.
+        deliver_everything(&mut bob, bob_addr, &mut alice, now);
+        deliver_everything(&mut alice, alice_addr, &mut bob, now);
+        relayed_round_trip(&mut bob, &mut alice, &alice_pub, now);
+        relayed_round_trip(&mut alice, &mut bob, &bob_pub, now);
+        // A direct data packet aimed at Alice is dropped without an error.
+        bob.encapsulate(alice_pub.id(), &sample_packet(), now)
+            .unwrap();
+        let data = bob.poll_transmit().unwrap();
+        assert_eq!(
+            alice
+                .handle_receive(Some(bob_addr), &data.payload, now)
+                .unwrap(),
+            None
+        );
     }
 }

@@ -571,6 +571,7 @@ impl EnrollmentBundle {
             self_node: Some(self.node.to_proto()),
             peers: self.peers.iter().map(NodeRecord::to_proto).collect(),
             relays: self.relays.iter().map(RelayGrant::to_proto).collect(),
+            peer_count: u32::try_from(self.peers.len()).unwrap_or(u32::MAX),
         }
     }
 }
@@ -603,6 +604,9 @@ pub struct Coordinator {
     nodes: HashMap<DeviceId, NodeRecord>,
     /// Current session generation per node (incremented on every enrollment).
     sessions: HashMap<DeviceId, u64>,
+    /// Pre-auth key prefix each node enrolled with: a registered node may
+    /// reconnect with that same key even after it was consumed or expired.
+    enrolled_with: HashMap<DeviceId, String>,
     next_generation: u64,
     next_ip_index: u32,
     dns: MagicDnsResolver,
@@ -619,6 +623,7 @@ impl Coordinator {
             preauth_keys: HashMap::new(),
             nodes: HashMap::new(),
             sessions: HashMap::new(),
+            enrolled_with: HashMap::new(),
             next_generation: 1,
             next_ip_index: 1,
             dns: MagicDnsResolver::new(),
@@ -747,9 +752,18 @@ impl Coordinator {
         if provided_digest.as_slice() != key.secret_hash {
             return Err(CoordinatorError::InvalidPreAuthKey);
         }
-        key.check_usable(now_unix_secs)?;
-
         let node_id = public.id();
+        // Headscale model: the pre-auth key registers the machine once; after
+        // that the node key is the credential and the same (now consumed or
+        // expired) key keeps working for reconnects of that node only. A
+        // deleted key still cuts the node off.
+        let reconnecting = self
+            .enrolled_with
+            .get(&node_id)
+            .is_some_and(|p| p == prefix);
+        if !reconnecting {
+            key.check_usable(now_unix_secs)?;
+        }
         // Allocate addresses before consuming the key so an exhausted pool does
         // not burn a single-use key.
         let (ipv4, ipv6) = if let Some(existing) = self.nodes.get(&node_id) {
@@ -785,6 +799,7 @@ impl Coordinator {
         let generation = self.next_generation;
         self.next_generation += 1;
         self.sessions.insert(node_id, generation);
+        self.enrolled_with.insert(node_id, prefix.to_owned());
         let (sanitized_label, fqdn) = self.dns.register(node_id, hostname, ipv4, ipv6);
         let record = NodeRecord {
             public,
@@ -872,6 +887,8 @@ impl Coordinator {
             && node.ephemeral
             && let Some(removed) = self.nodes.remove(&node_id)
         {
+            // A removed ephemeral node is a stranger again: it needs a usable key.
+            self.enrolled_with.remove(&node_id);
             self.dns.unregister(&removed.fqdn);
             self.batcher.enqueue(
                 &removed.tenant,
@@ -1076,6 +1093,71 @@ mod tests {
         coord.handle_disconnect(dev1.id(), bundle.generation);
         assert_eq!(coord.node_count(), 0);
         assert_eq!(coord.dns().lookup("runner-01.omega"), None);
+    }
+
+    #[test]
+    fn registered_node_reconnects_with_its_consumed_or_expired_key() {
+        let mut coord = Coordinator::new([0x55u8; 32]);
+        let token = coord
+            .create_preauth_key(
+                "acme",
+                false,
+                false,
+                vec!["tag:desk".to_owned()],
+                Some(2000),
+            )
+            .unwrap();
+        let dev = DeviceIdentity::generate();
+        let first = coord
+            .enroll_machine(&token, dev.public(), "desk", vec![], 1000)
+            .unwrap();
+        coord.handle_disconnect(dev.id(), first.generation);
+
+        // The key is consumed and, later, expired: the registered node still
+        // reconnects with it (node key + original key), keeping its address.
+        let again = coord
+            .enroll_machine(&token, dev.public(), "desk", vec![], 2500)
+            .unwrap();
+        assert_eq!(again.node.ipv4, first.node.ipv4);
+        assert_ne!(again.generation, first.generation);
+
+        // Another device cannot ride the consumed key.
+        let stranger = DeviceIdentity::generate();
+        assert_eq!(
+            coord
+                .enroll_machine(&token, stranger.public(), "intruder", vec![], 1500)
+                .unwrap_err(),
+            CoordinatorError::PreAuthKeyAlreadyUsed
+        );
+        // Nor can the node use a different consumed key.
+        let other = coord
+            .create_preauth_key("acme", false, false, vec!["tag:desk".to_owned()], None)
+            .unwrap();
+        coord
+            .enroll_machine(&other, stranger.public(), "other", vec![], 1500)
+            .unwrap();
+        assert_eq!(
+            coord
+                .enroll_machine(&other, dev.public(), "desk", vec![], 1500)
+                .unwrap_err(),
+            CoordinatorError::PreAuthKeyAlreadyUsed
+        );
+
+        // An ephemeral node that was removed on disconnect is a stranger again.
+        let ephemeral_key = coord
+            .create_preauth_key("acme", false, true, vec!["tag:desk".to_owned()], None)
+            .unwrap();
+        let runner = DeviceIdentity::generate();
+        let bundle = coord
+            .enroll_machine(&ephemeral_key, runner.public(), "runner", vec![], 1500)
+            .unwrap();
+        coord.handle_disconnect(runner.id(), bundle.generation);
+        assert_eq!(
+            coord
+                .enroll_machine(&ephemeral_key, runner.public(), "runner", vec![], 1500)
+                .unwrap_err(),
+            CoordinatorError::PreAuthKeyAlreadyUsed
+        );
     }
 
     #[test]

@@ -102,3 +102,11 @@ version_group = "omegadesk"
 [[package]]
 name = "omegadesk-tun"
 version_group = "omegadesk"
+
+[[package]]
+name = "omegadesk-control"
+version_group = "omegadesk"
+
+[[package]]
+name = "omegadesk-magicsock"
+version_group = "omegadesk"
