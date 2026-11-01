@@ -16,6 +16,11 @@
 //!
 //! On startup the agent prints its access password (and, on the local
 //! network, its TLS certificate fingerprint); the client requires it to connect.
+//!
+//! On the mesh the coordinator's policy decides, per connecting device, whether a
+//! session may open and whether it needs a TOTP step-up (`--totp-secret`), is
+//! recorded (`--recordings-dir`), watermarked or clipboard-limited; every
+//! decision is written to `--audit-log` as JSON Lines.
 
 mod virtual_display;
 
@@ -25,12 +30,14 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
+use omegadesk_agent::access::{self, AccessConfig, AccessControl};
 use omegadesk_agent::capture_loop::EncoderChoice;
 use omegadesk_agent::session::SessionConfig;
 use omegadesk_agent::{password, platform, session};
 use omegadesk_codec::EncoderSettings;
 use omegadesk_control::{ControlConfig, parse_server_key};
 use omegadesk_magicsock::{Node, NodeConfig};
+use omegadesk_policy::AuditLog;
 use omegadesk_transport::server_endpoint;
 use tracing::{info, warn};
 
@@ -125,6 +132,106 @@ struct Args {
     /// service sessions).
     #[arg(long, env = "OMEGADESK_AGENT_KEY_FILE")]
     key_file: Option<std::path::PathBuf>,
+
+    /// Base32 TOTP secret (RFC 6238, HMAC-SHA256, 6 digits, 30 s) enrolled in the
+    /// operators' authenticator apps. Required for sessions the policy marks
+    /// `"action": "check"`; such sessions are refused without it.
+    #[arg(long, env = "OMEGADESK_TOTP_SECRET")]
+    totp_secret: Option<String>,
+
+    /// Print a freshly generated TOTP secret and its `otpauth://` URI, then exit.
+    #[arg(long, conflicts_with = "totp_secret")]
+    generate_totp_secret: bool,
+
+    /// Directory for `.odrec` session recordings. Required for sessions the policy
+    /// marks `"record": true`; such sessions are refused without it.
+    #[arg(long, env = "OMEGADESK_RECORDINGS_DIR")]
+    recordings_dir: Option<PathBuf>,
+
+    /// Append security audit events (connections, denials, MFA, DLP, recordings)
+    /// as JSON Lines to this file.
+    #[arg(long, env = "OMEGADESK_AUDIT_LOG")]
+    audit_log: Option<PathBuf>,
+}
+
+/// Binds the QUIC endpoint: on the mesh it enrolls a [`Node`] (kept alive for the whole run)
+/// and uses its endpoint; otherwise it opens a Phase 1 LAN endpoint with a pinned fingerprint.
+async fn build_endpoint(
+    args: &Args,
+    identity: omegadesk_identity::DeviceIdentity,
+    hostname: &str,
+) -> anyhow::Result<(omegadesk_transport::Endpoint, Option<Node>)> {
+    let (Some(server), Some(server_key), Some(preauth_key)) =
+        (&args.server, &args.server_key, &args.preauth_key)
+    else {
+        let (endpoint, fingerprint) =
+            server_endpoint(args.listen).context("failed to bind agent QUIC endpoint")?;
+        info!("agent listening on {}", endpoint.local_addr()?);
+        info!("certificate fingerprint: {fingerprint}");
+        return Ok((endpoint, None));
+    };
+    let server_public = parse_server_key(server_key).context("invalid --server-key")?;
+    let mut node_config = NodeConfig::new(ControlConfig {
+        server_addr: server.clone(),
+        server_public,
+        preauth_key: preauth_key.clone(),
+        hostname: hostname.to_owned(),
+        endpoints: Vec::new(),
+        quicksupport_id: None,
+    });
+    node_config.bind = args.listen;
+    node_config.relay_only = args.relay_only;
+    let node = Node::start(Arc::new(identity), node_config)
+        .await
+        .context("failed to join the mesh")?;
+    info!(
+        "mesh address: {} ({}); clients connect with `omegadesk-client {}`",
+        node.self_info().fqdn,
+        node.self_info().ipv4,
+        node.self_info().fqdn
+    );
+    let endpoint = node.endpoint().clone();
+    Ok((endpoint, Some(node)))
+}
+
+/// Builds the policy/MFA/recording/audit enforcement from the command line.
+fn build_access(
+    args: &Args,
+    agent_id: omegadesk_identity::DeviceId,
+) -> anyhow::Result<Arc<AccessControl>> {
+    let totp_secret = match &args.totp_secret {
+        Some(text) => {
+            let secret = access::decode_totp_secret(text)
+                .context("--totp-secret must be a base32 secret of at least 80 bits")?;
+            info!(
+                "per-connection MFA enabled; enroll authenticators with {}",
+                access::totp_uri(&args.name, text.trim())
+            );
+            Some(secret)
+        }
+        None => None,
+    };
+    let audit = match &args.audit_log {
+        Some(path) => {
+            let log = AuditLog::open(path)
+                .with_context(|| format!("failed to open audit log {}", path.display()))?;
+            info!("audit log: {}", path.display());
+            Some(Arc::new(log))
+        }
+        None => None,
+    };
+    if let Some(dir) = &args.recordings_dir {
+        std::fs::create_dir_all(dir)
+            .with_context(|| format!("failed to create {}", dir.display()))?;
+        info!("session recordings: {}", dir.display());
+    }
+    Ok(Arc::new(AccessControl::new(AccessConfig {
+        agent_name: args.name.clone(),
+        agent_id,
+        totp_secret,
+        recordings_dir: args.recordings_dir.clone(),
+        audit,
+    })))
 }
 
 /// Agent subcommands.
@@ -148,6 +255,13 @@ fn main() -> anyhow::Result<()> {
         )
         .init();
     let mut args = Args::parse();
+    if args.generate_totp_secret {
+        let secret = access::generate_totp_secret();
+        let stdout = std::io::stdout();
+        access::write_line(stdout.lock(), &secret)?;
+        access::write_line(stdout.lock(), &access::totp_uri(&args.name, &secret))?;
+        return Ok(());
+    }
 
     // The service subcommands (including the SCM `run` entry point, which blocks
     // for the service's lifetime) must not run under a pre-built async runtime,
@@ -167,8 +281,8 @@ fn main() -> anyhow::Result<()> {
 async fn run_share(args: Args) -> anyhow::Result<()> {
     platform::prefer_performance();
 
-    let password = match args.password {
-        Some(password) if password.len() >= 8 => password,
+    let password = match &args.password {
+        Some(password) if password.len() >= 8 => password.clone(),
         Some(_) => anyhow::bail!("the access password must be at least 8 characters long"),
         None => password::generate(),
     };
@@ -182,9 +296,11 @@ async fn run_share(args: Args) -> anyhow::Result<()> {
         .context("failed to load or create device identity")?;
     info!("device ID: {}", identity.id());
 
+    let access = build_access(&args, identity.id())?;
+
     let config = Arc::new(SessionConfig {
         device_public_key: identity.public().signing_key_bytes(),
-        name: args.name,
+        name: args.name.clone(),
         password,
         monitor: args.display,
         encoder: args.encoder,
@@ -196,48 +312,14 @@ async fn run_share(args: Args) -> anyhow::Result<()> {
         gate: None,
         clipboard: !args.no_clipboard,
         file_transfer: true,
-        receive_dir: args.receive_dir,
-        send_files: args.send_file,
+        receive_dir: args.receive_dir.clone(),
+        send_files: args.send_file.clone(),
+        access,
     });
 
     // Mesh mode keeps the `Node` alive for the whole run: dropping it stops
     // the control, relay and driver tasks.
-    let mut mesh_node: Option<Node> = None;
-    let endpoint = if let (Some(server), Some(server_key), Some(preauth_key)) =
-        (&args.server, &args.server_key, &args.preauth_key)
-    {
-        {
-            let server_public = parse_server_key(server_key).context("invalid --server-key")?;
-            let mut node_config = NodeConfig::new(ControlConfig {
-                server_addr: server.clone(),
-                server_public,
-                preauth_key: preauth_key.clone(),
-                hostname: config.name.clone(),
-                endpoints: Vec::new(),
-                quicksupport_id: None,
-            });
-            node_config.bind = args.listen;
-            node_config.relay_only = args.relay_only;
-            let node = Node::start(Arc::new(identity), node_config)
-                .await
-                .context("failed to join the mesh")?;
-            info!(
-                "mesh address: {} ({}); clients connect with `omegadesk-client {}`",
-                node.self_info().fqdn,
-                node.self_info().ipv4,
-                node.self_info().fqdn
-            );
-            let endpoint = node.endpoint().clone();
-            mesh_node = Some(node);
-            endpoint
-        }
-    } else {
-        let (endpoint, fingerprint) =
-            server_endpoint(args.listen).context("failed to bind agent QUIC endpoint")?;
-        info!("agent listening on {}", endpoint.local_addr()?);
-        info!("certificate fingerprint: {fingerprint}");
-        endpoint
-    };
+    let (endpoint, mesh_node) = build_endpoint(&args, identity, &config.name).await?;
     info!("access password: {}", config.password);
 
     // Optional virtual monitor for headless hosts / privacy mode. Kept alive for
@@ -257,12 +339,16 @@ async fn run_share(args: Args) -> anyhow::Result<()> {
             }
         };
         let remote = connection.remote_address();
-        if let Some(peer) = mesh_node.as_ref().and_then(|node| node.peer_at(remote)) {
+        // On the mesh the remote address identifies the peer: it is only reachable
+        // through the tunnel keyed to that peer's identity, and its netmap entry
+        // carries the coordinator's session decision for it.
+        let peer = mesh_node.as_ref().and_then(|node| node.peer_at(remote));
+        if let Some(peer) = &peer {
             info!("client connected: {} ({remote})", peer.fqdn);
         } else {
             info!("client connected: {remote}");
         }
-        match session::run(connection, config.clone()).await {
+        match session::run(connection, config.clone(), peer).await {
             Ok(()) => info!("session ended: {remote}"),
             Err(error) => warn!("session with {remote} ended with error: {error:#}"),
         }

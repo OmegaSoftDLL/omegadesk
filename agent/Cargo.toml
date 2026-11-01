@@ -10,7 +10,9 @@ publish.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+bytes.workspace = true
 clap.workspace = true
+data-encoding.workspace = true
 omegadesk-capture.workspace = true
 omegadesk-codec.workspace = true
 omegadesk-control.workspace = true
@@ -18,16 +20,21 @@ omegadesk-identity.workspace = true
 omegadesk-idd.workspace = true
 omegadesk-input.workspace = true
 omegadesk-magicsock.workspace = true
+omegadesk-policy.workspace = true
 omegadesk-protocol.workspace = true
+omegadesk-recording.workspace = true
 omegadesk-service.workspace = true
 omegadesk-session = { workspace = true, features = ["io"] }
 omegadesk-transport.workspace = true
+prost.workspace = true
 quinn.workspace = true
 rand_core.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+zeroize.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows = { workspace = true, features = [

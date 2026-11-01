@@ -12,6 +12,7 @@ publish.workspace = true
 data-encoding.workspace = true
 omegadesk-identity.workspace = true
 omegadesk-noise.workspace = true
+omegadesk-policy.workspace = true
 omegadesk-protocol.workspace = true
 omegadesk-relay.workspace = true
 prost.workspace = true

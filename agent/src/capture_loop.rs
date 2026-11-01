@@ -9,6 +9,7 @@ use omegadesk_codec::{
 };
 use omegadesk_input::TargetDisplay;
 use omegadesk_protocol::v1::{VideoCodec, VideoFrame};
+use omegadesk_session::dlp::apply_watermark_bgra;
 use tokio::sync::mpsc::{self, error::TrySendError};
 use tracing::{debug, info, warn};
 
@@ -324,21 +325,38 @@ pub(crate) fn run(
         }
 
         let captured_at_micros = unix_micros();
+        let mut frame = frame;
+        let watermark_patch = state.watermark.as_ref().map(|watermark| {
+            apply_watermark_bgra(
+                &mut frame.bgra,
+                frame.width,
+                frame.height,
+                &watermark.build_overlay(captured_at_micros / 1_000),
+                WATERMARK_SCALE,
+            )
+        });
         let encode_start = Instant::now();
         let encoded = active_encoder.encoder.encode(RawFrame {
             width: frame.width,
             height: frame.height,
             bgra: &frame.bgra,
+            // A watermarked frame must be encoded from the CPU pixels: the GPU
+            // texture still holds the clean desktop (see `WATERMARK_SCALE`).
             #[cfg(windows)]
             d3d11_texture: frame
                 .gpu_texture
                 .as_ref()
+                .filter(|_| watermark_patch.is_none())
                 .map(|gpu| omegadesk_codec::D3d11Texture {
                     device: &gpu.device,
                     context: &gpu.context,
                     texture: &gpu.texture,
                 }),
         });
+        if let Some(patch) = &watermark_patch {
+            // Keep `last` clean so a re-encode on a keyframe request stamps once.
+            patch.restore(&mut frame.bgra, frame.width);
+        }
         let encoded = match encoded {
             Ok(encoded) => encoded,
             Err(error) => {
@@ -396,6 +414,16 @@ pub(crate) fn run(
         last = Some(frame);
     }
 }
+
+/// Scale of the policy watermark glyphs (5x7 font pixels become 10x14 frame pixels).
+///
+/// The watermark (`user | client IP | session | time`, KasmVNC `DLP_WatermarkText`) is
+/// composed into the captured BGRA frame right before encoding and removed again after it.
+/// Cost: a few thousand blended pixels plus an ~80 KiB save/restore per frame (see
+/// `omegadesk_session::dlp::apply_watermark_bgra`), negligible next to the encode. The
+/// visible price is on Windows: a zero-copy frame is encoded from its CPU pixels instead of
+/// the GPU texture, so watermarked sessions pay the Media Foundation CPU upload.
+const WATERMARK_SCALE: u32 = 2;
 
 /// Per-stage timing accumulator logged every [`TIMING_PERIOD`].
 #[derive(Debug, Default)]

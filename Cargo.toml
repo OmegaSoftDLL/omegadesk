@@ -57,6 +57,7 @@ quinn = { version = "0.11", default-features = false, features = ["log", "runtim
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring"] }
 ring = "0.17"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+os_info = { version = "3", default-features = false }
 softbuffer = "0.4"
 rand_core = { version = "0.6", features = ["getrandom"] }
 serde = { version = "1", features = ["derive"] }

@@ -15,6 +15,7 @@
 //!   with risk classification and full-text filtering.
 
 use std::fmt::Write as _;
+use std::io;
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use thiserror::Error;
@@ -334,6 +335,121 @@ impl OdrecWriter {
     #[must_use]
     pub fn into_bytes(self) -> Bytes {
         self.buffer.freeze()
+    }
+}
+
+/// Streaming `.odrec` writer: the same container as [`OdrecWriter`], written record by record
+/// to any [`io::Write`] sink (a `BufWriter<File>` at the agent) instead of an in-memory buffer,
+/// so an hours-long session costs a bounded amount of memory. The keyframe index is kept in
+/// memory exactly like [`OdrecWriter`] and the hint rules are identical.
+///
+/// MeshCentral writes every record straight to the file descriptor as it is relayed
+/// (`recordingEntry` in `Ylianst_MeshCentral/meshrelay.js` lines 134–156, `fs.write(logfile.fd,
+/// block, ...)`); this is the typed equivalent.
+#[derive(Debug)]
+pub struct OdrecStreamWriter<W: io::Write> {
+    sink: W,
+    scratch: BytesMut,
+    keyframes: Vec<KeyframeIndexEntry>,
+    record_count: usize,
+    bytes_written: u64,
+    last_keyframe_byte_offset: u64,
+    last_keyframe_timestamp_ms: u64,
+}
+
+impl<W: io::Write> OdrecStreamWriter<W> {
+    /// Writes [`ODREC_MAGIC`] to `sink` and returns the writer.
+    ///
+    /// # Errors
+    ///
+    /// Returns the I/O error of the sink.
+    pub fn new(mut sink: W) -> io::Result<Self> {
+        sink.write_all(&ODREC_MAGIC)?;
+        Ok(Self {
+            sink,
+            scratch: BytesMut::with_capacity(4096),
+            keyframes: Vec::new(),
+            record_count: 0,
+            bytes_written: ODREC_MAGIC.len() as u64,
+            last_keyframe_byte_offset: 0,
+            last_keyframe_timestamp_ms: 0,
+        })
+    }
+
+    /// Appends `record` and returns its byte offset in the stream. Only records flagged
+    /// [`RecordFlags::KEYFRAME`] enter the index (see [`OdrecWriter::append`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidInput` if the payload exceeds `u32::MAX` bytes, or the sink's I/O error.
+    pub fn append(&mut self, record: &OdrecRecord) -> io::Result<u64> {
+        self.scratch.clear();
+        record
+            .encode(&mut self.scratch)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+        self.sink.write_all(&self.scratch)?;
+        let byte_offset = self.bytes_written;
+        if record.flags.contains(RecordFlags::KEYFRAME) {
+            self.keyframes.push(KeyframeIndexEntry {
+                record_index: self.record_count,
+                timestamp_ms: record.timestamp_ms,
+                byte_offset,
+            });
+            self.last_keyframe_byte_offset = byte_offset;
+            self.last_keyframe_timestamp_ms = record.timestamp_ms;
+        }
+        self.bytes_written += self.scratch.len() as u64;
+        self.record_count += 1;
+        Ok(byte_offset)
+    }
+
+    /// Same rule as [`OdrecWriter::keyframe_hint_due`]: the producer should emit a recovery
+    /// point for a frame stamped `timestamp_ms`.
+    #[must_use]
+    pub fn keyframe_hint_due(&self, timestamp_ms: u64) -> bool {
+        if self.keyframes.is_empty() {
+            return true;
+        }
+        let bytes_since = self
+            .bytes_written
+            .saturating_sub(self.last_keyframe_byte_offset);
+        let millis_since = timestamp_ms.saturating_sub(self.last_keyframe_timestamp_ms);
+        bytes_since >= KEYFRAME_BYTE_INTERVAL && millis_since >= KEYFRAME_TIME_INTERVAL_MS
+    }
+
+    /// Indexed keyframes so far.
+    #[must_use]
+    pub fn keyframes(&self) -> &[KeyframeIndexEntry] {
+        &self.keyframes
+    }
+
+    /// Records written so far (the end-of-stream marker included once written).
+    #[must_use]
+    pub const fn record_count(&self) -> usize {
+        self.record_count
+    }
+
+    /// Bytes written so far, magic included.
+    #[must_use]
+    pub const fn bytes_written(&self) -> u64 {
+        self.bytes_written
+    }
+
+    /// Appends the [`RecordType::EndOfStream`] marker stamped `timestamp_ms`, flushes and
+    /// returns the sink.
+    ///
+    /// # Errors
+    ///
+    /// Returns the sink's I/O error.
+    pub fn finish(mut self, timestamp_ms: u64) -> io::Result<W> {
+        self.append(&OdrecRecord {
+            record_type: RecordType::EndOfStream,
+            flags: RecordFlags::NONE,
+            timestamp_ms,
+            payload: Bytes::new(),
+        })?;
+        self.sink.flush()?;
+        Ok(self.sink)
     }
 }
 
@@ -720,6 +836,43 @@ mod tests {
                 .map(|k| k.record_index),
             Some(4)
         );
+    }
+
+    /// The streaming writer produces byte-for-byte what the in-memory writer produces and
+    /// keeps the same keyframe index.
+    #[test]
+    fn stream_writer_matches_in_memory_writer() {
+        let mut memory = OdrecWriter::new();
+        let mut stream = OdrecStreamWriter::new(Vec::new()).unwrap();
+        let records = [
+            OdrecRecord {
+                record_type: RecordType::Metadata,
+                flags: RecordFlags::NONE,
+                timestamp_ms: 10,
+                payload: Bytes::from_static(b"{}"),
+            },
+            frame(RecordFlags::KEYFRAME, 20, 100),
+            frame(RecordFlags::NONE, 30, 50),
+            frame(RecordFlags::KEYFRAME, 40, 100),
+        ];
+        for record in &records {
+            let a = memory.append(record).unwrap();
+            let b = stream.append(record).unwrap();
+            assert_eq!(a, b, "byte offsets agree");
+        }
+        assert_eq!(memory.keyframes(), stream.keyframes());
+        assert_eq!(stream.keyframe_hint_due(40), memory.keyframe_hint_due(40));
+        assert_eq!(stream.record_count(), 4);
+        assert_eq!(stream.bytes_written(), memory.as_bytes().len() as u64);
+
+        let bytes = stream.finish(50).unwrap();
+        assert_eq!(&bytes[..memory.as_bytes().len()], memory.as_bytes());
+        let parsed = parse_odrec_stream(&bytes).unwrap();
+        assert_eq!(parsed.len(), 5);
+        assert_eq!(parsed[4].record_type, RecordType::EndOfStream);
+        assert_eq!(parsed[4].timestamp_ms, 50);
+        assert!(parsed[1].flags.contains(RecordFlags::KEYFRAME));
+        assert!(!parsed[2].flags.contains(RecordFlags::KEYFRAME));
     }
 
     /// Companion to issue #29 `recording-player.ts:57`: the Rust parser rejects a trailing

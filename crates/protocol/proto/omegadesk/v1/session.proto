@@ -29,6 +29,8 @@ message Envelope {
     ChatMessage chat_message = 40;
     TerminalData terminal_data = 41;
     TerminalResize terminal_resize = 42;
+    MfaRequired mfa_required = 50;
+    MfaResponse mfa_response = 51;
   }
 }
 
@@ -41,6 +43,40 @@ message Hello {
   Capabilities capabilities = 4;
   // Access password displayed by the agent. Without it the agent rejects the connection.
   string access_password = 5;
+  // Self-reported device posture, evaluated by the agent against the session
+  // policy distributed by the coordinator (Phase 5). Optional: a policy that
+  // requires a minimum OS version rejects a Hello without it.
+  DevicePosture posture = 6;
+}
+
+// Endpoint posture attributes reported by the connecting device (Tailscale
+// `Hostinfo` model: self-reported, so policies pair them with checks the agent
+// can verify itself, such as the source network).
+message DevicePosture {
+  // `windows`, `linux` or `macos`.
+  string os_family = 1;
+  uint32 os_major = 2;
+  uint32 os_minor = 3;
+  // Patch level, or the build number on Windows.
+  uint32 os_patch = 4;
+}
+
+// Sent by the agent after a valid Hello when the session policy requires
+// per-connection MFA (`"action": "check"`): the client must answer with an
+// MfaResponse carrying the same challenge_id before HelloAck is sent
+// (RustDesk `REQUIRE_2FA` login flow, RFC 6238 TOTP).
+message MfaRequired {
+  string challenge_id = 1;
+  // Human-readable method hint shown by the client (`totp`).
+  string method = 2;
+  // Attempts left for this challenge before the connection is rejected.
+  uint32 attempts_left = 3;
+}
+
+message MfaResponse {
+  string challenge_id = 1;
+  // Six-digit TOTP code typed by the operator.
+  string code = 2;
 }
 
 message HelloAck {
@@ -108,6 +144,12 @@ enum ErrorCode {
   ERROR_CODE_UNAUTHORIZED = 2;
   ERROR_CODE_NO_COMMON_CODEC = 3;
   ERROR_CODE_INTERNAL = 4;
+  // The coordinator's session policy does not allow this peer to connect.
+  ERROR_CODE_POLICY_DENIED = 5;
+  // Per-connection MFA failed, timed out or the peer is locked out.
+  ERROR_CODE_MFA_FAILED = 6;
+  // The connecting device does not satisfy the policy's posture requirements.
+  ERROR_CODE_POSTURE_REJECTED = 7;
 }
 
 message VideoFrame {

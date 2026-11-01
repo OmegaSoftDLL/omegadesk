@@ -735,6 +735,8 @@ mod tests {
             tags: vec![],
             ephemeral: true,
             quicksupport_id: None,
+            user: String::new(),
+            session: None,
         }
     }
 

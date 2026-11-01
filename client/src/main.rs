@@ -75,6 +75,11 @@ struct Args {
     #[arg(long, env = "OMEGADESK_PASSWORD")]
     password: String,
 
+    /// One-time code from the authenticator app, for agents whose policy requires
+    /// per-connection MFA. Without it the code is asked for on the terminal.
+    #[arg(long)]
+    totp: Option<String>,
+
     /// Watch only; do not send keyboard or mouse events.
     #[arg(long)]
     view_only: bool,
@@ -154,8 +159,9 @@ fn main() -> anyhow::Result<()> {
             route,
             password: args.password,
             clipboard: !args.no_clipboard,
-            receive_dir: args.receive_dir,
-            send_files: args.send_file,
+            receive_dir: args.receive_dir.clone(),
+            send_files: args.send_file.clone(),
+            totp: args.totp,
         },
         shared.clone(),
         event_loop.create_proxy(),

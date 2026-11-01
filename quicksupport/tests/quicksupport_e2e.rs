@@ -197,12 +197,13 @@ async fn connect(tech: &Node, id: QuickSupportId) -> Connection {
 }
 
 /// Runs the technician's half of the handshake and returns the host's reply.
-async fn hello(connection: &Connection, password: &str) -> Envelope {
-    hello_with_control(connection, password).await.0
+async fn hello(tech: &Node, connection: &Connection, password: &str) -> Envelope {
+    hello_with_control(tech, connection, password).await.0
 }
 
 /// Keeps the control stream alive for tests that continue past `HelloAck`.
 async fn hello_with_control(
+    tech: &Node,
     connection: &Connection,
     password: &str,
 ) -> (Envelope, SendStream, EnvelopeReader) {
@@ -212,13 +213,14 @@ async fn hello_with_control(
         &Envelope {
             payload: Some(Payload::Hello(Hello {
                 protocol_version: PROTOCOL_VERSION,
-                device_public_key: vec![7u8; 32].into(),
+                device_public_key: tech.self_info().public.signing_key_bytes().to_vec().into(),
                 device_name: "tech-client".to_owned(),
                 capabilities: Some(Capabilities {
                     decoders: vec![VideoCodec::H264 as i32],
                     encoders: Vec::new(),
                 }),
                 access_password: password.to_owned(),
+                posture: None,
             })),
         },
     )
@@ -315,7 +317,7 @@ async fn host_checks_the_password_then_asks_for_consent() {
     let gate = ScriptedGate::new(true);
     let serving = serve_once(&host, &gate);
     let connection = connect(&tech, id).await;
-    let reply = hello(&connection, &mismatch_of(&password)).await;
+    let reply = hello(&tech, &connection, &mismatch_of(&password)).await;
     assert_eq!(error_message(&reply), "invalid password");
     let result = outcome(serving).await;
     assert!(
@@ -330,7 +332,7 @@ async fn host_checks_the_password_then_asks_for_consent() {
     let declining = ScriptedGate::new(false);
     let serving = serve_once(&host, &declining);
     let connection = connect(&tech, id).await;
-    let reply = hello(&connection, &password).await;
+    let reply = hello(&tech, &connection, &password).await;
     assert_eq!(error_message(&reply), "the user declined the session");
     let result = outcome(serving).await;
     assert!(matches!(result, SessionOutcome::Failed(_)), "{result:?}");
@@ -341,7 +343,7 @@ async fn host_checks_the_password_then_asks_for_consent() {
     let serving = serve_once(&host, &gate);
     let connection = connect(&tech, id).await;
     let (reply, _control_send, mut control_reader) =
-        hello_with_control(&connection, &password).await;
+        hello_with_control(&tech, &connection, &password).await;
     let Some(Payload::HelloAck(ack)) = reply.payload else {
         panic!("expected HelloAck, got {reply:?}");
     };
@@ -389,7 +391,7 @@ async fn ten_wrong_passwords_rotate_the_temporary_password() {
     for attempt in 1..=MAX_CONSECUTIVE_FAILURES {
         let serving = serve_once(&host, &gate);
         let connection = connect(&tech, id).await;
-        let reply = hello(&connection, &wrong).await;
+        let reply = hello(&tech, &connection, &wrong).await;
         assert_eq!(error_message(&reply), "invalid password");
         let result = outcome(serving).await;
         let expected_rotation = attempt == MAX_CONSECUTIVE_FAILURES;

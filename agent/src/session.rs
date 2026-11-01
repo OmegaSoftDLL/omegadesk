@@ -3,6 +3,7 @@
 //! display switching, video QoS) wired in from `crate::channels`.
 
 use std::future::Future;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -11,6 +12,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::bail;
 use omegadesk_codec::EncoderSettings;
+use omegadesk_control::PeerInfo;
 use omegadesk_identity::DeviceId;
 use omegadesk_input::{InputInjector, TargetDisplay};
 use omegadesk_protocol::v1::{
@@ -20,10 +22,12 @@ use omegadesk_protocol::v1::{
 use omegadesk_protocol::{PROTOCOL_VERSION, negotiate_codec};
 use omegadesk_session::MonitorCatalog;
 use omegadesk_session::clipboard_io::ClipboardWorker;
+use omegadesk_session::dlp::{ClipboardDirection, WatermarkConfig};
 use omegadesk_transport::{Connection, EnvelopeReader, SendStream, send_envelope};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
+use crate::access::{AccessControl, SessionAccess, describe_device};
 use crate::capture_loop::{self, EncoderChoice};
 use crate::channels::{clipboard, file_transfer, monitors, qos::AgentQos};
 
@@ -90,8 +94,8 @@ pub struct SessionConfig {
     pub settings: EncoderSettings,
     /// Whether remote keyboard and mouse events are injected.
     pub input: bool,
-    /// Consulted after the password check and before `HelloAck`; `None` admits
-    /// every authenticated client.
+    /// Consulted after the password and policy checks and before `HelloAck`;
+    /// `None` admits every authenticated client.
     pub gate: Option<Arc<dyn SessionGate>>,
     /// Synchronize the text clipboard with the client.
     pub clipboard: bool,
@@ -101,6 +105,8 @@ pub struct SessionConfig {
     pub receive_dir: PathBuf,
     /// Files pushed to every client right after the handshake.
     pub send_files: Vec<PathBuf>,
+    /// Policy, MFA, recording and audit enforcement shared by every session.
+    pub access: Arc<AccessControl>,
 }
 
 /// Shared state between the blocking capture thread and the async control task.
@@ -108,6 +114,8 @@ pub struct SessionConfig {
 pub(crate) struct SessionState {
     pub(crate) stop: AtomicBool,
     pub(crate) keyframe_requested: AtomicBool,
+    /// Forensic watermark the capture loop composes into every frame (policy `watermark`).
+    pub(crate) watermark: Option<WatermarkConfig>,
     target: Mutex<Option<TargetDisplay>>,
     /// Display the capture thread must capture (changed by `SelectDisplay`).
     monitor: AtomicU32,
@@ -166,15 +174,20 @@ impl SessionState {
     }
 }
 
-/// Serves a single client connection from handshake to teardown.
+/// Serves a single client connection from handshake to teardown. `peer` is the
+/// netmap entry owning the connection's remote address (`None` on the LAN).
 ///
 /// # Errors
 ///
 /// Returns an error when the handshake fails (a wrong password is reported as
 /// [`crate::password::Rejected`], reachable through `downcast_ref`) or the
 /// session ends abnormally.
-pub async fn run(connection: Connection, config: Arc<SessionConfig>) -> anyhow::Result<()> {
-    let result = serve(&connection, &config).await;
+pub async fn run(
+    connection: Connection,
+    config: Arc<SessionConfig>,
+    peer: Option<PeerInfo>,
+) -> anyhow::Result<()> {
+    let result = serve(&connection, &config, peer.as_ref()).await;
     let reason: &[u8] = if result.is_ok() { b"done" } else { b"error" };
     connection.close(close_code::NORMAL.into(), reason);
     let stats = connection.stats();
@@ -194,22 +207,79 @@ async fn open_video_stream(connection: &Connection) -> anyhow::Result<SendStream
     Ok(stream)
 }
 
-async fn serve(connection: &Connection, config: &Arc<SessionConfig>) -> anyhow::Result<()> {
+fn start_file_transfers(
+    connection: &Connection,
+    config: &SessionConfig,
+) -> (
+    Option<tokio::task::JoinHandle<()>>,
+    Option<tokio::task::JoinHandle<()>>,
+) {
+    if !config.file_transfer {
+        return (None, None);
+    }
+    if let Err(error) = file_transfer::prepare_receive_dir(&config.receive_dir) {
+        warn!(
+            "cannot create {}: {error}; incoming files will fail",
+            config.receive_dir.display()
+        );
+    }
+    (
+        Some(file_transfer::spawn_receiver(
+            connection.clone(),
+            config.receive_dir.clone(),
+        )),
+        file_transfer::spawn_sender(connection.clone(), config.send_files.clone()),
+    )
+}
+
+fn spawn_video(
+    mut video_send: SendStream,
+    mut frame_rx: mpsc::Receiver<omegadesk_protocol::v1::VideoFrame>,
+    access: SessionAccess,
+    state: Arc<SessionState>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        while let Some(frame) = frame_rx.recv().await {
+            let sequence = frame.sequence;
+            if access.record_frame(&frame) {
+                state.keyframe_requested.store(true, Ordering::Relaxed);
+            }
+            let envelope = Envelope {
+                payload: Some(Payload::VideoFrame(frame)),
+            };
+            if send_envelope(&mut video_send, &envelope).await.is_err() {
+                break;
+            }
+            state.note_frame_sent(sequence);
+        }
+    })
+}
+
+async fn serve(
+    connection: &Connection,
+    config: &Arc<SessionConfig>,
+    peer: Option<&PeerInfo>,
+) -> anyhow::Result<()> {
     let (mut control_send, control_recv) = connection.accept_bi().await?;
     let mut control = EnvelopeReader::new(control_recv);
-    if let Err(error) = handshake(&mut control_send, &mut control, config).await {
-        // Ensure the rejection reason reaches the client before closing:
-        // finish the stream and give the client a brief window to read it.
-        let _ = control_send.finish();
-        let _ = tokio::time::timeout(REJECT_GRACE, connection.closed()).await;
-        connection.close(close_code::REJECTED.into(), b"rejected");
-        return Err(error);
-    }
+    let remote = connection.remote_address();
+    let access = match handshake(&mut control_send, &mut control, config, peer, remote).await {
+        Ok((_codec, access)) => access,
+        Err(error) => {
+            // Ensure the rejection reason reaches the client before closing:
+            // finish the stream and give the client a brief window to read it.
+            let _ = control_send.finish();
+            let _ = tokio::time::timeout(REJECT_GRACE, connection.closed()).await;
+            connection.close(close_code::REJECTED.into(), b"rejected");
+            return Err(error);
+        }
+    };
 
     // Dedicated unidirectional stream for video so large keyframes do not block control messages.
-    let mut video_send = open_video_stream(connection).await?;
+    let video_send = open_video_stream(connection).await?;
     let state = Arc::new(SessionState {
         keyframe_requested: AtomicBool::new(true),
+        watermark: access.watermark(),
         ..SessionState::default()
     });
     let qos = AgentQos::new(config.settings);
@@ -221,25 +291,9 @@ async fn serve(connection: &Connection, config: &Arc<SessionConfig>) -> anyhow::
     // Messages produced outside the control loop (clipboard worker thread).
     let (outbound_tx, outbound_rx) = mpsc::unbounded_channel::<Envelope>();
     let clipboard = clipboard::start(config.clipboard, outbound_tx.clone());
-    let (file_receiver, file_sender) = if config.file_transfer {
-        if let Err(error) = file_transfer::prepare_receive_dir(&config.receive_dir) {
-            warn!(
-                "cannot create {}: {error}; incoming files will fail",
-                config.receive_dir.display()
-            );
-        }
-        (
-            Some(file_transfer::spawn_receiver(
-                connection.clone(),
-                config.receive_dir.clone(),
-            )),
-            file_transfer::spawn_sender(connection.clone(), config.send_files.clone()),
-        )
-    } else {
-        (None, None)
-    };
+    let (file_receiver, file_sender) = start_file_transfers(connection, config);
 
-    let (frame_tx, mut frame_rx) = mpsc::channel(VIDEO_QUEUE);
+    let (frame_tx, frame_rx) = mpsc::channel(VIDEO_QUEUE);
     let capture = {
         let state = state.clone();
         let config = config.clone();
@@ -250,21 +304,7 @@ async fn serve(connection: &Connection, config: &Arc<SessionConfig>) -> anyhow::
             })?
     };
 
-    let video = {
-        let state = state.clone();
-        tokio::spawn(async move {
-            while let Some(frame) = frame_rx.recv().await {
-                let sequence = frame.sequence;
-                let envelope = Envelope {
-                    payload: Some(Payload::VideoFrame(frame)),
-                };
-                if send_envelope(&mut video_send, &envelope).await.is_err() {
-                    break;
-                }
-                state.note_frame_sent(sequence);
-            }
-        })
-    };
+    let video = spawn_video(video_send, frame_rx, access.clone(), state.clone());
 
     let injector = if config.input {
         match omegadesk_input::open() {
@@ -286,7 +326,14 @@ async fn serve(connection: &Connection, config: &Arc<SessionConfig>) -> anyhow::
         clipboard,
         qos,
     };
-    let result = serve_control(&mut control_send, &mut control, &mut channels, &state).await;
+    let result = serve_control(
+        &mut control_send,
+        &mut control,
+        &mut channels,
+        &state,
+        &access,
+    )
+    .await;
 
     state.stop.store(true, Ordering::Relaxed);
     video.abort();
@@ -305,15 +352,22 @@ async fn serve(connection: &Connection, config: &Arc<SessionConfig>) -> anyhow::
     {
         warn!("capture thread panicked");
     }
+    access.finish(match &result {
+        Ok(()) => "closed by client",
+        Err(_) => "ended with error",
+    });
     result
 }
 
-/// Receives `Hello`, verifies the access password, negotiates a video codec, and replies with `HelloAck`.
+/// Receives `Hello`, verifies the access password, applies the coordinator's policy decision
+/// (posture, MFA step-up), negotiates a video codec, and replies with `HelloAck`.
 async fn handshake(
     control_send: &mut SendStream,
     control: &mut EnvelopeReader,
     config: &SessionConfig,
-) -> anyhow::Result<VideoCodec> {
+    peer: Option<&PeerInfo>,
+    remote: SocketAddr,
+) -> anyhow::Result<(VideoCodec, SessionAccess)> {
     let Some(Envelope {
         payload: Some(Payload::Hello(hello)),
     }) = control.next().await?
@@ -337,6 +391,17 @@ async fn handshake(
         reject(control_send, ErrorCode::Unauthorized, "invalid password").await;
         return Err(crate::password::Rejected.into());
     }
+    let access = match config
+        .access
+        .authorize(control_send, control, &hello, peer, remote)
+        .await
+    {
+        Ok(access) => access,
+        Err(rejection) => {
+            reject(control_send, rejection.code, &rejection.message).await;
+            bail!("session refused: {rejection}");
+        }
+    };
     let client_decoders: Vec<VideoCodec> = hello
         .capabilities
         .as_ref()
@@ -385,7 +450,7 @@ async fn handshake(
         },
     )
     .await?;
-    Ok(codec)
+    Ok((codec, access))
 }
 
 /// Everything the control loop multiplexes besides the control stream itself.
@@ -408,6 +473,7 @@ async fn serve_control(
     control: &mut EnvelopeReader,
     channels: &mut ControlChannels,
     state: &SessionState,
+    access: &SessionAccess,
 ) -> anyhow::Result<()> {
     let mut target = None;
     let mut ticker = tokio::time::interval(QOS_TICK);
@@ -416,7 +482,7 @@ async fn serve_control(
             envelope = control.next() => {
                 match envelope {
                     Ok(Some(envelope)) => {
-                        handle_control(envelope, control_send, channels, state, &mut target).await?;
+                        handle_control(envelope, control_send, channels, state, access, &mut target).await?;
                     }
                     Ok(None) => return Ok(()),
                     Err(omegadesk_transport::TransportError::Read(
@@ -444,6 +510,7 @@ async fn handle_control(
     control_send: &mut SendStream,
     channels: &mut ControlChannels,
     state: &SessionState,
+    access: &SessionAccess,
     target: &mut Option<TargetDisplay>,
 ) -> anyhow::Result<()> {
     match envelope.payload {
@@ -477,16 +544,24 @@ async fn handle_control(
             send_envelope(control_send, &monitors::display_list(&channels.catalog)).await?;
         }
         Some(Payload::ClipboardEvent(event)) => {
-            clipboard::apply(channels.clipboard.as_ref(), event);
+            if access
+                .check_clipboard(ClipboardDirection::ClientToHost, event.data.len())
+                .is_ok()
+            {
+                access.record_input(&Payload::ClipboardEvent(event.clone()));
+                clipboard::apply(channels.clipboard.as_ref(), event);
+            }
         }
-        Some(Payload::KeyEvent(key)) => {
+        Some(payload @ Payload::KeyEvent(key)) => {
+            access.record_input(&payload);
             if let Some(injector) = channels.injector.as_mut()
                 && let Err(error) = injector.key(&key)
             {
                 warn!("key event not injected: {error}");
             }
         }
-        Some(Payload::PointerEvent(pointer)) => {
+        Some(payload @ Payload::PointerEvent(pointer)) => {
+            access.record_input(&payload);
             if let Some(injector) = channels.injector.as_mut() {
                 // The captured monitor bounds change across reopen, mode and display switches.
                 let current = state.target();
@@ -517,7 +592,9 @@ async fn handle_control(
             | Payload::FileTransferAck(_)
             | Payload::ChatMessage(_)
             | Payload::TerminalData(_)
-            | Payload::TerminalResize(_),
+            | Payload::TerminalResize(_)
+            | Payload::MfaRequired(_)
+            | Payload::MfaResponse(_),
         )
         | None => {}
     }
@@ -532,18 +609,4 @@ async fn reject(stream: &mut SendStream, code: ErrorCode, message: &str) {
         })),
     };
     let _ = send_envelope(stream, &envelope).await;
-}
-
-/// Formats the peer's `DeviceId` from its 32-byte signing public key for logging.
-/// In Phase 2 the coordinator authorizes sessions using this identity.
-fn describe_device(public_key: &[u8]) -> String {
-    <[u8; 32]>::try_from(public_key).map_or_else(
-        |_| "no identity".to_owned(),
-        |key| {
-            format!(
-                "ID {}",
-                omegadesk_identity::DeviceId::from_signing_key(&key)
-            )
-        },
-    )
 }

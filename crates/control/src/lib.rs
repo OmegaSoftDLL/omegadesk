@@ -17,6 +17,7 @@ use omegadesk_identity::{DeviceId, DeviceIdentity, DevicePublic, IdentityError, 
 use omegadesk_noise::{
     InitiatorHandshake, MAX_FRAME_CIPHERTEXT_LEN, NoiseError, NoiseReceiver, NoiseSender,
 };
+pub use omegadesk_policy::SessionDecision;
 use omegadesk_protocol::control::CONTROL_PROTOCOL_VERSION;
 use omegadesk_protocol::control::v1 as control;
 use omegadesk_relay::{RelayError, RelayTicket};
@@ -130,6 +131,12 @@ pub struct PeerInfo {
     /// Nine-digit QuickSupport ID assigned by the coordinator; `None` for
     /// agents and clients.
     pub quicksupport_id: Option<QuickSupportId>,
+    /// Owner of the peer in the policy (`alice@example.com`); empty for tagged machines.
+    pub user: String,
+    /// What this peer may do when it opens a remote session on *this* node, compiled by
+    /// the coordinator from the tenant policy. `None` when the coordinator runs without a
+    /// policy file: every peer of the tenant is visible and only the access password applies.
+    pub session: Option<SessionDecision>,
 }
 
 impl PeerInfo {
@@ -180,6 +187,8 @@ impl PeerInfo {
                         .map_err(|_| ControlError::Malformed("quicksupport id"))?,
                 )
             },
+            user: info.user.clone(),
+            session: info.session.as_ref().map(SessionDecision::from_proto),
         })
     }
 }
@@ -1020,6 +1029,138 @@ mod tests {
         assert!(
             matches!(event, Some(NetmapEvent::Disconnected(ref reason)) if reason.contains("no control traffic")),
             "{event:?}"
+        );
+    }
+
+    /// Phase 5, in process over the real control protocol: with a policy loaded the
+    /// coordinator hands every node a filtered netmap whose peers carry the session
+    /// grant, and a policy reload reaches the connected nodes as deltas.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines, reason = "one scenario over the real protocol")]
+    async fn policy_filters_the_netmap_received_over_the_control_channel() {
+        let (addr, server_public, _key, coord) = start_coordinator([5u8; 32]).await;
+        let (helpdesk_key, server_key, guest_key) = {
+            let mut guard = coord.lock().unwrap();
+            (
+                guard
+                    .create_preauth_key_for_user(
+                        "acme",
+                        "alice@example.com",
+                        true,
+                        false,
+                        vec!["tag:helpdesk".into()],
+                        None,
+                    )
+                    .unwrap(),
+                guard
+                    .create_preauth_key("acme", true, false, vec!["tag:servers".into()], None)
+                    .unwrap(),
+                guard
+                    .create_preauth_key("acme", true, false, vec!["tag:guest".into()], None)
+                    .unwrap(),
+            )
+        };
+        let policy = omegadesk_policy::PolicyV2::parse_hujson(
+            r#"{ "sessions": [
+                { "action": "check", "src": ["tag:helpdesk"], "dst": ["tag:servers"], "record": true }
+            ] }"#,
+        )
+        .unwrap();
+        coord.lock().unwrap().set_policy(Some(policy));
+
+        let connect = |identity: Arc<DeviceIdentity>, key: String, hostname: &str| {
+            let config = ControlConfig {
+                server_addr: addr.to_string(),
+                server_public,
+                preauth_key: key,
+                hostname: hostname.to_owned(),
+                endpoints: vec![],
+                quicksupport_id: None,
+            };
+            ControlClient::connect(identity, config)
+        };
+        let server = Arc::new(DeviceIdentity::generate());
+        let (mut server_ctl, server_enrollment) =
+            connect(Arc::clone(&server), server_key, "server")
+                .await
+                .unwrap();
+        assert_eq!(server_enrollment.peers, Vec::<PeerInfo>::new());
+
+        // The guest is enrolled but invisible to the server, and sees nobody.
+        let guest = Arc::new(DeviceIdentity::generate());
+        let (mut guest_ctl, guest_enrollment) = connect(Arc::clone(&guest), guest_key, "guest")
+            .await
+            .unwrap();
+        assert_eq!(guest_enrollment.peers, Vec::<PeerInfo>::new());
+
+        // Helpdesk appears at the server with its grant; the guest hears nothing.
+        let helpdesk = Arc::new(DeviceIdentity::generate());
+        let (_helpdesk_ctl, helpdesk_enrollment) =
+            connect(Arc::clone(&helpdesk), helpdesk_key, "helpdesk")
+                .await
+                .unwrap();
+        assert_eq!(helpdesk_enrollment.self_node.user, "alice@example.com");
+        assert_eq!(helpdesk_enrollment.peers.len(), 1);
+        let server_as_seen = &helpdesk_enrollment.peers[0];
+        assert_eq!(server_as_seen.id(), server.id());
+        assert_eq!(
+            server_as_seen.session,
+            Some(SessionDecision::DENIED),
+            "the server may not open a session on the helpdesk machine"
+        );
+        let event = tokio::time::timeout(Duration::from_secs(5), server_ctl.next_event())
+            .await
+            .unwrap()
+            .unwrap();
+        let NetmapEvent::PeerUpserted(peer) = event else {
+            panic!("expected PeerUpserted, got {event:?}");
+        };
+        assert_eq!(peer.id(), helpdesk.id());
+        let grant = peer.session.expect("grant travels with the peer");
+        assert!(grant.allowed && grant.require_mfa && grant.record);
+        assert!(!grant.watermark);
+
+        // Reload: the guest becomes a helpdesk by policy and shows up at the server.
+        let widened = omegadesk_policy::PolicyV2::parse_hujson(
+            r#"{ "sessions": [
+                { "action": "check", "src": ["tag:helpdesk"], "dst": ["tag:servers"], "record": true },
+                { "action": "accept", "src": ["tag:guest"], "dst": ["tag:servers"], "watermark": true }
+            ] }"#,
+        )
+        .unwrap();
+        let sent = coord.lock().unwrap().set_policy(Some(widened));
+        assert!(sent >= 2, "{sent}");
+        let event = tokio::time::timeout(Duration::from_secs(5), server_ctl.next_event())
+            .await
+            .unwrap()
+            .unwrap();
+        let NetmapEvent::PeerUpserted(peer) = event else {
+            panic!("expected PeerUpserted, got {event:?}");
+        };
+        assert_eq!(peer.id(), guest.id());
+        let grant = peer.session.unwrap();
+        assert!(grant.allowed && grant.watermark && !grant.require_mfa);
+        let event = tokio::time::timeout(Duration::from_secs(5), guest_ctl.next_event())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(&event, NetmapEvent::PeerUpserted(peer) if peer.id() == server.id()),
+            "{event:?}"
+        );
+
+        // Tighten again: the guest loses the server.
+        let narrow = omegadesk_policy::PolicyV2::parse_hujson(r#"{ "sessions": [] }"#).unwrap();
+        coord.lock().unwrap().set_policy(Some(narrow));
+        let event = tokio::time::timeout(Duration::from_secs(5), guest_ctl.next_event())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            event,
+            NetmapEvent::PeerRemoved {
+                signing_key: server.public().signing_key_bytes()
+            }
         );
     }
 }

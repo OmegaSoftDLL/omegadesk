@@ -513,6 +513,10 @@ async fn handshake(
                     encoders: Vec::new(),
                 }),
                 access_password: password.to_owned(),
+                // The gateway cannot attest the browser's OS, so it reports no
+                // posture: a policy that requires one fails the session closed
+                // (per-connection MFA for browser sessions lands with Phase 4).
+                posture: None,
             })),
         },
     )
