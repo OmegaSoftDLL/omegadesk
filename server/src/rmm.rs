@@ -12,21 +12,24 @@
 //!   `Shared/Entities/ScriptSchedule.cs` (lines 7–44),
 //!   `Server/Services/ScriptScheduleDispatcher.cs` (lines 31–158), and
 //!   `Server/Services/ScriptScheduler.cs` (lines 5–75): `ScriptingShell` (`PSCore`, `WinPS`,
-//!   `Bash`, `CMD`), `RepeatInterval` (`Hourly`, `Daily`, `Weekly`, `Monthly`), `AdvanceSchedule`
-//!   and `CatchUpNextRun`, deduplicated device + device-group target resolution, and
+//!   `Bash`, `CMD`), `RepeatInterval` (`Hourly`, `Daily`, `Weekly`, `Monthly` anchored to
+//!   `StartAt.AddMonths(i)`), `AdvanceSchedule` and `CatchUpNextRun`, deduplicated device +
+//!   device-group target resolution scoped to the schedule's `OrganizationID`, and
 //!   `RunOnNextConnect` vs online-only dispatch.
-//! - `Ylianst_MeshCentral/meshagent.js` (lines 139–145, 292–449): `MeshCommand_CoreModule (10)`,
+//! - `Ylianst_MeshCentral/meshagent.js` (lines 53, 139–145, 292–449): `MeshCommand_CoreModule (10)`,
 //!   `MeshCommand_AgentHash (12)`, `MeshCommand_AgentStartDownload / EndDownload (13)`,
 //!   `MeshCommand_AgentBinaryBlock (14)` (`[0, 14, 0, 1, ..chunk]` driven by agent ACK
-//!   `[0, 14, 0, 1]`), and `taskLimiter` concurrency cap so simultaneous agent updates never
-//!   saturate the server.
+//!   `[0, 14, 0, 1]`), `taskLimiter` concurrency cap so simultaneous agent updates never
+//!   saturate the server, the `agentidletimeout` socket timeout, and the `obj.close` cleanup
+//!   that releases the `taskLimiter` slot when an agent drops mid-download.
 //! - `docs/plan.md` §2.8: per-site expiring deployment links and identity-bound
 //!   `agent.<device_id>.<channel>` message bus over QUIC on the mesh.
 
 use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
 
 use bytes::{BufMut, Bytes, BytesMut};
-use data_encoding::HEXLOWER;
+use data_encoding::{HEXLOWER, HEXLOWER_PERMISSIVE};
 use omegadesk_identity::DeviceId;
 use ring::hmac;
 use sha2::{Digest, Sha256};
@@ -34,6 +37,13 @@ use thiserror::Error;
 
 /// Default block size in bytes for chunked agent binary updates (`16 KiB`, `meshagent.js` line 315).
 pub const DEFAULT_AGENT_UPDATE_BLOCK_SIZE: usize = 16_384;
+
+/// Default stall timeout for an active agent binary transfer: a transfer that receives no block
+/// ACK for this long is dropped and its `taskLimiter` slot released (`meshagent.js` line 53:
+/// `agentidletimeout` closes a silent agent socket after 2 min 30 s).
+pub const DEFAULT_TRANSFER_STALL_TIMEOUT_MS: u64 = 150_000;
+
+const SECS_PER_DAY: u64 = 86_400;
 
 /// `MeshCommand_CoreModule` (`10` in `meshagent.js` line 319: clear or update core module).
 pub const CMD_CORE_MODULE: u16 = 10;
@@ -200,21 +210,86 @@ pub enum RepeatInterval {
     Daily,
     /// Every 7 days (`604_800 s`).
     Weekly,
-    /// Every 30-day month (`2_592_000 s`).
+    /// Every calendar month, anchored to the schedule's start date
+    /// (`schedule.StartAt.AddMonths(i)` in `ScriptScheduleDispatcher.cs` lines 138–143).
     Monthly,
 }
 
 impl RepeatInterval {
-    /// Returns the step duration in seconds for this interval.
+    /// Returns the fixed step duration in seconds for this interval, or `None` for
+    /// [`RepeatInterval::Monthly`], whose length depends on the calendar (28–31 days) and is
+    /// advanced with [`add_calendar_months`] instead.
     #[must_use]
-    pub const fn step_secs(self) -> u64 {
+    pub const fn fixed_step_secs(self) -> Option<u64> {
         match self {
-            Self::Hourly => 3_600,
-            Self::Daily => 86_400,
-            Self::Weekly => 604_800,
-            Self::Monthly => 2_592_000,
+            Self::Hourly => Some(3_600),
+            Self::Daily => Some(SECS_PER_DAY),
+            Self::Weekly => Some(7 * SECS_PER_DAY),
+            Self::Monthly => None,
         }
     }
+}
+
+/// Converts a proleptic Gregorian civil date to days since the Unix epoch (Howard Hinnant's
+/// `days_from_civil`, valid for every date representable as `i64` days).
+fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = y.div_euclid(400);
+    let yoe = y.rem_euclid(400);
+    let mp = (i64::from(month) + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + i64::from(day) - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+/// Converts days since the Unix epoch to a `(year, month, day)` civil date (Howard Hinnant's
+/// `civil_from_days`).
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    (
+        year,
+        u32::try_from(month).unwrap_or(1),
+        u32::try_from(day).unwrap_or(1),
+    )
+}
+
+const fn days_in_month(year: i64, month: u32) -> u32 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        _ => {
+            let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+            if leap { 29 } else { 28 }
+        }
+    }
+}
+
+/// Returns `start_unix_secs` advanced by `months` calendar months, clamping the day of the month
+/// to the length of the target month and keeping the time of day. This mirrors the .NET
+/// `DateTimeOffset.AddMonths` call in `ScriptScheduleDispatcher.cs` line 141, so a schedule
+/// anchored on January 31 runs on February 28 (or 29) and then on March 31, never drifting.
+#[must_use]
+pub fn add_calendar_months(start_unix_secs: u64, months: u32) -> u64 {
+    let days = i64::try_from(start_unix_secs / SECS_PER_DAY).unwrap_or(i64::MAX);
+    let secs_of_day = start_unix_secs % SECS_PER_DAY;
+    let (year, month, day) = civil_from_days(days);
+    let month_index = i64::from(month) - 1 + i64::from(months);
+    let target_year = year + month_index.div_euclid(12);
+    let target_month = u32::try_from(month_index.rem_euclid(12)).unwrap_or(0) + 1;
+    let target_day = day.min(days_in_month(target_year, target_month));
+    let target_days = days_from_civil(target_year, target_month, target_day);
+    u64::try_from(target_days)
+        .unwrap_or(0)
+        .saturating_mul(SECS_PER_DAY)
+        .saturating_add(secs_of_day)
 }
 
 /// Saved script definition stored in the RMM library (`SavedScript.cs`).
@@ -243,6 +318,10 @@ pub struct ScriptSchedule {
     pub saved_script_id: String,
     /// Recurrence interval (`Interval` in `ScriptSchedule.cs` line 25).
     pub interval: RepeatInterval,
+    /// Original scheduled date in UNIX seconds (`StartAt` in `ScriptSchedule.cs` line 33). The
+    /// anchor for [`RepeatInterval::Monthly`]: every run lands on the same day of the month and
+    /// time of day as this instant (clamped to the month length).
+    pub start_at_unix_secs: u64,
     /// Next scheduled execution timestamp in UNIX seconds (`NextRun` in `ScriptSchedule.cs` line 31).
     pub next_run_unix_secs: u64,
     /// Last execution timestamp in UNIX seconds (`LastRun` in `ScriptSchedule.cs` line 27).
@@ -264,9 +343,23 @@ impl ScriptSchedule {
         if self.next_run_unix_secs > now_unix_secs {
             return false;
         }
-        let step = self.interval.step_secs();
-        while self.next_run_unix_secs <= now_unix_secs {
-            self.next_run_unix_secs = self.next_run_unix_secs.saturating_add(step);
+        if let Some(step) = self.interval.fixed_step_secs() {
+            // `CatchUpNextRun` (`ScriptScheduleDispatcher.cs` lines 152–158).
+            while self.next_run_unix_secs <= now_unix_secs {
+                self.next_run_unix_secs = self.next_run_unix_secs.saturating_add(step);
+            }
+        } else {
+            // `ScriptScheduleDispatcher.cs` lines 138–143: `NextRun = StartAt.AddMonths(i)` for
+            // the first `i` that lands after now. Every month is at most 31 days, so starting
+            // from `elapsed / 31 days` never overshoots and the loop runs a handful of times.
+            let elapsed = now_unix_secs.saturating_sub(self.start_at_unix_secs);
+            let mut months = u32::try_from(elapsed / (31 * SECS_PER_DAY)).unwrap_or(u32::MAX);
+            let mut candidate = add_calendar_months(self.start_at_unix_secs, months);
+            while candidate <= now_unix_secs && months < u32::MAX {
+                months += 1;
+                candidate = add_calendar_months(self.start_at_unix_secs, months);
+            }
+            self.next_run_unix_secs = candidate;
         }
         self.last_run_unix_secs = Some(now_unix_secs);
         true
@@ -316,6 +409,11 @@ impl ScriptScheduler {
     /// `device_ids` and `site_ids` memberships from `inventories`, dispatching immediately to
     /// online devices, and queueing offline devices when `run_on_next_connect` is `true`
     /// (`DispatchPendingScriptRuns` in `ScriptScheduleDispatcher.cs` lines 31–108).
+    ///
+    /// Both target kinds are scoped to the schedule's tenant: in Remotely the `Devices` and
+    /// `DeviceGroups` navigation properties (`ScriptSchedule.cs` lines 17–20) can only reference
+    /// rows of the same `OrganizationID`, so a direct device ID whose inventory belongs to another
+    /// tenant, or that is not in the inventory at all, is skipped instead of dispatched or queued.
     pub fn dispatch_due_runs(
         &mut self,
         inventories: &HashMap<DeviceId, DeviceInventory>,
@@ -330,7 +428,10 @@ impl ScriptScheduler {
 
             let mut target_devices: Vec<DeviceId> = Vec::new();
             for dev_id in &schedule.device_ids {
-                if !target_devices.contains(dev_id) {
+                let owned_by_tenant = inventories
+                    .get(dev_id)
+                    .is_some_and(|inv| inv.tenant_id == schedule.tenant_id);
+                if owned_by_tenant && !target_devices.contains(dev_id) {
                     target_devices.push(*dev_id);
                 }
             }
@@ -437,8 +538,13 @@ impl DeploymentLinkManager {
         let site_id = site_id.into();
         let installer_target = installer_target.into();
 
-        let msg = format!(
-            "{link_id}|{tenant_id}|{site_id}|{installer_target}|{expires_at_unix_secs}|{max_uses}"
+        let msg = link_message(
+            &link_id,
+            &tenant_id,
+            &site_id,
+            &installer_target,
+            expires_at_unix_secs,
+            max_uses,
         );
         let tag = hmac::sign(&self.signing_key, msg.as_bytes());
         let token_hex = HEXLOWER.encode(tag.as_ref());
@@ -463,7 +569,7 @@ impl DeploymentLinkManager {
     /// # Errors
     ///
     /// Returns [`RmmError::InvalidDeploymentLink`] if the link is unknown, expired, exhausted,
-    /// or the HMAC token does not match.
+    /// or the HMAC token does not verify.
     pub fn redeem_link(
         &mut self,
         link_id: &str,
@@ -479,12 +585,41 @@ impl DeploymentLinkManager {
         if link.max_uses > 0 && link.current_uses >= link.max_uses {
             return Err(RmmError::InvalidDeploymentLink("Link max uses reached"));
         }
-        if link.token_hex != token_hex {
+        // The token is a bearer secret: decode the hex tag and let `ring::hmac::verify` compare
+        // it in constant time against a MAC recomputed over the issued link parameters. A plain
+        // `String` comparison would stop at the first differing character and leak the length of
+        // the matching prefix through timing. The permissive decoder accepts either hex case
+        // because what is compared is the MAC bytes, not their textual encoding.
+        let msg = link_message(
+            &link.link_id,
+            &link.tenant_id,
+            &link.site_id,
+            &link.installer_target,
+            link.expires_at_unix_secs,
+            link.max_uses,
+        );
+        let tag = HEXLOWER_PERMISSIVE
+            .decode(token_hex.as_bytes())
+            .map_err(|_| RmmError::InvalidDeploymentLink("Token signature mismatch"))?;
+        if hmac::verify(&self.signing_key, msg.as_bytes(), &tag).is_err() {
             return Err(RmmError::InvalidDeploymentLink("Token signature mismatch"));
         }
         link.current_uses += 1;
         Ok((link.tenant_id.clone(), link.site_id.clone()))
     }
+}
+
+/// Canonical message authenticated by a deployment link token: every parameter the installer
+/// is trusted with, so none of them can be swapped without invalidating the tag.
+fn link_message(
+    link_id: &str,
+    tenant_id: &str,
+    site_id: &str,
+    installer_target: &str,
+    expires_at_unix_secs: u64,
+    max_uses: u32,
+) -> String {
+    format!("{link_id}|{tenant_id}|{site_id}|{installer_target}|{expires_at_unix_secs}|{max_uses}")
 }
 
 /// Target agent binary image managed by [`AgentUpdateManager`] (`obj.agentExeInfo` in `meshagent.js`).
@@ -516,22 +651,37 @@ impl AgentBinaryImage {
     }
 }
 
+/// One in-flight binary stream. The image is pinned once at start, exactly like
+/// `obj.agentUpdate.agentUpdateData` / `agentUpdateHash` in `meshagent.js` lines 364–372, so a
+/// `register_image` replacing that architecture mid-transfer never mixes two binaries or sends
+/// the wrong completion hash to an agent that already received the old prefix.
 #[derive(Debug, Clone)]
 struct ActiveAgentTransfer {
-    arch_key: String,
+    image: Arc<AgentBinaryImage>,
     ptr: usize,
+    last_progress_ms: u64,
 }
 
 /// Chunked agent binary auto-updater with concurrency limiting (`taskLimiter`), ported directly
-/// from `Ylianst_MeshCentral/meshagent.js` (lines 139–145, 292–449).
+/// from `Ylianst_MeshCentral/meshagent.js` (lines 53, 139–145, 292–449).
+///
+/// Slots are released in three ways, each mirroring the reference: the final block is `ACKed`
+/// (`taskLimiter.completed` in line 443), the agent's stream closes
+/// ([`Self::cancel_transfer`], `obj.close` in lines 139–145), or the agent stays silent for the
+/// stall timeout ([`Self::expire_stalled_transfers`], `agentidletimeout` in line 53). A hash
+/// report from an agent that still holds a slot is treated as a reconnect and restarts the
+/// download from byte zero.
 #[derive(Debug, Clone)]
 pub struct AgentUpdateManager {
     max_concurrent_updates: usize,
     block_size: usize,
-    images: HashMap<String, AgentBinaryImage>,
+    images: HashMap<String, Arc<AgentBinaryImage>>,
     active_transfers: HashMap<DeviceId, ActiveAgentTransfer>,
     waiting_queue: VecDeque<(DeviceId, String)>,
 }
+
+/// Frames to send to agents promoted out of the `taskLimiter` queue into freed slots.
+pub type PromotedTransfers = Vec<(DeviceId, Vec<Bytes>)>;
 
 impl AgentUpdateManager {
     /// Creates an update manager allowing at most `max_concurrent_updates` simultaneous binary
@@ -547,9 +697,10 @@ impl AgentUpdateManager {
         }
     }
 
-    /// Registers the canonical [`AgentBinaryImage`] for an architecture.
+    /// Registers the canonical [`AgentBinaryImage`] for an architecture. Transfers already in
+    /// flight keep streaming the snapshot they started with; only new transfers use `image`.
     pub fn register_image(&mut self, image: AgentBinaryImage) {
-        self.images.insert(image.arch_key.clone(), image);
+        self.images.insert(image.arch_key.clone(), Arc::new(image));
     }
 
     /// Returns the number of currently active binary transfers.
@@ -565,102 +716,168 @@ impl AgentUpdateManager {
     }
 
     /// Processes an agent's reported binary hash (`MeshCommand_AgentHash = 12`, `meshagent.js`
-    /// line 292). If the agent's hash matches the current image, returns an empty vector.
-    /// If an update is needed and a concurrency slot is available, starts the download and
-    /// returns the initial binary control frames (`cmd 10`, `cmd 13`, and first `cmd 14` block);
-    /// otherwise places the agent in the `taskLimiter` queue.
+    /// line 292) at `now_ms`. Returns the frames for this agent and the frames for any agents
+    /// promoted out of the queue as a side effect.
+    ///
+    /// - Hash matches the current image: the agent is up to date; any slot or queue entry it
+    ///   still held (it may have been updated through a transfer we never saw complete) is
+    ///   released and waiting agents are promoted.
+    /// - Hash differs and the agent already holds a slot: the agent reconnected after a dropped
+    ///   stream (a fresh `cmd 12` is only sent on connect), so the download restarts from byte
+    ///   zero in the same slot instead of being ignored.
+    /// - Hash differs and a slot is free: starts the download and returns the initial control
+    ///   frames (`cmd 10`, `cmd 13`, and the first `cmd 14` block).
+    /// - Otherwise: places the agent in the `taskLimiter` queue (or leaves it there).
     pub fn handle_agent_hash(
         &mut self,
         device_id: DeviceId,
         arch_key: &str,
         reported_hash: &[u8; 32],
-    ) -> Vec<Bytes> {
-        let Some(image) = self.images.get(arch_key) else {
-            return Vec::new();
+        now_ms: u64,
+    ) -> (Vec<Bytes>, PromotedTransfers) {
+        let Some(image) = self.images.get(arch_key).cloned() else {
+            return (Vec::new(), Vec::new());
         };
         if &image.sha256_hash == reported_hash {
-            return Vec::new();
+            let promoted = self.cancel_transfer(device_id, now_ms);
+            return (Vec::new(), promoted);
         }
-        if self.active_transfers.contains_key(&device_id)
-            || self
-                .waiting_queue
-                .iter()
-                .any(|(queued_id, _)| *queued_id == device_id)
+        if self
+            .waiting_queue
+            .iter()
+            .any(|(queued_id, _)| *queued_id == device_id)
         {
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         }
 
-        if self.active_transfers.len() >= self.max_concurrent_updates {
+        let reconnect = self.active_transfers.remove(&device_id).is_some();
+        if !reconnect && self.active_transfers.len() >= self.max_concurrent_updates {
             self.waiting_queue
                 .push_back((device_id, arch_key.to_owned()));
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         }
 
-        self.start_transfer(device_id, arch_key)
+        let frames = self.start_transfer(device_id, image, now_ms);
+        // A transfer that fits in a single block completes inside `start_transfer` without ever
+        // occupying a slot. On the reconnect path the slot this agent held is now free, so
+        // waiting agents must be promoted here or they would stay queued with no later ACK or
+        // expiry able to release them.
+        let promoted = self.promote_waiting(now_ms);
+        (frames, promoted)
     }
 
     /// Processes a 4-byte `MeshCommand_AgentBinaryBlock` ACK (`[0, 14, 0, 1]`, `status == 1` in
-    /// `meshagent.js` lines 400–448), returning the next chunk frame (`[0, 14, 0, 1, ..data]`)
-    /// and, once `ptr == data.len()`, the final `MeshCommand_AgentDownload (13)` completion
-    /// frame carrying the expected binary hash (`[0, 13, 0, 0, ..hash]`).
+    /// `meshagent.js` lines 400–448) at `now_ms`, returning the next chunk frame
+    /// (`[0, 14, 0, 1, ..data]`) and, once `ptr == data.len()`, the final
+    /// `MeshCommand_AgentDownload (13)` completion frame carrying the hash of the snapshot that
+    /// was streamed (`[0, 13, 0, 0, ..hash]`). Every chunk and the hash come from the image
+    /// pinned when the transfer started, never from the currently registered image.
     pub fn handle_block_ack(
         &mut self,
         device_id: DeviceId,
         ack_msg: &[u8],
-    ) -> (Vec<Bytes>, Vec<(DeviceId, Vec<Bytes>)>) {
+        now_ms: u64,
+    ) -> (Vec<Bytes>, PromotedTransfers) {
         if ack_msg != [0, 14, 0, 1] {
             return (Vec::new(), Vec::new());
         }
+        let block_size = self.block_size;
         let Some(transfer) = self.active_transfers.get_mut(&device_id) else {
             return (Vec::new(), Vec::new());
         };
-        let Some(image) = self.images.get(&transfer.arch_key) else {
-            self.active_transfers.remove(&device_id);
-            return (Vec::new(), Vec::new());
-        };
+        let image = Arc::clone(&transfer.image);
 
         let mut frames = Vec::new();
         let remaining = image.data.len().saturating_sub(transfer.ptr);
         if remaining > 0 {
-            let len = self.block_size.min(remaining);
+            let len = block_size.min(remaining);
             let chunk = &image.data[transfer.ptr..transfer.ptr + len];
             transfer.ptr += len;
             frames.push(encode_binary_block_frame(chunk));
         }
+        transfer.last_progress_ms = now_ms;
+        let finished = transfer.ptr >= image.data.len();
 
         let mut promoted = Vec::new();
-        if transfer.ptr >= image.data.len() {
+        if finished {
             frames.push(encode_end_download_frame(&image.sha256_hash));
             self.active_transfers.remove(&device_id);
             // Release taskLimiter slot and start next queued agent (`meshagent.js` line 443).
-            while self.active_transfers.len() < self.max_concurrent_updates {
-                let Some((next_dev, next_arch)) = self.waiting_queue.pop_front() else {
-                    break;
-                };
-                let next_frames = self.start_transfer(next_dev, &next_arch);
-                if !next_frames.is_empty() {
-                    promoted.push((next_dev, next_frames));
-                }
-            }
+            promoted = self.promote_waiting(now_ms);
         }
 
         (frames, promoted)
     }
 
-    fn start_transfer(&mut self, device_id: DeviceId, arch_key: &str) -> Vec<Bytes> {
-        let Some(image) = self.images.get(arch_key) else {
-            return Vec::new();
-        };
-        let first_len = self.block_size.min(image.data.len());
-        let first_chunk = &image.data[..first_len];
+    /// Releases the slot and any queue entry held by `device_id` when its stream closes
+    /// (`obj.close` in `meshagent.js` lines 139–145: `taskLimiter.completed(obj.agentUpdate.taskid)`
+    /// followed by `delete obj.agentUpdate`), then promotes waiting agents into the freed slot.
+    /// Returns the frames to send to each promoted agent.
+    pub fn cancel_transfer(&mut self, device_id: DeviceId, now_ms: u64) -> PromotedTransfers {
+        let was_active = self.active_transfers.remove(&device_id).is_some();
+        self.waiting_queue
+            .retain(|(queued_id, _)| *queued_id != device_id);
+        if was_active {
+            self.promote_waiting(now_ms)
+        } else {
+            Vec::new()
+        }
+    }
 
-        self.active_transfers.insert(
-            device_id,
-            ActiveAgentTransfer {
-                arch_key: arch_key.to_owned(),
-                ptr: first_len,
-            },
-        );
+    /// Drops every active transfer that has not received a block ACK for at least
+    /// `stall_timeout_ms` (the `agentidletimeout` socket timeout in `meshagent.js` line 53,
+    /// [`DEFAULT_TRANSFER_STALL_TIMEOUT_MS`] by default) and promotes waiting agents into the
+    /// freed slots. Returns the stalled device IDs and the frames for each promoted agent. An
+    /// expired agent that is still connected will report its hash again and restart cleanly.
+    pub fn expire_stalled_transfers(
+        &mut self,
+        now_ms: u64,
+        stall_timeout_ms: u64,
+    ) -> (Vec<DeviceId>, PromotedTransfers) {
+        let mut stalled: Vec<DeviceId> = self
+            .active_transfers
+            .iter()
+            .filter(|(_, transfer)| {
+                now_ms.saturating_sub(transfer.last_progress_ms) >= stall_timeout_ms
+            })
+            .map(|(device_id, _)| *device_id)
+            .collect();
+        stalled.sort_unstable();
+        for device_id in &stalled {
+            self.active_transfers.remove(device_id);
+        }
+        let promoted = if stalled.is_empty() {
+            Vec::new()
+        } else {
+            self.promote_waiting(now_ms)
+        };
+        (stalled, promoted)
+    }
+
+    fn promote_waiting(&mut self, now_ms: u64) -> PromotedTransfers {
+        let mut promoted = Vec::new();
+        while self.active_transfers.len() < self.max_concurrent_updates {
+            let Some((next_dev, next_arch)) = self.waiting_queue.pop_front() else {
+                break;
+            };
+            let Some(image) = self.images.get(&next_arch).cloned() else {
+                continue;
+            };
+            let next_frames = self.start_transfer(next_dev, image, now_ms);
+            if !next_frames.is_empty() {
+                promoted.push((next_dev, next_frames));
+            }
+        }
+        promoted
+    }
+
+    fn start_transfer(
+        &mut self,
+        device_id: DeviceId,
+        image: Arc<AgentBinaryImage>,
+        now_ms: u64,
+    ) -> Vec<Bytes> {
+        let first_len = self.block_size.min(image.data.len());
 
         // `meshagent.js` lines 353–380:
         // 1. ShortToStr(10) + ShortToStr(0) -> clear core
@@ -669,11 +886,19 @@ impl AgentUpdateManager {
         let mut frames = vec![
             Bytes::from_static(&[0, 10, 0, 0]),
             Bytes::from_static(&[0, 13, 0, 0]),
-            encode_binary_block_frame(first_chunk),
+            encode_binary_block_frame(&image.data[..first_len]),
         ];
         if first_len == image.data.len() {
             frames.push(encode_end_download_frame(&image.sha256_hash));
-            self.active_transfers.remove(&device_id);
+        } else {
+            self.active_transfers.insert(
+                device_id,
+                ActiveAgentTransfer {
+                    image,
+                    ptr: first_len,
+                    last_progress_ms: now_ms,
+                },
+            );
         }
         frames
     }
@@ -876,6 +1101,7 @@ mod tests {
             tenant_id: "tenant-1".to_owned(),
             saved_script_id: "scr-audit".to_owned(),
             interval: RepeatInterval::Hourly,
+            start_at_unix_secs: 1_000,
             next_run_unix_secs: 1_000,
             last_run_unix_secs: None,
             run_on_next_connect: true,
@@ -890,6 +1116,200 @@ mod tests {
         assert_eq!(
             scheduler.drain_queued_scripts_for_device(dev_offline),
             vec!["scr-audit".to_owned()]
+        );
+    }
+
+    fn inventory(
+        device_id: DeviceId,
+        tenant_id: &str,
+        site_id: Option<&str>,
+        is_online: bool,
+    ) -> DeviceInventory {
+        DeviceInventory {
+            device_id,
+            tenant_id: tenant_id.to_owned(),
+            site_id: site_id.map(str::to_owned),
+            device_name: "host".to_owned(),
+            alias: None,
+            agent_version: "0.1.0".to_owned(),
+            platform: "Linux".to_owned(),
+            os_architecture: "x86_64".to_owned(),
+            os_description: "Debian 13".to_owned(),
+            is_64_bit: true,
+            processor_count: 4,
+            cpu_utilization_pct: 0,
+            used_memory_bytes: 0,
+            total_memory_bytes: 0,
+            drives: Vec::new(),
+            mac_addresses: Vec::new(),
+            current_user: None,
+            custom_fields: HashMap::new(),
+            windows_update: WindowsUpdateStatus::default(),
+            is_online,
+            last_online_unix_secs: 0,
+        }
+    }
+
+    fn schedule(tenant_id: &str, device_ids: Vec<DeviceId>, site_ids: Vec<&str>) -> ScriptSchedule {
+        ScriptSchedule {
+            schedule_id: format!("sched-{tenant_id}"),
+            name: "Nightly".to_owned(),
+            tenant_id: tenant_id.to_owned(),
+            saved_script_id: format!("scr-{tenant_id}"),
+            interval: RepeatInterval::Daily,
+            start_at_unix_secs: 1_000,
+            next_run_unix_secs: 1_000,
+            last_run_unix_secs: None,
+            run_on_next_connect: true,
+            device_ids,
+            site_ids: site_ids.into_iter().map(str::to_owned).collect(),
+        }
+    }
+
+    /// Regression test for #30 `rmm.rs:335`: explicit device targets must pass the same tenant
+    /// check as site targets, and unknown devices must never be queued.
+    #[test]
+    fn direct_device_targets_require_matching_tenant() {
+        let dev_a_online = DeviceIdentity::generate().id();
+        let dev_b_online = DeviceIdentity::generate().id();
+        let dev_b_offline = DeviceIdentity::generate().id();
+        let dev_unknown = DeviceIdentity::generate().id();
+
+        let inventories = HashMap::from([
+            (
+                dev_a_online,
+                inventory(dev_a_online, "tenant-a", None, true),
+            ),
+            (
+                dev_b_online,
+                inventory(dev_b_online, "tenant-b", None, true),
+            ),
+            (
+                dev_b_offline,
+                inventory(dev_b_offline, "tenant-b", None, false),
+            ),
+        ]);
+
+        // Tenant A's schedule names its own device plus two of tenant B's and one unknown one.
+        let mut scheduler = ScriptScheduler::new();
+        scheduler.add_schedule(schedule(
+            "tenant-a",
+            vec![
+                dev_b_online,
+                dev_a_online,
+                dev_b_offline,
+                dev_unknown,
+                dev_a_online,
+            ],
+            Vec::new(),
+        ));
+
+        let runs = scheduler.dispatch_due_runs(&inventories, 5_000);
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].dispatched_online_devices, vec![dev_a_online]);
+        assert_eq!(runs[0].queued_offline_devices, Vec::<DeviceId>::new());
+        assert_eq!(
+            scheduler.drain_queued_scripts_for_device(dev_b_offline),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            scheduler.drain_queued_scripts_for_device(dev_unknown),
+            Vec::<String>::new()
+        );
+    }
+
+    fn unix_secs(year: i64, month: u32, day: u32, hour: u64) -> u64 {
+        u64::try_from(days_from_civil(year, month, day)).unwrap() * SECS_PER_DAY + hour * 3_600
+    }
+
+    /// Regression test for #30 `rmm.rs:215`: `Monthly` follows `StartAt.AddMonths(i)`
+    /// (`ScriptScheduleDispatcher.cs` line 141), not a fixed 30-day step.
+    #[test]
+    fn monthly_schedule_advances_by_calendar_month_anchored_to_start_at() {
+        // Civil date helpers round-trip across leap years and era boundaries.
+        for days in [-719_468, -1, 0, 19_723, 20_148, 51_179] {
+            let (y, m, d) = civil_from_days(days);
+            assert_eq!(days_from_civil(y, m, d), days);
+        }
+        assert_eq!(civil_from_days(0), (1970, 1, 1));
+        assert_eq!(unix_secs(2024, 2, 29, 0), 1_709_164_800);
+
+        // January 1 09:00 -> February 1 09:00, not January 31 (30 days later).
+        let jan_1 = unix_secs(2025, 1, 1, 9);
+        let mut first_of_month = schedule("tenant-a", Vec::new(), Vec::new());
+        first_of_month.interval = RepeatInterval::Monthly;
+        first_of_month.start_at_unix_secs = jan_1;
+        first_of_month.next_run_unix_secs = jan_1;
+        assert!(first_of_month.advance_if_due(jan_1 + 60));
+        assert_eq!(first_of_month.next_run_unix_secs, unix_secs(2025, 2, 1, 9));
+        assert_eq!(first_of_month.last_run_unix_secs, Some(jan_1 + 60));
+
+        // January 31 -> February 28 (clamped) -> March 31 (anchored, no drift to the 28th).
+        let jan_31 = unix_secs(2025, 1, 31, 9);
+        let mut end_of_month = schedule("tenant-a", Vec::new(), Vec::new());
+        end_of_month.interval = RepeatInterval::Monthly;
+        end_of_month.start_at_unix_secs = jan_31;
+        end_of_month.next_run_unix_secs = jan_31;
+        assert!(end_of_month.advance_if_due(jan_31));
+        assert_eq!(end_of_month.next_run_unix_secs, unix_secs(2025, 2, 28, 9));
+        assert!(!end_of_month.advance_if_due(unix_secs(2025, 2, 28, 8)));
+        assert!(end_of_month.advance_if_due(unix_secs(2025, 3, 1, 0)));
+        assert_eq!(end_of_month.next_run_unix_secs, unix_secs(2025, 3, 31, 9));
+
+        // Catching up after a long outage lands on the first anchored date after `now`,
+        // crossing a leap day and a year boundary.
+        assert!(end_of_month.advance_if_due(unix_secs(2028, 2, 29, 12)));
+        assert_eq!(end_of_month.next_run_unix_secs, unix_secs(2028, 3, 31, 9));
+        assert_eq!(add_calendar_months(jan_31, 13), unix_secs(2026, 2, 28, 9));
+        assert_eq!(add_calendar_months(jan_31, 37), unix_secs(2028, 2, 29, 9));
+
+        assert_eq!(RepeatInterval::Monthly.fixed_step_secs(), None);
+        assert_eq!(RepeatInterval::Weekly.fixed_step_secs(), Some(604_800));
+    }
+
+    /// Regression test for #30 `rmm.rs:484`: the token is verified as MAC bytes with
+    /// `ring::hmac::verify`, not compared as a hex `String`.
+    #[test]
+    fn deployment_link_token_is_verified_as_mac_bytes_not_hex_string() {
+        let mut deploy_mgr = DeploymentLinkManager::new(&[0x5Au8; 32]);
+        let link =
+            deploy_mgr.create_link("lnk-1", "tenant-acme", "site-sp", "linux-x86_64", 2_000, 0);
+        let other =
+            deploy_mgr.create_link("lnk-2", "tenant-acme", "site-rj", "linux-x86_64", 2_000, 0);
+        assert_eq!(link.token_hex.len(), 64);
+
+        // The same tag in uppercase hex decodes to the same MAC bytes and must be accepted;
+        // a byte-for-byte string comparison would have rejected it.
+        let upper = link.token_hex.to_ascii_uppercase();
+        assert_ne!(upper, link.token_hex);
+        assert_eq!(
+            deploy_mgr.redeem_link("lnk-1", &upper, 1_500),
+            Ok(("tenant-acme".to_owned(), "site-sp".to_owned()))
+        );
+
+        let mismatch = Err(RmmError::InvalidDeploymentLink("Token signature mismatch"));
+        // A tag issued for another link (different site) does not verify for this one.
+        assert_eq!(
+            deploy_mgr.redeem_link("lnk-1", &other.token_hex, 1_500),
+            mismatch
+        );
+        // Single flipped nibble, truncated tag, non-hex tag, empty tag.
+        let mut tampered = link.token_hex.clone();
+        let last = tampered.pop().unwrap();
+        tampered.push(if last == '0' { '1' } else { '0' });
+        assert_eq!(deploy_mgr.redeem_link("lnk-1", &tampered, 1_500), mismatch);
+        assert_eq!(
+            deploy_mgr.redeem_link("lnk-1", &link.token_hex[..62], 1_500),
+            mismatch
+        );
+        assert_eq!(deploy_mgr.redeem_link("lnk-1", "zz", 1_500), mismatch);
+        assert_eq!(deploy_mgr.redeem_link("lnk-1", "", 1_500), mismatch);
+        // A key rotation invalidates every outstanding token for the same parameters.
+        let mut rotated = DeploymentLinkManager::new(&[0xA5u8; 32]);
+        rotated.create_link("lnk-1", "tenant-acme", "site-sp", "linux-x86_64", 2_000, 0);
+        assert_eq!(
+            rotated.redeem_link("lnk-1", &link.token_hex, 1_500),
+            mismatch
         );
     }
 
@@ -929,27 +1349,224 @@ mod tests {
         let dev2 = DeviceIdentity::generate().id();
         let old_hash = [0x11u8; 32];
 
-        let dev1_start = updater.handle_agent_hash(dev1, "linux-x86_64", &old_hash);
+        let (dev1_start, _) = updater.handle_agent_hash(dev1, "linux-x86_64", &old_hash, 0);
         assert_eq!(dev1_start.len(), 3); // cmd 10, cmd 13, first cmd 14 block ("OMEG")
         assert_eq!(updater.active_count(), 1);
 
         // dev2 requests update while dev1 occupies the single taskLimiter slot.
-        let dev2_start = updater.handle_agent_hash(dev2, "linux-x86_64", &old_hash);
+        let (dev2_start, _) = updater.handle_agent_hash(dev2, "linux-x86_64", &old_hash, 0);
         assert_eq!(dev2_start, Vec::<Bytes>::new());
         assert_eq!(updater.queued_count(), 1);
 
         // dev1 ACKs block 1 -> receives block 2 ("A_BI").
-        let (dev1_blk2, promoted1) = updater.handle_block_ack(dev1, &[0, 14, 0, 1]);
+        let (dev1_blk2, promoted1) = updater.handle_block_ack(dev1, &[0, 14, 0, 1], 10);
         assert_eq!(dev1_blk2.len(), 1);
         assert_eq!(promoted1.len(), 0);
 
         // dev1 ACKs block 2 -> receives block 3 ("N_V2") + cmd 13 end download with hash,
         // and dev2 is automatically promoted from the taskLimiter queue!
-        let (dev1_fin, promoted2) = updater.handle_block_ack(dev1, &[0, 14, 0, 1]);
+        let (dev1_fin, promoted2) = updater.handle_block_ack(dev1, &[0, 14, 0, 1], 20);
         assert_eq!(dev1_fin.len(), 2);
         assert_eq!(&dev1_fin[1][4..], &expected_hash);
         assert_eq!(promoted2.len(), 1);
         assert_eq!(promoted2[0].0, dev2);
+    }
+
+    /// Regression test for #30 `rmm.rs:588`: a disconnected agent releases its slot, waiting
+    /// agents are promoted, and a reconnecting agent's hash report restarts its download.
+    #[test]
+    fn disconnected_agent_frees_slot_and_reconnect_restarts_download() {
+        let mut updater = AgentUpdateManager::new(1, 4);
+        let image =
+            AgentBinaryImage::new("linux-x86_64", "0.2.0", Bytes::from_static(b"OMEGA_BIN_V2"));
+        let expected_hash = image.sha256_hash;
+        updater.register_image(image);
+
+        let dev1 = DeviceIdentity::generate().id();
+        let dev2 = DeviceIdentity::generate().id();
+        let dev3 = DeviceIdentity::generate().id();
+        let old_hash = [0x11u8; 32];
+
+        updater.handle_agent_hash(dev1, "linux-x86_64", &old_hash, 0);
+        updater.handle_agent_hash(dev2, "linux-x86_64", &old_hash, 0);
+        updater.handle_agent_hash(dev3, "linux-x86_64", &old_hash, 0);
+        assert_eq!((updater.active_count(), updater.queued_count()), (1, 2));
+
+        // dev1 reconnects mid-download and reports its (still old) hash: the download restarts
+        // from byte zero in the slot it already holds, instead of being ignored.
+        let (restart, promoted) = updater.handle_agent_hash(dev1, "linux-x86_64", &old_hash, 100);
+        assert_eq!(restart.len(), 3);
+        assert_eq!(&restart[2][4..], b"OMEG");
+        assert_eq!(promoted, PromotedTransfers::new());
+        assert_eq!((updater.active_count(), updater.queued_count()), (1, 2));
+
+        // dev1's stream closes for good: its slot is freed and dev2 is promoted.
+        let promoted = updater.cancel_transfer(dev1, 200);
+        assert_eq!(promoted.len(), 1);
+        assert_eq!(promoted[0].0, dev2);
+        assert_eq!(&promoted[0].1[2][4..], b"OMEG");
+        assert_eq!((updater.active_count(), updater.queued_count()), (1, 1));
+
+        // Cancelling an agent that only sat in the queue removes it without promoting anyone.
+        assert_eq!(updater.cancel_transfer(dev3, 300), PromotedTransfers::new());
+        assert_eq!((updater.active_count(), updater.queued_count()), (1, 0));
+        assert_eq!(updater.cancel_transfer(dev3, 300), PromotedTransfers::new());
+
+        // dev1 comes back: the slot is taken by dev2, so it queues; dev2 completing promotes it.
+        let (queued, _) = updater.handle_agent_hash(dev1, "linux-x86_64", &old_hash, 400);
+        assert_eq!(queued, Vec::<Bytes>::new());
+        assert_eq!(updater.queued_count(), 1);
+        updater.handle_block_ack(dev2, &[0, 14, 0, 1], 410);
+        let (dev2_fin, promoted) = updater.handle_block_ack(dev2, &[0, 14, 0, 1], 420);
+        assert_eq!(&dev2_fin[1][4..], &expected_hash);
+        assert_eq!(promoted.len(), 1);
+        assert_eq!(promoted[0].0, dev1);
+
+        // An agent that reports the current hash while holding a slot is done: release it.
+        updater.handle_agent_hash(dev2, "linux-x86_64", &old_hash, 500);
+        assert_eq!(updater.queued_count(), 1);
+        let (none, promoted) = updater.handle_agent_hash(dev1, "linux-x86_64", &expected_hash, 600);
+        assert_eq!(none, Vec::<Bytes>::new());
+        assert_eq!(promoted.len(), 1);
+        assert_eq!(promoted[0].0, dev2);
+        assert_eq!((updater.active_count(), updater.queued_count()), (1, 0));
+    }
+
+    /// Regression test for #30 `rmm.rs:588`: a transfer with no ACK for the stall timeout is
+    /// expired so it cannot pin a `taskLimiter` slot forever.
+    #[test]
+    fn stalled_transfer_expires_and_promotes_waiting_agent() {
+        let mut updater = AgentUpdateManager::new(1, 4);
+        updater.register_image(AgentBinaryImage::new(
+            "linux-x86_64",
+            "0.2.0",
+            Bytes::from_static(b"OMEGA_BIN_V2"),
+        ));
+        let dev1 = DeviceIdentity::generate().id();
+        let dev2 = DeviceIdentity::generate().id();
+        let old_hash = [0x11u8; 32];
+
+        updater.handle_agent_hash(dev1, "linux-x86_64", &old_hash, 1_000);
+        updater.handle_agent_hash(dev2, "linux-x86_64", &old_hash, 1_000);
+        // An ACK refreshes the progress timestamp.
+        updater.handle_block_ack(dev1, &[0, 14, 0, 1], 50_000);
+
+        let (stalled, promoted) = updater.expire_stalled_transfers(
+            50_000 + DEFAULT_TRANSFER_STALL_TIMEOUT_MS - 1,
+            DEFAULT_TRANSFER_STALL_TIMEOUT_MS,
+        );
+        assert_eq!(stalled, Vec::<DeviceId>::new());
+        assert_eq!(promoted, PromotedTransfers::new());
+        assert_eq!((updater.active_count(), updater.queued_count()), (1, 1));
+
+        let (stalled, promoted) = updater.expire_stalled_transfers(
+            50_000 + DEFAULT_TRANSFER_STALL_TIMEOUT_MS,
+            DEFAULT_TRANSFER_STALL_TIMEOUT_MS,
+        );
+        assert_eq!(stalled, vec![dev1]);
+        assert_eq!(promoted.len(), 1);
+        assert_eq!(promoted[0].0, dev2);
+        assert_eq!((updater.active_count(), updater.queued_count()), (1, 0));
+
+        // A late ACK from the expired agent is ignored; its next hash report starts over.
+        let (frames, _) = updater.handle_block_ack(dev1, &[0, 14, 0, 1], 300_000);
+        assert_eq!(frames, Vec::<Bytes>::new());
+    }
+
+    /// Regression test for the Copilot finding on PR #37 (`rmm.rs:760`): when a reconnecting
+    /// agent restarts onto an image that fits in a single block, the transfer completes at once
+    /// and the slot it held must be handed to the waiting queue immediately.
+    #[test]
+    fn single_block_reconnect_restart_promotes_waiting_agents() {
+        let mut updater = AgentUpdateManager::new(1, 4);
+        updater.register_image(AgentBinaryImage::new(
+            "linux-x86_64",
+            "0.2.0",
+            Bytes::from_static(b"OMEGA_BIN_V2"),
+        ));
+        let dev1 = DeviceIdentity::generate().id();
+        let dev2 = DeviceIdentity::generate().id();
+        let old_hash = [0x11u8; 32];
+
+        updater.handle_agent_hash(dev1, "linux-x86_64", &old_hash, 0);
+        updater.handle_agent_hash(dev2, "linux-x86_64", &old_hash, 0);
+        assert_eq!((updater.active_count(), updater.queued_count()), (1, 1));
+
+        // The image is replaced with one that fits in a single 4-byte block.
+        let tiny = AgentBinaryImage::new("linux-x86_64", "0.3.0", Bytes::from_static(b"V3!"));
+        let tiny_hash = tiny.sha256_hash;
+        updater.register_image(tiny);
+
+        // dev1 reconnects: its restart completes immediately (cmd 10, 13, one block, cmd 13 end)
+        // and dev2 is promoted in the same call, also completing immediately.
+        let (restart, promoted) = updater.handle_agent_hash(dev1, "linux-x86_64", &old_hash, 100);
+        assert_eq!(restart.len(), 4);
+        assert_eq!(&restart[2][4..], b"V3!");
+        assert_eq!(&restart[3][4..], &tiny_hash);
+        assert_eq!(promoted.len(), 1);
+        assert_eq!(promoted[0].0, dev2);
+        assert_eq!(promoted[0].1.len(), 4);
+        assert_eq!(&promoted[0].1[3][4..], &tiny_hash);
+        assert_eq!((updater.active_count(), updater.queued_count()), (0, 0));
+
+        // The non-reconnect path behaves the same: a fresh single-block start never strands
+        // a queue that was filled while the slot was busy.
+        let mut updater = AgentUpdateManager::new(1, 4);
+        updater.register_image(AgentBinaryImage::new(
+            "linux-x86_64",
+            "0.2.0",
+            Bytes::from_static(b"OMEGA_BIN_V2"),
+        ));
+        updater.handle_agent_hash(dev1, "linux-x86_64", &old_hash, 0);
+        updater.handle_agent_hash(dev2, "linux-x86_64", &old_hash, 0);
+        updater.register_image(AgentBinaryImage::new(
+            "linux-x86_64",
+            "0.3.0",
+            Bytes::from_static(b"V3!"),
+        ));
+        let promoted = updater.cancel_transfer(dev1, 50);
+        assert_eq!(promoted.len(), 1);
+        assert_eq!(promoted[0].0, dev2);
+        assert_eq!((updater.active_count(), updater.queued_count()), (0, 0));
+    }
+
+    /// Regression test for #30 `rmm.rs:617`: an active transfer streams the image snapshot it
+    /// started with even if that architecture's image is replaced mid-transfer.
+    #[test]
+    fn replacing_image_mid_transfer_keeps_pinned_snapshot_for_chunks_and_hash() {
+        let mut updater = AgentUpdateManager::new(2, 4);
+        let v2 =
+            AgentBinaryImage::new("linux-x86_64", "0.2.0", Bytes::from_static(b"OMEGA_BIN_V2"));
+        let v2_hash = v2.sha256_hash;
+        updater.register_image(v2);
+
+        let dev1 = DeviceIdentity::generate().id();
+        let dev2 = DeviceIdentity::generate().id();
+        let old_hash = [0x11u8; 32];
+        let (start, _) = updater.handle_agent_hash(dev1, "linux-x86_64", &old_hash, 0);
+        assert_eq!(&start[2][4..], b"OMEG");
+
+        // The image is replaced after dev1 received its first block.
+        let v3 =
+            AgentBinaryImage::new("linux-x86_64", "0.3.0", Bytes::from_static(b"NEWBINARY_V3"));
+        let v3_hash = v3.sha256_hash;
+        assert_ne!(v2_hash, v3_hash);
+        updater.register_image(v3);
+
+        // dev1 keeps receiving V2 bytes and the V2 hash.
+        let (blk2, _) = updater.handle_block_ack(dev1, &[0, 14, 0, 1], 10);
+        assert_eq!(&blk2[0][4..], b"A_BI");
+        let (fin, _) = updater.handle_block_ack(dev1, &[0, 14, 0, 1], 20);
+        assert_eq!(&fin[0][4..], b"N_V2");
+        assert_eq!(&fin[1][4..], &v2_hash);
+
+        // A transfer started after the replacement streams V3, and an agent already on V2 is
+        // offered V3 because its hash no longer matches the current image.
+        let (start_v3, _) = updater.handle_agent_hash(dev2, "linux-x86_64", &v2_hash, 30);
+        assert_eq!(&start_v3[2][4..], b"NEWB");
+        let (_, _) = updater.handle_block_ack(dev2, &[0, 14, 0, 1], 40);
+        let (fin_v3, _) = updater.handle_block_ack(dev2, &[0, 14, 0, 1], 50);
+        assert_eq!(&fin_v3[1][4..], &v3_hash);
     }
 
     #[test]

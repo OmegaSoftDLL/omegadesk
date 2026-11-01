@@ -246,21 +246,26 @@ impl McpTrustEngine {
             .get(&device_id)
             .unwrap_or(&self.default_policy);
 
-        if policy.auto_approve_tools.iter().any(|t| t == tool_name) {
-            return RiskAssessment {
-                tool_name: tool_name.to_owned(),
-                risk_level: RiskLevel::Safe,
-                reasons: vec!["auto-approved tool".to_owned()],
-                recommendation: TrustRecommendation::Proceed,
-            };
-        }
-
+        // The denylist is consulted before the allowlist, deliberately inverting the order of
+        // `QuickDesk/quickdesk-mcp/src/trust.rs` lines 275–292: `auto_approve_tools` ships with
+        // defaults such as `read_file` and `screenshot`, so an operator adding one of them to a
+        // device's `blocked_tools` must get `Block`, not an auto-approved `Proceed`. An explicit
+        // block always wins over an (often implicit) approval.
         if policy.blocked_tools.iter().any(|t| t == tool_name) {
             return RiskAssessment {
                 tool_name: tool_name.to_owned(),
                 risk_level: RiskLevel::Critical,
                 reasons: vec!["tool is blocked by policy".to_owned()],
                 recommendation: TrustRecommendation::Block,
+            };
+        }
+
+        if policy.auto_approve_tools.iter().any(|t| t == tool_name) {
+            return RiskAssessment {
+                tool_name: tool_name.to_owned(),
+                risk_level: RiskLevel::Safe,
+                reasons: vec!["auto-approved tool".to_owned()],
+                recommendation: TrustRecommendation::Proceed,
             };
         }
 
@@ -425,5 +430,49 @@ mod tests {
             engine.authorize_tool_call(dev, "screenshot", &HashMap::new(), true, 300),
             Err(McpError::EmergencyStopActive(_))
         ));
+    }
+
+    /// Regression test for #31 `mcp/src/lib.rs:249`: a tool listed in both `auto_approve_tools`
+    /// and `blocked_tools` is blocked; explicit blocking beats auto-approval.
+    #[test]
+    fn blocked_tools_take_precedence_over_auto_approved_defaults() {
+        let mut engine = McpTrustEngine::new();
+        let locked_down = DeviceIdentity::generate().id();
+        let other = DeviceIdentity::generate().id();
+
+        let mut policy = TrustPolicy::default();
+        assert!(policy.auto_approve_tools.iter().any(|t| t == "read_file"));
+        policy.blocked_tools = vec!["read_file".to_owned(), "screenshot".to_owned()];
+        engine.set_device_policy(locked_down, policy);
+
+        for tool in ["read_file", "screenshot"] {
+            let assessment = engine.assess_risk(locked_down, tool, &HashMap::new());
+            assert_eq!(assessment.risk_level, RiskLevel::Critical);
+            assert_eq!(assessment.recommendation, TrustRecommendation::Block);
+            assert_eq!(
+                assessment.reasons,
+                vec!["tool is blocked by policy".to_owned()]
+            );
+            // Operator confirmation cannot override an explicit block.
+            assert_eq!(
+                engine.authorize_tool_call(locked_down, tool, &HashMap::new(), true, 100),
+                Err(McpError::ToolBlocked(tool.to_owned()))
+            );
+        }
+        assert!(
+            engine
+                .audit_log()
+                .iter()
+                .all(|e| e.recommendation == TrustRecommendation::Block)
+        );
+
+        // The default policy on another device still auto-approves the same tools.
+        let assessment = engine.assess_risk(other, "read_file", &HashMap::new());
+        assert_eq!(assessment.recommendation, TrustRecommendation::Proceed);
+        assert!(
+            engine
+                .authorize_tool_call(other, "read_file", &HashMap::new(), false, 200)
+                .is_ok()
+        );
     }
 }
