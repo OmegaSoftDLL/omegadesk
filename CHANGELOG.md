@@ -25,6 +25,10 @@ All notable changes to OmegaDesk are documented here. The format follows [Keep a
 
 ### Changed
 
+- `omegadesk-mesh`: tunnel keys are now direction-specific and bound to a per-process epoch (header carries the sender epoch), with STUN reflexive discovery, probe expiry, direct-path trust/heartbeats and automatic fallback when a validated path dies; `MeshNode::new` takes the STUN servers, `encapsulate` no longer takes a clock, `ipv4_udp` returns an error for oversized payloads, `LinkStateRouter` requires verified relay certificates, and `finalize` was removed from the Noise initiator (use `complete`).
+- `omegadesk-relay`: tickets name the relay they are valid on and carry a 120-byte wire format; the login frame is sealed with the client's key; `RelayRouter::new` takes the relay identity and `register_client` returns a `RegisteredClient` with a connection generation. The relay binary requires `--ticket-secret-hex`, persists its identity, serves STUN on UDP, and validates frame lengths before allocating.
+- `omegadesk-server`: netmap snapshots and deltas are scoped to the node's tenant; the binary keeps the control stream open and speaks the new `omegadesk.control.v1` protocol (`EnrollRequest`/`EnrollResponse`, `NetmapBatch`, `EndpointUpdate`, `RelayTicketRequest`, `Keepalive`), persists its identity and requires `--ticket-secret-hex`; relays are configured with `--relay host:port=<key>`.
+
 - The build plan (`docs/plan.md`) and the README no longer mark Phases 2–7 as done. The 2026-11-01 audit found that the crates added for those phases are not used by any binary, that 78 Copilot Code Review findings on PRs #17–#24 were merged without a fix, and that several claims (IronRDP, IddCx driver, MCP server, Linux/macOS capture, SSO/WebAuthn) describe data types rather than working features. Each item now carries an honest status and its known defects.
 - `release-plz.toml` covers every workspace crate, so the lockstep version applies to the crates added for Phases 2–7.
 

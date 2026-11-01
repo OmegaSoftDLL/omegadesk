@@ -1,39 +1,68 @@
 //! Stateless DERP-style packet relay binary (`omegadesk-relay`).
+//!
+//! Serves two things, like a Tailscale DERP node (`cmd/derper`):
+//! - the relay itself over TCP (`--listen`), where clients log in with a ticket
+//!   issued by the coordinator and sealed with their private key;
+//! - a STUN binding responder over UDP (`--stun-listen`) so mesh nodes behind
+//!   NAT can learn their public endpoint for hole punching.
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use omegadesk_identity::DeviceIdentity;
-use omegadesk_relay::{FRAME_HEADER_LEN, RelayFrame, RelayRouter};
+use omegadesk_identity::{DeviceIdentity, FileStore, KeyStore, default_store};
+use omegadesk_mesh::stun;
+use omegadesk_relay::{
+    CLIENT_INFO_WIRE_LEN, FRAME_HEADER_LEN, KEEP_ALIVE, RegisteredClient, RelayFrame, RelayRouter,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use tokio::sync::mpsc;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
+
+/// Time a connection has to complete its login before it is dropped.
+const LOGIN_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// A client that sends nothing (not even a `Ping`) for this long is dropped.
+const IDLE_TIMEOUT: Duration = Duration::from_secs(150);
 
 #[derive(Debug, Parser)]
 #[command(
     name = "omegadesk-relay",
     version,
-    about = "Stateless OmegaDesk packet relay"
+    about = "Stateless OmegaDesk packet relay and STUN responder"
 )]
 struct Args {
-    /// Address to listen on (defaults to 0.0.0.0:8443 for unprivileged startup;
-    /// use 0.0.0.0:443 in production).
+    /// TCP address to listen on for relay clients (use 0.0.0.0:443 in production).
     #[arg(long, env = "OMEGADESK_RELAY_LISTEN", default_value = "0.0.0.0:8443")]
     listen: SocketAddr,
 
+    /// UDP address for the STUN binding responder (RFC 5389). Defaults to the
+    /// relay port on UDP; pass `--no-stun` to disable it.
+    #[arg(long, env = "OMEGADESK_RELAY_STUN_LISTEN")]
+    stun_listen: Option<SocketAddr>,
+
+    /// Disables the STUN responder.
+    #[arg(long)]
+    no_stun: bool,
+
     /// Hex-encoded 32-byte shared HMAC secret used to verify coordinator tickets.
-    #[arg(
-        long,
-        env = "OMEGADESK_RELAY_TICKET_SECRET",
-        default_value = "4f6d6567614465736b52656c61795469636b6574536563726574563130303030"
-    )]
+    /// Required: there is no default, so a relay can never accept tickets forged
+    /// with a publicly known key.
+    #[arg(long, env = "OMEGADESK_RELAY_TICKET_SECRET")]
     ticket_secret_hex: String,
 
-    /// Check configuration and exit immediately (used for smoke tests).
+    /// File holding the relay's persistent identity. Defaults to the operating
+    /// system credential store (account `relay`).
+    #[arg(long, env = "OMEGADESK_RELAY_KEY_FILE")]
+    key_file: Option<PathBuf>,
+
+    /// Check configuration, print the relay public key, and exit.
     #[arg(long)]
     check_only: bool,
 }
@@ -57,80 +86,169 @@ fn unix_now() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
-async fn read_wire_frame(stream: &mut TcpStream) -> Result<RelayFrame> {
-    let mut header = [0u8; FRAME_HEADER_LEN];
-    stream.read_exact(&mut header).await?;
-    let body_len = usize::try_from(u32::from_be_bytes([
-        header[1], header[2], header[3], header[4],
-    ]))?;
-    let mut buf = vec![0u8; FRAME_HEADER_LEN + body_len];
-    buf[..FRAME_HEADER_LEN].copy_from_slice(&header);
-    stream.read_exact(&mut buf[FRAME_HEADER_LEN..]).await?;
-    Ok(RelayFrame::decode(&buf)?)
+fn hex(bytes: &[u8]) -> String {
+    data_encoding::HEXLOWER.encode(bytes)
 }
 
-async fn handle_client(mut stream: TcpStream, router: Arc<Mutex<RelayRouter>>) -> Result<()> {
+/// Reads one frame, validating the declared length against the protocol limit
+/// before allocating the body (an unauthenticated peer cannot make the relay
+/// allocate gigabytes by announcing a huge frame).
+async fn read_frame(reader: &mut OwnedReadHalf, max_body: usize) -> Result<RelayFrame> {
+    let mut header = [0u8; FRAME_HEADER_LEN];
+    reader.read_exact(&mut header).await?;
+    let (frame_type, body_len) = RelayFrame::parse_header(&header)?;
+    if body_len > max_body {
+        anyhow::bail!("frame body of {body_len} bytes exceeds the {max_body}-byte limit");
+    }
+    let mut body = vec![0u8; body_len];
+    reader.read_exact(&mut body).await?;
+    Ok(RelayFrame::decode_body(frame_type, &body)?)
+}
+
+async fn write_frame(writer: &mut OwnedWriteHalf, frame: &RelayFrame) -> Result<()> {
+    writer.write_all(&frame.encode()?).await?;
+    Ok(())
+}
+
+async fn login(
+    reader: &mut OwnedReadHalf,
+    writer: &mut OwnedWriteHalf,
+    router: &Arc<Mutex<RelayRouter>>,
+) -> Result<RegisteredClient> {
     let greeting = {
         let guard = router
             .lock()
             .map_err(|_| anyhow::anyhow!("relay router mutex poisoned"))?;
-        guard.server_key_frame().encode()?
+        guard.server_key_frame()
     };
-    stream.write_all(&greeting).await?;
+    write_frame(writer, &greeting).await?;
 
-    let login = read_wire_frame(&mut stream).await?;
+    let frame = read_frame(reader, CLIENT_INFO_WIRE_LEN).await?;
     let RelayFrame::ClientInfo {
         client_public_key,
-        ticket,
-    } = login
+        sealed,
+    } = frame
     else {
         anyhow::bail!("expected FrameClientInfo as first client frame");
     };
-
-    let (server_info_bytes, mut rx) = {
+    let registered = {
         let mut guard = router
             .lock()
             .map_err(|_| anyhow::anyhow!("relay router mutex poisoned"))?;
-        let (info_frame, rx) = guard.register_client(client_public_key, &ticket, unix_now())?;
-        (info_frame.encode()?, rx)
+        guard.register_client(client_public_key, &sealed, unix_now())?
     };
-    stream.write_all(&server_info_bytes).await?;
+    write_frame(writer, &registered.server_info).await?;
+    Ok(registered)
+}
 
+/// Drains frames queued for this client (relayed packets, `PeerGone`, `Pong`)
+/// and emits keep-alives, owning the write half exclusively.
+async fn writer_loop(mut writer: OwnedWriteHalf, mut outbound: mpsc::Receiver<RelayFrame>) {
+    let mut keepalive = tokio::time::interval(KEEP_ALIVE);
+    keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    keepalive.tick().await;
     loop {
-        tokio::select! {
-            outbound = rx.recv() => {
-                let Some(frame) = outbound else { break };
-                stream.write_all(&frame.encode()?).await?;
-            }
-            inbound = read_wire_frame(&mut stream) => {
-                let Ok(frame) = inbound else { break };
-                match frame {
-                    RelayFrame::SendPacket { dst_key, packet } => {
-                        if let Ok(mut guard) = router.lock() {
-                            let _ = guard.forward_packet(client_public_key, dst_key, packet);
-                        }
-                    }
-                    RelayFrame::Ping(data) => {
-                        let pong = RelayFrame::Pong(data).encode()?;
-                        stream.write_all(&pong).await?;
-                    }
-                    RelayFrame::ServerKey { .. }
-                    | RelayFrame::ClientInfo { .. }
-                    | RelayFrame::ServerInfo { .. }
-                    | RelayFrame::RecvPacket { .. }
-                    | RelayFrame::KeepAlive
-                    | RelayFrame::NotePreferred { .. }
-                    | RelayFrame::PeerGone { .. }
-                    | RelayFrame::Pong(_) => {}
-                }
-            }
+        let frame = tokio::select! {
+            outbound = outbound.recv() => match outbound {
+                Some(frame) => frame,
+                None => break,
+            },
+            _ = keepalive.tick() => RelayFrame::KeepAlive,
+        };
+        if write_frame(&mut writer, &frame).await.is_err() {
+            break;
         }
     }
+    let _ = writer.shutdown().await;
+}
 
-    if let Ok(mut guard) = router.lock() {
-        guard.unregister_client(&client_public_key);
+/// Reads client frames, owning the read half exclusively, so a cancelled
+/// write can never corrupt an in-progress read.
+async fn reader_loop(
+    mut reader: OwnedReadHalf,
+    client_key: [u8; 32],
+    router: Arc<Mutex<RelayRouter>>,
+    outbound_tx: mpsc::Sender<RelayFrame>,
+) -> Result<()> {
+    loop {
+        let frame = tokio::time::timeout(
+            IDLE_TIMEOUT,
+            read_frame(&mut reader, omegadesk_relay::MAX_FRAME_BODY_LEN),
+        )
+        .await
+        .context("client idle timeout")??;
+        match frame {
+            RelayFrame::SendPacket { dst_key, packet } => {
+                let mut guard = router
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("relay router mutex poisoned"))?;
+                guard.forward_packet(client_key, dst_key, packet)?;
+            }
+            RelayFrame::Ping(data) => {
+                if outbound_tx.try_send(RelayFrame::Pong(data)).is_err() {
+                    warn!("client outbound queue full; dropping pong");
+                }
+            }
+            RelayFrame::KeepAlive
+            | RelayFrame::NotePreferred { .. }
+            | RelayFrame::Pong(_)
+            | RelayFrame::ServerKey { .. }
+            | RelayFrame::ClientInfo { .. }
+            | RelayFrame::ServerInfo { .. }
+            | RelayFrame::RecvPacket { .. }
+            | RelayFrame::PeerGone { .. } => {}
+        }
     }
-    Ok(())
+}
+
+async fn handle_client(stream: TcpStream, router: Arc<Mutex<RelayRouter>>) -> Result<()> {
+    stream.set_nodelay(true)?;
+    let (mut reader, mut writer) = stream.into_split();
+    let registered = tokio::time::timeout(LOGIN_TIMEOUT, login(&mut reader, &mut writer, &router))
+        .await
+        .context("login timeout")??;
+    let RegisteredClient {
+        key,
+        generation,
+        outbound,
+        outbound_tx,
+        ..
+    } = registered;
+    info!(client = %hex(&key[..8]), generation, "relay client registered");
+
+    let writer_task = tokio::spawn(writer_loop(writer, outbound));
+    let result = reader_loop(reader, key, Arc::clone(&router), outbound_tx).await;
+    writer_task.abort();
+
+    // Always unregister, whatever ended the session; a stale generation is a no-op.
+    if let Ok(mut guard) = router.lock() {
+        guard.unregister_client(&key, generation);
+    }
+    result
+}
+
+/// RFC 5389 binding responder: answers every well-formed binding request with
+/// the sender's reflexive address (`stun.Response` in Tailscale's `derper`).
+async fn stun_loop(socket: UdpSocket) {
+    let mut buf = vec![0u8; 1500];
+    loop {
+        let Ok((len, from)) = socket.recv_from(&mut buf).await else {
+            continue;
+        };
+        if let Ok(tx_id) = stun::parse_binding_request(&buf[..len]) {
+            let _ = socket
+                .send_to(&stun::binding_response(&tx_id, from), from)
+                .await;
+        }
+    }
+}
+
+fn load_identity(key_file: Option<&PathBuf>) -> Result<DeviceIdentity> {
+    let store: Box<dyn KeyStore> = match key_file {
+        Some(path) => Box::new(FileStore::new(path.clone())),
+        None => default_store("relay").context("failed to open the relay key store")?,
+    };
+    DeviceIdentity::load_or_create(store.as_ref()).context("failed to load the relay identity")
 }
 
 #[tokio::main]
@@ -144,27 +262,41 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     let secret = decode_hex_32(&args.ticket_secret_hex)
         .context("ticket_secret_hex must be exactly 64 hex characters (32 bytes)")?;
-
-    let relay_identity = DeviceIdentity::generate();
-    let router = Arc::new(Mutex::new(RelayRouter::new(
-        relay_identity.public().exchange_key_bytes(),
-        secret,
-    )));
+    let identity = load_identity(args.key_file.as_ref())?;
+    let public = identity.public();
+    info!(
+        id = %identity.id(),
+        relay_public_key = %hex(&public.exchange_key_bytes()),
+        "relay identity loaded; pass this key to the coordinator with --relay"
+    );
+    let router = Arc::new(Mutex::new(RelayRouter::new(identity, secret)));
 
     if args.check_only {
-        info!(id = %relay_identity.id(), "relay configuration verified");
+        info!("relay configuration verified");
         return Ok(());
     }
 
-    let listener = TcpListener::bind(args.listen).await?;
-    info!(listen = %args.listen, id = %relay_identity.id(), "omegadesk-relay listening");
+    if !args.no_stun {
+        let stun_addr = args
+            .stun_listen
+            .unwrap_or(SocketAddr::new(args.listen.ip(), args.listen.port()));
+        match UdpSocket::bind(stun_addr).await {
+            Ok(socket) => {
+                info!(listen = %stun_addr, "STUN responder listening");
+                tokio::spawn(stun_loop(socket));
+            }
+            Err(error) => warn!(listen = %stun_addr, %error, "STUN responder disabled"),
+        }
+    }
 
+    let listener = TcpListener::bind(args.listen).await?;
+    info!(listen = %args.listen, "omegadesk-relay listening");
     loop {
         let (stream, peer_addr) = listener.accept().await?;
         let router_clone = Arc::clone(&router);
         tokio::spawn(async move {
             if let Err(err) = handle_client(stream, router_clone).await {
-                warn!(%peer_addr, error = %err, "relay client session ended");
+                info!(%peer_addr, error = %err, "relay client session ended");
             }
         });
     }

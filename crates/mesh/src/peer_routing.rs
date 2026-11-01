@@ -131,11 +131,12 @@ impl LazyConnManager {
         let threshold = self.inactivity_threshold;
         let is_recently_active =
             |peer_id: DeviceId, map: &HashMap<DeviceId, LazyPeerState>| match map.get(&peer_id) {
-                Some(LazyPeerState::ExcludedPermanent) => true,
+                // An excluded peer keeps only its own tunnel permanent; it does not
+                // count as activity that keeps its HA partners awake.
                 Some(LazyPeerState::Active { last_activity }) => {
                     now.saturating_duration_since(*last_activity) < threshold
                 }
-                Some(LazyPeerState::Sleeping) | None => false,
+                Some(LazyPeerState::ExcludedPermanent | LazyPeerState::Sleeping) | None => false,
             };
 
         let mut to_sleep = Vec::new();
@@ -235,14 +236,21 @@ impl PeerRelayCertificate {
         can_relay: bool,
         expires_at_unix_secs: u64,
     ) -> Vec<u8> {
+        // Length-prefixed fields so `["a\0b"]` and `["a", "b"]` never share a
+        // transcript (the signature binds the exact group membership).
         let mut out = Vec::with_capacity(96);
-        out.extend_from_slice(b"omegadesk-nebula-cert-v1:");
+        out.extend_from_slice(b"omegadesk-nebula-cert-v2:");
         out.extend_from_slice(subject.as_bytes());
         out.push(u8::from(can_relay));
         out.extend_from_slice(&expires_at_unix_secs.to_le_bytes());
+        out.extend_from_slice(
+            &u32::try_from(groups.len())
+                .unwrap_or(u32::MAX)
+                .to_le_bytes(),
+        );
         for g in groups {
+            out.extend_from_slice(&u32::try_from(g.len()).unwrap_or(u32::MAX).to_le_bytes());
             out.extend_from_slice(g.as_bytes());
-            out.push(0);
         }
         out
     }
@@ -284,16 +292,57 @@ pub struct RoutePath {
 
 /// Coordinator-free OSPF link-state routing table computing minimum-RTT paths via Dijkstra's
 /// algorithm (`docs/plan.md` §2.2 line 45 & §4 Phase 7 line 307).
-#[derive(Debug, Default, Clone)]
+///
+/// Relay eligibility is **never** taken from the advertised `can_relay` flag: a
+/// node becomes a transit hop only after a [`PeerRelayCertificate`] signed by
+/// the configured authority was verified with [`Self::register_relay_certificate`],
+/// and only until that certificate expires (Nebula model).
+#[derive(Debug, Clone)]
 pub struct LinkStateRouter {
+    authority: DevicePublic,
     lsdb: HashMap<DeviceId, LinkStateAdvertisement>,
+    /// Verified relay certificates: subject -> expiry (UNIX seconds).
+    relay_until: HashMap<DeviceId, u64>,
 }
 
 impl LinkStateRouter {
-    /// Creates an empty link-state router.
+    /// Creates an empty link-state router trusting relay certificates signed by `authority`.
     #[must_use]
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(authority: DevicePublic) -> Self {
+        Self {
+            authority,
+            lsdb: HashMap::new(),
+            relay_until: HashMap::new(),
+        }
+    }
+
+    /// Verifies `cert` against the authority and records the subject as an
+    /// authorized relay until the certificate expires.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IdentityError::InvalidSignature`] if the certificate is not
+    /// signed by the authority, has expired, or does not grant `can_relay`.
+    pub fn register_relay_certificate(
+        &mut self,
+        cert: &PeerRelayCertificate,
+        now_unix_secs: u64,
+    ) -> Result<(), IdentityError> {
+        cert.verify(&self.authority, now_unix_secs)?;
+        if !cert.can_relay {
+            return Err(IdentityError::InvalidSignature);
+        }
+        self.relay_until
+            .insert(cert.subject, cert.expires_at_unix_secs);
+        Ok(())
+    }
+
+    /// Returns `true` if `node` holds a verified, unexpired relay certificate.
+    #[must_use]
+    pub fn is_authorized_relay(&self, node: DeviceId, now_unix_secs: u64) -> bool {
+        self.relay_until
+            .get(&node)
+            .is_some_and(|&expires| now_unix_secs < expires)
     }
 
     /// Ingests a [`LinkStateAdvertisement`], returning `true` if it is newer than any previously
@@ -309,10 +358,15 @@ impl LinkStateRouter {
     }
 
     /// Computes the minimum-latency [`RoutePath`] from `source` to `destination` using
-    /// Dijkstra's algorithm, allowing intermediate transit hops only through nodes with
-    /// `can_relay == true`.
+    /// Dijkstra's algorithm, allowing intermediate transit hops only through nodes whose
+    /// relay certificate was verified and is valid at `now_unix_secs`.
     #[must_use]
-    pub fn compute_route(&self, source: DeviceId, destination: DeviceId) -> Option<RoutePath> {
+    pub fn compute_route(
+        &self,
+        source: DeviceId,
+        destination: DeviceId,
+        now_unix_secs: u64,
+    ) -> Option<RoutePath> {
         if source == destination {
             return None;
         }
@@ -335,7 +389,7 @@ impl LinkStateRouter {
             let Some(lsa) = self.lsdb.get(&current) else {
                 continue;
             };
-            if current != source && !lsa.can_relay {
+            if current != source && !self.is_authorized_relay(current, now_unix_secs) {
                 continue;
             }
 
@@ -392,7 +446,8 @@ mod tests {
         // Coordinator-free link-state routing:
         // Direct A -> C has high latency (200 ms), whereas A -> B (15 ms) -> C (20 ms) is 35 ms
         // through peer-relay B.
-        let mut router = LinkStateRouter::new();
+        let mut router = LinkStateRouter::new(authority.public());
+        // Advertising `can_relay = true` alone grants nothing.
         assert!(router.ingest_lsa(LinkStateAdvertisement {
             origin: node_a,
             sequence: 1,
@@ -417,13 +472,67 @@ mod tests {
                 rtt_ms: 20,
             }],
         }));
+        let direct_only = router.compute_route(node_a, node_c, 1_000).unwrap();
+        assert_eq!(direct_only.hops, vec![node_c]);
+        assert_eq!(direct_only.total_rtt_ms, 200);
+
+        // A forged or foreign certificate is rejected; the real one authorizes B.
+        let forged = PeerRelayCertificate::issue(
+            &DeviceIdentity::generate(),
+            node_b_relay,
+            vec![],
+            true,
+            5_000,
+        );
+        assert!(router.register_relay_certificate(&forged, 1_000).is_err());
+        router.register_relay_certificate(&cert, 1_000).unwrap();
+        assert!(router.ingest_lsa(LinkStateAdvertisement {
+            origin: node_a,
+            sequence: 2,
+            can_relay: false,
+            neighbors: vec![
+                LinkNeighbor {
+                    peer: node_b_relay,
+                    rtt_ms: 15,
+                },
+                LinkNeighbor {
+                    peer: node_c,
+                    rtt_ms: 200,
+                },
+            ],
+        }));
+        assert!(router.ingest_lsa(LinkStateAdvertisement {
+            origin: node_b_relay,
+            sequence: 2,
+            can_relay: true,
+            neighbors: vec![LinkNeighbor {
+                peer: node_c,
+                rtt_ms: 20,
+            }],
+        }));
 
         let route = router
-            .compute_route(node_a, node_c)
+            .compute_route(node_a, node_c, 1_000)
             .unwrap_or_else(|| unreachable!());
         assert_eq!(route.next_hop, node_b_relay);
         assert_eq!(route.hops, vec![node_b_relay, node_c]);
         assert_eq!(route.total_rtt_ms, 35);
+        // Once the certificate expires, B is no longer a transit hop.
+        let expired = router.compute_route(node_a, node_c, 6_000).unwrap();
+        assert_eq!(expired.hops, vec![node_c]);
+
+        // Group lists are length-prefixed in the transcript, so moving a NUL
+        // between two groups changes the signed message.
+        let two = PeerRelayCertificate::issue(
+            &authority,
+            node_a,
+            vec!["a".into(), "b".into()],
+            false,
+            5_000,
+        );
+        let mut joined = two.clone();
+        joined.groups = vec!["a\0b".to_owned()];
+        assert!(joined.verify(&authority.public(), 1_000).is_err());
     }
 
     #[test]

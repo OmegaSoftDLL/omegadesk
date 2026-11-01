@@ -1,0 +1,112 @@
+// OmegaDesk control plane, version 1: messages exchanged between a node (agent
+// or client) and the coordinator (`omegadesk-server`) over the Noise IK control
+// channel. Semantics inspired by Tailscale `tailcfg` (MapRequest/MapResponse) and
+// Headscale's batched map responses, with our own wire format.
+syntax = "proto3";
+
+package omegadesk.control.v1;
+
+message ControlEnvelope {
+  oneof payload {
+    EnrollRequest enroll_request = 1;
+    EnrollResponse enroll_response = 2;
+    NetmapBatch netmap_batch = 3;
+    EndpointUpdate endpoint_update = 4;
+    RelayTicketRequest relay_ticket_request = 5;
+    RelayTicketResponse relay_ticket_response = 6;
+    Keepalive keepalive = 7;
+    ControlError error = 8;
+  }
+}
+
+// First message after the Noise handshake. The node's keys are already
+// authenticated by the handshake; the pre-auth key authorizes enrollment.
+message EnrollRequest {
+  uint32 protocol_version = 1;
+  // `odk_<prefix>_<secret>` token created on the coordinator.
+  string preauth_key = 2;
+  // Requested hostname; the coordinator sanitizes it into a `*.omega` label.
+  string hostname = 3;
+  // Direct UDP endpoints currently known to the node (`ip:port`).
+  repeated string endpoints = 4;
+}
+
+// A node in the network map. Keys are raw 32-byte Ed25519 / X25519 public keys.
+message NodeInfo {
+  bytes signing_key = 1;
+  bytes exchange_key = 2;
+  string tenant = 3;
+  string hostname = 4;
+  string fqdn = 5;
+  string ipv4 = 6;
+  string ipv6 = 7;
+  repeated string endpoints = 8;
+  repeated string tags = 9;
+  bool ephemeral = 10;
+}
+
+// A relay node the coordinator issued tickets for.
+message RelayInfo {
+  // `host:port` of the relay's TCP listener.
+  string address = 1;
+  // Relay X25519 public key (32 bytes), also the ticket audience.
+  bytes exchange_key = 2;
+  // Serialized single-use ticket (see `omegadesk-relay` `RelayTicket::to_bytes`).
+  bytes ticket = 3;
+  // `host:port` of the relay's STUN responder, when it runs one.
+  string stun_address = 4;
+}
+
+message EnrollResponse {
+  uint32 protocol_version = 1;
+  NodeInfo self_node = 2;
+  // Every peer visible to this node (same tenant) at enrollment time.
+  repeated NodeInfo peers = 3;
+  repeated RelayInfo relays = 4;
+}
+
+message NetmapDelta {
+  oneof change {
+    NodeInfo peer_upserted = 1;
+    EndpointUpdate endpoints_updated = 2;
+    // Ed25519 signing key of the removed peer.
+    bytes peer_removed = 3;
+  }
+}
+
+// Coalesced incremental changes pushed by the coordinator.
+message NetmapBatch {
+  repeated NetmapDelta deltas = 1;
+}
+
+// Sent by a node whenever its direct UDP endpoints change (STUN/LAN); relayed
+// to peers inside a NetmapBatch with `signing_key` filled by the coordinator.
+message EndpointUpdate {
+  bytes signing_key = 1;
+  repeated string endpoints = 2;
+}
+
+// Asks for fresh single-use tickets (the previous ones were redeemed or expired).
+message RelayTicketRequest {}
+
+message RelayTicketResponse {
+  repeated RelayInfo relays = 1;
+}
+
+// Liveness probe in both directions; the receiver echoes `sequence`.
+message Keepalive {
+  uint64 sequence = 1;
+}
+
+message ControlError {
+  ControlErrorCode code = 1;
+  string message = 2;
+}
+
+enum ControlErrorCode {
+  CONTROL_ERROR_CODE_UNSPECIFIED = 0;
+  CONTROL_ERROR_CODE_UNSUPPORTED_VERSION = 1;
+  CONTROL_ERROR_CODE_INVALID_PREAUTH_KEY = 2;
+  CONTROL_ERROR_CODE_NOT_ENROLLED = 3;
+  CONTROL_ERROR_CODE_INTERNAL = 4;
+}

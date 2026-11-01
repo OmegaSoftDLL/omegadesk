@@ -16,6 +16,8 @@ data-encoding.workspace = true
 omegadesk-identity.workspace = true
 omegadesk-mesh = { path = "../crates/mesh" }
 omegadesk-noise = { path = "../crates/noise" }
+omegadesk-protocol.workspace = true
+prost.workspace = true
 omegadesk-relay = { path = "../relay" }
 omegadesk-tun = { path = "../crates/tun" }
 rand_core.workspace = true

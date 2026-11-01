@@ -23,6 +23,24 @@ pub mod v1 {
     include!(concat!(env!("OUT_DIR"), "/omegadesk.v1.rs"));
 }
 
+/// Control-plane messages exchanged with the coordinator over Noise IK.
+pub mod control {
+    /// Current control protocol version sent in `EnrollRequest` / `EnrollResponse`.
+    pub const CONTROL_PROTOCOL_VERSION: u32 = 1;
+
+    /// Version 1 control messages.
+    #[allow(
+        missing_docs,
+        unreachable_pub,
+        clippy::pedantic,
+        clippy::wildcard_enum_match_arm,
+        clippy::large_enum_variant
+    )]
+    pub mod v1 {
+        include!(concat!(env!("OUT_DIR"), "/omegadesk.control.v1.rs"));
+    }
+}
+
 /// Selects the session codec: the first entry in the host's preference list
 /// that the client is able to decode.
 #[must_use]
