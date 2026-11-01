@@ -638,6 +638,10 @@ impl VncCongestionController {
             self.min_rtt_ms = None;
             self.min_congested_rtt_ms = None;
             self.in_slow_start = true;
+            // `Congestion.cxx` keeps `extraBuffer` across the reset; after an idle pause the
+            // pipe has drained, so stale over-buffering bytes would make the next probes
+            // subtract a delay that no longer exists and understate congestion. Drop them.
+            self.extra_buffer = 0;
         }
 
         if let Some(base_rtt) = self.base_rtt_ms {
@@ -1039,10 +1043,16 @@ mod tests {
         assert!(!cc.in_slow_start());
         let backed_off = cc.congestion_window();
 
+        // A burst 1 ms after the last send leaves over-buffering bytes in `extra_buffer`.
+        cc.update_position(250_000, 1_201);
+        assert!(cc.extra_buffer > 0);
+
         // 5 s of silence (> 100 ms and > 2 * base RTT), then data is sent with no zero-byte
-        // position update during the pause. This send itself must trigger the idle reset.
+        // position update during the pause. This send itself must trigger the idle reset,
+        // which also discards the stale over-buffering estimate: the pipe has drained.
         cc.update_position(300_000, 6_200);
         assert!(cc.in_slow_start());
+        assert_eq!(cc.extra_buffer, 0);
         assert_eq!(cc.congestion_window(), INITIAL_WINDOW.min(backed_off));
         // The RTT baseline was discarded: the next pong re-measures it from scratch (300 ms
         // instead of the 10 ms learned before the pause), which the bandwidth estimate exposes.
