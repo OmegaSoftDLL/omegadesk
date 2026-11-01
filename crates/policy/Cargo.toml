@@ -9,13 +9,16 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
-omegadesk-identity.workspace = true
+omegadesk-identity = { workspace = true, features = ["serde"] }
 omegadesk-protocol.workspace = true
 ring.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
 
 [lints]
 workspace = true

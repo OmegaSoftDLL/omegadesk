@@ -1,7 +1,8 @@
 //! Supervises the control connection: forwards netmap events to the driver,
-//! pushes endpoint updates, serves fresh relay tickets, and re-enrolls with
-//! back-off when the coordinator connection drops (Tailscale `controlclient`
-//! auto-reconnect; Headscale re-issues the full map on reconnect).
+//! pushes endpoint updates, serves fresh relay tickets, routes RMM messages to
+//! the RMM task, and re-enrolls with back-off when the coordinator connection
+//! drops (Tailscale `controlclient` auto-reconnect; Headscale re-issues the
+//! full map on reconnect).
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -9,7 +10,7 @@ use std::time::Duration;
 
 use omegadesk_control::{
     ControlClient, ControlConfig, ControlError, ControlHandle, Enrollment, NetmapEvent, RelayGrant,
-    TicketSource,
+    RmmEvent, TicketSource,
 };
 use omegadesk_identity::DeviceIdentity;
 use tokio::sync::mpsc;
@@ -66,6 +67,31 @@ impl TicketSource for SharedControl {
 /// re-enrollment before the resync is applied non-destructively.
 const SNAPSHOT_COMPLETION_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Where non-netmap control events go.
+pub(crate) struct Sinks {
+    pub(crate) driver: mpsc::Sender<DriverMsg>,
+    /// RMM task of the agent; a closed receiver (clients, tests) just drops events.
+    pub(crate) rmm: mpsc::Sender<RmmEvent>,
+}
+
+impl Sinks {
+    /// Delivers one event to the right sink. Returns `false` when the driver is gone.
+    async fn deliver(&self, event: NetmapEvent) -> bool {
+        match event {
+            NetmapEvent::ScriptDispatch(dispatch) => {
+                let _ = self.rmm.send(RmmEvent::ScriptDispatch(dispatch)).await;
+                true
+            }
+            other @ (NetmapEvent::PeerUpserted(_)
+            | NetmapEvent::EndpointsUpdated { .. }
+            | NetmapEvent::PeerRemoved { .. }
+            | NetmapEvent::Disconnected(_)) => {
+                self.driver.send(DriverMsg::Netmap(other)).await.is_ok()
+            }
+        }
+    }
+}
+
 /// Runs until the driver goes away. A QuickSupport host re-enrolls proposing
 /// the ID it was assigned, so the number the end user read aloud survives a
 /// coordinator reconnect unless another host took it in the meantime.
@@ -74,7 +100,7 @@ pub(crate) async fn supervise(
     mut config: ControlConfig,
     shared: Arc<SharedControl>,
     first: ControlClient,
-    driver: mpsc::Sender<DriverMsg>,
+    sinks: Sinks,
     mut endpoint_updates: mpsc::UnboundedReceiver<Vec<SocketAddr>>,
 ) {
     let mut link = Some(first.into_parts());
@@ -99,9 +125,10 @@ pub(crate) async fn supervise(
                     }
                     let (handle, mut events) = reconnected.into_parts();
                     shared.set(Some(handle.clone()));
-                    if !resync(&driver, &mut events, enrollment).await {
+                    if !resync(&sinks, &mut events, enrollment).await {
                         return;
                     }
+                    let _ = sinks.rmm.send(RmmEvent::Enrolled).await;
                     backoff = BACKOFF_MIN;
                     link = Some((handle, events));
                 }
@@ -119,7 +146,7 @@ pub(crate) async fn supervise(
                         break;
                     }
                     Some(event) => {
-                        if driver.send(DriverMsg::Netmap(event)).await.is_err() {
+                        if !sinks.deliver(event).await {
                             return;
                         }
                     }
@@ -150,7 +177,7 @@ pub(crate) async fn supervise(
 /// if it does not complete in time, the peers are upserted one by one instead
 /// and nothing is removed. Returns `false` when the driver is gone.
 async fn resync(
-    driver: &mpsc::Sender<DriverMsg>,
+    sinks: &Sinks,
     events: &mut mpsc::Receiver<NetmapEvent>,
     mut enrollment: Enrollment,
 ) -> bool {
@@ -170,7 +197,8 @@ async fn resync(
         }
     }
     let delivered = if enrollment.is_complete() {
-        driver
+        sinks
+            .driver
             .send(DriverMsg::Resync {
                 self_node: Box::new(enrollment.self_node),
                 peers: enrollment.peers,
@@ -185,7 +213,8 @@ async fn resync(
         );
         let mut ok = true;
         for peer in enrollment.peers {
-            if driver
+            if sinks
+                .driver
                 .send(DriverMsg::Netmap(NetmapEvent::PeerUpserted(Box::new(peer))))
                 .await
                 .is_err()
@@ -205,7 +234,7 @@ async fn resync(
             // The outer loop reads the receiver again and finds it closed.
             continue;
         }
-        if driver.send(DriverMsg::Netmap(event)).await.is_err() {
+        if !sinks.deliver(event).await {
             return false;
         }
     }

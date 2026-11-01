@@ -44,6 +44,19 @@ pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 /// forever.
 pub const READ_IDLE_TIMEOUT: Duration = Duration::from_secs(100);
 
+/// Prefix of a deployment-link token (`odl_<link_id>_<mac hex>`), as opposed
+/// to a pre-auth key (`odk_<prefix>_<secret>`).
+pub const DEPLOYMENT_TOKEN_PREFIX: &str = "odl_";
+
+/// Whether an enrollment credential is a deployment-link token rather than a
+/// pre-auth key. [`ControlConfig::preauth_key`] accepts both: the client puts a
+/// token in `EnrollRequest.deployment_token` so the coordinator can map it to
+/// the pre-auth key bound to the link.
+#[must_use]
+pub fn is_deployment_token(credential: &str) -> bool {
+    credential.trim().starts_with(DEPLOYMENT_TOKEN_PREFIX)
+}
+
 /// Errors returned by the control client.
 #[derive(Debug, thiserror::Error)]
 pub enum ControlError {
@@ -257,7 +270,7 @@ impl Enrollment {
 }
 
 /// Netmap changes pushed by the coordinator after enrollment.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum NetmapEvent {
     /// A peer joined or changed.
     PeerUpserted(Box<PeerInfo>),
@@ -273,8 +286,22 @@ pub enum NetmapEvent {
         /// Ed25519 signing key of the peer.
         signing_key: [u8; 32],
     },
+    /// The coordinator asks this node to run a script (RMM). Not a netmap
+    /// change: it rides the same stream so the mesh layer forwards it to the
+    /// RMM task as [`RmmEvent::ScriptDispatch`].
+    ScriptDispatch(Box<control::ScriptDispatch>),
     /// The control connection ended; the node must re-enroll.
     Disconnected(String),
+}
+
+/// What the RMM task of an agent receives from the control link.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RmmEvent {
+    /// A (re-)enrollment completed: the agent sends a fresh inventory report,
+    /// because the coordinator may have restarted and lost its memory of it.
+    Enrolled,
+    /// Run this script and report the result with [`ControlHandle::send_script_result`].
+    ScriptDispatch(Box<control::ScriptDispatch>),
 }
 
 /// Configuration for [`ControlClient::connect`].
@@ -284,7 +311,8 @@ pub struct ControlConfig {
     pub server_addr: String,
     /// Coordinator public identity (`--server-key`).
     pub server_public: DevicePublic,
-    /// `odk_<prefix>_<secret>` pre-authorized key.
+    /// Enrollment credential: an `odk_<prefix>_<secret>` pre-authorized key or
+    /// an `odl_<link>_<mac>` deployment-link token (see [`is_deployment_token`]).
     pub preauth_key: String,
     /// Requested hostname.
     pub hostname: String,
@@ -325,6 +353,38 @@ impl ControlHandle {
                 endpoints: endpoints.iter().map(ToString::to_string).collect(),
             },
         ));
+        self.outbound
+            .send(Outbound::Message(Box::new(msg)))
+            .await
+            .map_err(|_| ControlError::Closed)
+    }
+
+    /// Sends an RMM inventory report / heartbeat to the coordinator.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControlError::Closed`] if the connection is gone.
+    pub async fn send_inventory(
+        &self,
+        report: control::InventoryReport,
+    ) -> Result<(), ControlError> {
+        let msg = envelope(control::control_envelope::Payload::InventoryReport(report));
+        self.outbound
+            .send(Outbound::Message(Box::new(msg)))
+            .await
+            .map_err(|_| ControlError::Closed)
+    }
+
+    /// Reports the outcome of a [`control::ScriptDispatch`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControlError::Closed`] if the connection is gone.
+    pub async fn send_script_result(
+        &self,
+        result: control::ScriptResult,
+    ) -> Result<(), ControlError> {
+        let msg = envelope(control::control_envelope::Payload::ScriptResult(result));
         self.outbound
             .send(Outbound::Message(Box::new(msg)))
             .await
@@ -450,16 +510,22 @@ impl ControlClient {
         let session = handshake.complete(&identity, &msg2)?;
         let (mut tx, mut rx) = session.split();
 
+        let (preauth_key, deployment_token) = if is_deployment_token(&config.preauth_key) {
+            (String::new(), config.preauth_key.trim().to_owned())
+        } else {
+            (config.preauth_key.clone(), String::new())
+        };
         let request = envelope(control::control_envelope::Payload::EnrollRequest(
             control::EnrollRequest {
                 protocol_version: CONTROL_PROTOCOL_VERSION,
-                preauth_key: config.preauth_key.clone(),
+                preauth_key,
                 hostname: config.hostname.clone(),
                 endpoints: config.endpoints.iter().map(ToString::to_string).collect(),
                 quicksupport_id: config
                     .quicksupport_id
                     .map(QuickSupportId::digits)
                     .unwrap_or_default(),
+                deployment_token,
             },
         ));
         writer
@@ -627,6 +693,45 @@ async fn writer_loop(
     let _ = writer.shutdown().await;
 }
 
+async fn forward_netmap_batch(
+    events: &mpsc::Sender<NetmapEvent>,
+    batch: control::NetmapBatch,
+) -> bool {
+    for delta in batch.deltas {
+        let event = match delta.change {
+            Some(control::netmap_delta::Change::PeerUpserted(info)) => {
+                match PeerInfo::from_proto(&info) {
+                    Ok(peer) => NetmapEvent::PeerUpserted(Box::new(peer)),
+                    Err(error) => {
+                        warn!(%error, "ignoring malformed peer in netmap");
+                        continue;
+                    }
+                }
+            }
+            Some(control::netmap_delta::Change::EndpointsUpdated(update)) => {
+                let Ok(signing_key) = <[u8; 32]>::try_from(update.signing_key.as_ref()) else {
+                    continue;
+                };
+                NetmapEvent::EndpointsUpdated {
+                    signing_key,
+                    endpoints: parse_endpoints(&update.endpoints),
+                }
+            }
+            Some(control::netmap_delta::Change::PeerRemoved(key)) => {
+                let Ok(signing_key) = <[u8; 32]>::try_from(key.as_ref()) else {
+                    continue;
+                };
+                NetmapEvent::PeerRemoved { signing_key }
+            }
+            None => continue,
+        };
+        if events.send(event).await.is_err() {
+            return false;
+        }
+    }
+    true
+}
+
 async fn reader_loop(
     mut reader: OwnedReadHalf,
     mut rx: NoiseReceiver,
@@ -649,38 +754,8 @@ async fn reader_loop(
         };
         match msg.payload {
             Some(control::control_envelope::Payload::NetmapBatch(batch)) => {
-                for delta in batch.deltas {
-                    let event = match delta.change {
-                        Some(control::netmap_delta::Change::PeerUpserted(info)) => {
-                            match PeerInfo::from_proto(&info) {
-                                Ok(peer) => NetmapEvent::PeerUpserted(Box::new(peer)),
-                                Err(error) => {
-                                    warn!(%error, "ignoring malformed peer in netmap");
-                                    continue;
-                                }
-                            }
-                        }
-                        Some(control::netmap_delta::Change::EndpointsUpdated(update)) => {
-                            let Ok(signing_key) = <[u8; 32]>::try_from(update.signing_key.as_ref())
-                            else {
-                                continue;
-                            };
-                            NetmapEvent::EndpointsUpdated {
-                                signing_key,
-                                endpoints: parse_endpoints(&update.endpoints),
-                            }
-                        }
-                        Some(control::netmap_delta::Change::PeerRemoved(key)) => {
-                            let Ok(signing_key) = <[u8; 32]>::try_from(key.as_ref()) else {
-                                continue;
-                            };
-                            NetmapEvent::PeerRemoved { signing_key }
-                        }
-                        None => continue,
-                    };
-                    if events.send(event).await.is_err() {
-                        return;
-                    }
+                if !forward_netmap_batch(&events, batch).await {
+                    return;
                 }
             }
             Some(control::control_envelope::Payload::RelayTicketResponse(response)) => {
@@ -714,6 +789,15 @@ async fn reader_loop(
                     debug!("unsolicited QuickSupport lookup response");
                 }
             }
+            Some(control::control_envelope::Payload::ScriptDispatch(dispatch)) => {
+                if events
+                    .send(NetmapEvent::ScriptDispatch(Box::new(dispatch)))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
             Some(control::control_envelope::Payload::Error(error)) => {
                 break format!("coordinator error: {}", error.message);
             }
@@ -723,7 +807,9 @@ async fn reader_loop(
                 | control::control_envelope::Payload::EndpointUpdate(_)
                 | control::control_envelope::Payload::RelayTicketRequest(_)
                 | control::control_envelope::Payload::Keepalive(_)
-                | control::control_envelope::Payload::QuickSupportLookupRequest(_),
+                | control::control_envelope::Payload::QuickSupportLookupRequest(_)
+                | control::control_envelope::Payload::InventoryReport(_)
+                | control::control_envelope::Payload::ScriptResult(_),
             )
             | None => {}
         }
@@ -985,6 +1071,162 @@ mod tests {
         assert!(matches!(
             err,
             ControlError::Io(_) | ControlError::Noise(_) | ControlError::Closed
+        ));
+    }
+
+    type SharedRmm = Arc<Mutex<omegadesk_server::rmm_service::RmmService>>;
+
+    /// A coordinator whose RMM service the test can inspect, plus a deployment
+    /// token for tenant `acme`, site `site-sp`.
+    async fn start_rmm_coordinator() -> (SocketAddr, DevicePublic, SharedRmm, String) {
+        let server_id = Arc::new(DeviceIdentity::generate());
+        let mut coord = Coordinator::new([5u8; 32]);
+        let preauth_key = coord
+            .create_preauth_key("acme", true, false, vec![], None)
+            .unwrap();
+        let coordinator = Arc::new(Mutex::new(coord));
+        let rmm: SharedRmm = Arc::new(Mutex::new(
+            omegadesk_server::rmm_service::RmmService::in_memory(),
+        ));
+        let token = rmm
+            .lock()
+            .unwrap()
+            .create_deployment_link("acme", "site-sp", preauth_key, u64::MAX, 0)
+            .1;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let public = server_id.public();
+        tokio::spawn(control_server::serve_with(
+            listener,
+            server_id,
+            coordinator,
+            Arc::clone(&rmm),
+        ));
+        (addr, public, rmm, token)
+    }
+
+    async fn wait_until(mut condition: impl FnMut() -> bool) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !condition() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("condition never became true");
+    }
+
+    fn config(
+        addr: SocketAddr,
+        public: DevicePublic,
+        credential: &str,
+        host: &str,
+    ) -> ControlConfig {
+        ControlConfig {
+            server_addr: addr.to_string(),
+            server_public: public,
+            preauth_key: credential.to_owned(),
+            hostname: host.to_owned(),
+            endpoints: vec![],
+            quicksupport_id: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn deployment_tokens_enroll_and_rmm_messages_ride_the_control_stream() {
+        let (addr, public, rmm, token) = start_rmm_coordinator().await;
+        assert!(is_deployment_token(&token));
+        assert!(!is_deployment_token("odk_a_b"));
+
+        let node = Arc::new(DeviceIdentity::generate());
+        let (mut ctl, enrollment) =
+            ControlClient::connect(Arc::clone(&node), config(addr, public, &token, "pc"))
+                .await
+                .unwrap();
+        assert_eq!(enrollment.self_node.tenant, "acme");
+        {
+            let guard = rmm.lock().unwrap();
+            let inventory = guard.inventory(node.id()).unwrap();
+            assert_eq!(inventory.site_id.as_deref(), Some("site-sp"));
+            assert!(guard.is_online(node.id()));
+        }
+
+        // Inventory reaches the service; a dispatch reaches the node; its result is stored.
+        ctl.handle()
+            .send_inventory(control::InventoryReport {
+                hostname: "PC".into(),
+                cpu_utilization_pct: 7,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        wait_until(|| {
+            rmm.lock()
+                .unwrap()
+                .inventory(node.id())
+                .is_some_and(|inv| inv.cpu_utilization_pct == 7)
+        })
+        .await;
+        let (_, dispatch) = rmm
+            .lock()
+            .unwrap()
+            .run_script(
+                "pc",
+                "",
+                Some(omegadesk_server::rmm::ScriptingShell::Bash),
+                "echo hi",
+                5,
+            )
+            .unwrap();
+        let event = tokio::time::timeout(Duration::from_secs(5), ctl.next_event())
+            .await
+            .unwrap()
+            .unwrap();
+        let NetmapEvent::ScriptDispatch(script) = event else {
+            panic!("expected a ScriptDispatch, got {event:?}");
+        };
+        assert_eq!(
+            dispatch,
+            omegadesk_server::rmm_service::Dispatch::Sent(script.run_id)
+        );
+        assert_eq!(script.content, "echo hi");
+        assert_eq!(script.timeout_secs, 5);
+        ctl.handle()
+            .send_script_result(control::ScriptResult {
+                run_id: script.run_id,
+                script_id: script.script_id.clone(),
+                exit_code: 0,
+                stdout: "hi\n".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        wait_until(|| !rmm.lock().unwrap().results(Some(node.id()), 1).is_empty()).await;
+        assert_eq!(
+            rmm.lock().unwrap().results(Some(node.id()), 1)[0]
+                .outcome
+                .stdout,
+            "hi\n"
+        );
+
+        // Disconnecting marks the device offline in the service.
+        drop(ctl);
+        wait_until(|| !rmm.lock().unwrap().is_online(node.id())).await;
+    }
+
+    #[tokio::test]
+    async fn forged_deployment_tokens_are_rejected_with_their_own_code() {
+        let (addr, public, _rmm, _token) = start_rmm_coordinator().await;
+        let stranger = Arc::new(DeviceIdentity::generate());
+        let err = ControlClient::connect(stranger, config(addr, public, "odl_nope_ff", "x"))
+            .await
+            .err()
+            .unwrap();
+        assert!(matches!(
+            err,
+            ControlError::Rejected {
+                code: control::ControlErrorCode::InvalidDeploymentToken,
+                ..
+            }
         ));
     }
 

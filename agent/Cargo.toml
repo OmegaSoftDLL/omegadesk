@@ -24,6 +24,7 @@ omegadesk-policy.workspace = true
 omegadesk-protocol.workspace = true
 omegadesk-recording.workspace = true
 omegadesk-service.workspace = true
+omegadesk-rmm-agent.workspace = true
 omegadesk-session = { workspace = true, features = ["io"] }
 omegadesk-transport.workspace = true
 prost.workspace = true

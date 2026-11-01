@@ -108,5 +108,7 @@ fn apply_netmap(socket: &MagicSocket, event: NetmapEvent) {
         NetmapEvent::Disconnected(reason) => {
             warn!(%reason, "control connection lost; re-enrolling in the background");
         }
+        // RMM traffic is routed to the RMM task by the control link, never to the socket.
+        NetmapEvent::ScriptDispatch(_) => {}
     }
 }

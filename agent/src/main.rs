@@ -12,6 +12,11 @@
 //! # (`<name>.omega`) through NAT traversal or the relay, and TLS is bound to
 //! # the device identity the coordinator distributes.
 //! omegadesk-agent --server coord.example:8080 --server-key <128 hex> --preauth-key odk_...
+//!
+//! # Mesh with a deployment link (Phase 6): the token issued by
+//! # `omegadesk-server admin links create` enrolls the device into its tenant
+//! # and site; the agent then reports inventory and runs RMM scripts.
+//! omegadesk-agent --server coord.example:8080 --server-key <128 hex> --deployment-token odl_...
 //! ```
 //!
 //! On startup the agent prints its access password (and, on the local
@@ -22,6 +27,7 @@
 //! recorded (`--recordings-dir`), watermarked or clipboard-limited; every
 //! decision is written to `--audit-log` as JSON Lines.
 
+mod rmm;
 mod virtual_display;
 
 use std::net::SocketAddr;
@@ -100,7 +106,7 @@ struct Args {
 
     /// Coordinator `host:port`. Enables mesh mode: the agent enrolls, is
     /// reachable as `<name>.omega` and does not print a fingerprint.
-    #[arg(long, env = "OMEGADESK_SERVER", requires_all = ["server_key", "preauth_key"])]
+    #[arg(long, env = "OMEGADESK_SERVER", requires_all = ["server_key", "credential"])]
     server: Option<String>,
 
     /// Coordinator public key (128 hex characters printed by `omegadesk-server`).
@@ -108,8 +114,14 @@ struct Args {
     server_key: Option<String>,
 
     /// Pre-authorized key issued by the coordinator (`odk_...`).
-    #[arg(long, env = "OMEGADESK_PREAUTH_KEY")]
+    #[arg(long, env = "OMEGADESK_PREAUTH_KEY", group = "credential")]
     preauth_key: Option<String>,
+
+    /// Deployment-link token issued by `omegadesk-server admin links create`
+    /// (`odl_...`): enrolls without copying a pre-auth key and places the
+    /// device in the link's tenant and site.
+    #[arg(long, env = "OMEGADESK_DEPLOYMENT_TOKEN", group = "credential")]
+    deployment_token: Option<String>,
 
     /// Mesh mode only: never attempt direct paths, send everything via the relays.
     #[arg(long)]
@@ -152,6 +164,15 @@ struct Args {
     /// as JSON Lines to this file.
     #[arg(long, env = "OMEGADESK_AUDIT_LOG")]
     audit_log: Option<PathBuf>,
+
+    /// Mesh mode only: minutes between RMM inventory reports (a report is also
+    /// sent at enrollment and when the inventory changes).
+    #[arg(
+        long,
+        env = "OMEGADESK_INVENTORY_INTERVAL_MINUTES",
+        default_value_t = 15
+    )]
+    inventory_interval_minutes: u64,
 }
 
 /// Binds the QUIC endpoint: on the mesh it enrolls a [`Node`] (kept alive for the whole run)
@@ -160,9 +181,10 @@ async fn build_endpoint(
     args: &Args,
     identity: omegadesk_identity::DeviceIdentity,
     hostname: &str,
-) -> anyhow::Result<(omegadesk_transport::Endpoint, Option<Node>)> {
-    let (Some(server), Some(server_key), Some(preauth_key)) =
-        (&args.server, &args.server_key, &args.preauth_key)
+) -> anyhow::Result<(omegadesk_transport::Endpoint, Option<Arc<Node>>)> {
+    let credential = args.preauth_key.clone().or(args.deployment_token.clone());
+    let (Some(server), Some(server_key), Some(credential)) =
+        (&args.server, &args.server_key, credential)
     else {
         let (endpoint, fingerprint) =
             server_endpoint(args.listen).context("failed to bind agent QUIC endpoint")?;
@@ -174,16 +196,18 @@ async fn build_endpoint(
     let mut node_config = NodeConfig::new(ControlConfig {
         server_addr: server.clone(),
         server_public,
-        preauth_key: preauth_key.clone(),
+        preauth_key: credential,
         hostname: hostname.to_owned(),
         endpoints: Vec::new(),
         quicksupport_id: None,
     });
     node_config.bind = args.listen;
     node_config.relay_only = args.relay_only;
-    let node = Node::start(Arc::new(identity), node_config)
-        .await
-        .context("failed to join the mesh")?;
+    let node = Arc::new(
+        Node::start(Arc::new(identity), node_config)
+            .await
+            .context("failed to join the mesh")?,
+    );
     info!(
         "mesh address: {} ({}); clients connect with `omegadesk-client {}`",
         node.self_info().fqdn,
@@ -318,8 +342,11 @@ async fn run_share(args: Args) -> anyhow::Result<()> {
     });
 
     // Mesh mode keeps the `Node` alive for the whole run: dropping it stops
-    // the control, relay and driver tasks.
+    // the control, relay, driver and RMM tasks.
     let (endpoint, mesh_node) = build_endpoint(&args, identity, &config.name).await?;
+    if let Some(node) = &mesh_node {
+        rmm::spawn(node, args.inventory_interval_minutes);
+    }
     info!("access password: {}", config.password);
 
     // Optional virtual monitor for headless hosts / privacy mode. Kept alive for

@@ -23,7 +23,7 @@ OmegaDesk is a remote desktop you run on your own infrastructure, as an alternat
 ## Status
 
 > [!WARNING]
-> OmegaDesk is in early development. **Phases 0 and 1** of the [roadmap](docs/plan.md) are done: it works on a local network today, connecting by IP address, certificate fingerprint and password. **Phase 2** (coordinator, relay and mesh) is implemented end to end: agent and client enroll with a coordinator and connect by name through NAT traversal or the relay, verified in-process and in a two-machine test over Tailscale (a clean test across two distinct public NATs is still pending). From **Phase 3**, QuickSupport works end to end (nine-digit ID, temporary password, console consent prompt), and the native agent and client synchronize text clipboards, transfer files, switch monitors and adapt video quality. The **browser client** (Phase 4) connects through the coordinator's web gateway with keyboard, mouse and H.264 video, verified in-process; its latency against the native client is not measured yet. **Phase 5** (policies, per-connection MFA, recording, DLP and audit) is wired into the coordinator, the agent and the client and verified in-process; approval workflows and session sharing are still library code. Audio, chat, terminal and LAN mode remain unwired, and the RMM and compatibility layers (Phases 6 and 7) exist only as library crates that no binary uses yet; the plan lists their known defects. It is not ready for production use.
+> OmegaDesk is in early development. **Phases 0 and 1** of the [roadmap](docs/plan.md) are done: it works on a local network today, connecting by IP address, certificate fingerprint and password. **Phase 2** (coordinator, relay and mesh) is implemented end to end: agent and client enroll with a coordinator and connect by name through NAT traversal or the relay, verified in-process and in a two-machine test over Tailscale (a clean test across two distinct public NATs is still pending). From **Phase 3**, QuickSupport works end to end (nine-digit ID, temporary password, console consent prompt), and the native agent and client synchronize text clipboards, transfer files, switch monitors and adapt video quality. The **browser client** (Phase 4) connects through the coordinator's web gateway with keyboard, mouse and H.264 video, verified in-process; its latency against the native client is not measured yet. **Phase 5** (policies, per-connection MFA, recording, DLP and audit) is wired into the coordinator, the agent and the client and verified in-process; approval workflows and session sharing are still library code. **Phase 6** (RMM) works end to end from the command line: agents report inventory, the coordinator evaluates checks and runs scripts, and `omegadesk-server admin` operates the fleet; there is no web dashboard yet. Audio, chat, terminal and LAN mode remain unwired, and the compatibility layers (Phase 7) exist only as library crates that no binary uses yet; the plan lists their known defects. It is not ready for production use.
 
 What works today:
 
@@ -38,6 +38,7 @@ What works today:
 - **File transfer** in both directions on dedicated QUIC streams: `--send-file`, drag a file onto the client window, `--receive-dir` on either side. Transfers resume from a partial file and are SHA-256 verified before the file gets its final name; nothing is ever overwritten.
 - **Multi-monitor**: the agent lists its monitors; in the client press `Ctrl+Alt+Shift` + `1`..`9`, `N` (next) or `P` (previous) to switch the streamed display.
 - **Adaptive video quality**: the client acknowledges every frame and the agent lowers the bitrate first, then the frame rate, when the path congests (RustDesk `video_qos` model); `--bitrate-mbps` and `--fps` are the ceilings.
+- **RMM (command line)**: every mesh agent reports its inventory (OS, CPU, memory, drives, NICs, logged-on user, running processes and services, pending Windows reboot) at enrollment, every 15 minutes and on change; the coordinator evaluates checks (CPU, memory, disk, process, service, script exit code, offline), opens and resolves alerts, runs saved or ad-hoc PowerShell/`sh`/`cmd` scripts with a timeout (queued while a device is offline), keeps schedules, issues deployment links and persists it all to a JSON state file. `omegadesk-server admin devices|alerts|run|...` is the operator interface.
 
 First measurement (Intel Core Ultra 5 135U, 1920×1080, agent and client on the same machine): **60 fps and 24.5 ms end-to-end latency**. Host processing takes 15 ms (11 ms of it encoding), plus 0.2 ms network, 6 ms decode and 3 ms draw.
 
@@ -176,6 +177,24 @@ Without a policy every machine of a tenant sees every other one and the access p
 
 Machines get their tags from the pre-auth key they enroll with and their owner from `--bootstrap-user` (or `create_preauth_key_for_user`). An agent whose sessions require MFA needs `--totp-secret` (`--generate-totp-secret` prints one with its `otpauth://` URI for the authenticator app; codes are HMAC-SHA256, 6 digits, 30 s); the client passes `--totp <code>` or types it when asked. Sessions marked `record` need `--recordings-dir`; the agent refuses them otherwise. `--audit-log` on both binaries appends one JSON object per event (enrollments, denials, MFA, DLP, recordings).
 
+### RMM (inventory, checks, scripts)
+
+The coordinator also prints an `admin_token` and listens on `127.0.0.1:8081` for the local admin API (`--admin-listen`, `--admin-token`, `--state-file` to persist the RMM state). Every mesh agent reports its inventory automatically; the operator works from the same host as the coordinator:
+
+```sh
+export OMEGADESK_ADMIN_TOKEN=<admin_token>
+omegadesk-server admin devices                       # status, CPU/memory/disk, open alerts
+omegadesk-server admin device show office-pc         # full inventory, alerts, recent script results
+omegadesk-server admin checks add --id disk-c --kind disk --target 'C:' --max-percent 85 --tenant default --severity critical
+omegadesk-server admin scripts add --name "Clean temp" --shell powershell --file clean.ps1
+omegadesk-server admin run office-pc --script clean-temp
+omegadesk-server admin schedules add --name "Nightly" --tenant default --script clean-temp --interval daily --site hq
+omegadesk-server admin results --device office-pc
+omegadesk-server admin links create --tenant default --site hq --expires-in 86400
+# prints an odl_... token; install the agent with it instead of a pre-auth key:
+omegadesk-agent --server coord.example:8080 --server-key <128 hex> --deployment-token odl_...
+```
+
 ## Architecture
 
 ```
@@ -201,7 +220,8 @@ Machines get their tags from the pre-auth key they enroll with and their owner f
 | [`omegadesk-control`](crates/control) | Node-side client of the coordinator (enrollment, netmap, tickets) |
 | [`omegadesk-magicsock`](crates/magicsock) | The mesh as a QUIC socket: direct or relayed, virtual peer addresses |
 | [`omegadesk-relay`](relay) | DERP-style packet relay with single-use tickets and STUN |
-| [`omegadesk-server`](server) | Coordinator: keys, tenants, netmap stream, `*.omega` names |
+| [`omegadesk-server`](server) | Coordinator: keys, tenants, netmap stream, `*.omega` names, RMM service and local admin API |
+| [`omegadesk-rmm-agent`](crates/rmm-agent) | Agent side of RMM: inventory collection, heartbeat, script execution |
 | [`omegadesk-agent`](agent) | The service that shares a machine (also a library: the session reused by QuickSupport) |
 | [`omegadesk-service`](crates/service) | Windows `LocalSystem` service and per-session worker (unattended access across the login screen and UAC) |
 | [`omegadesk-quicksupport`](quicksupport) | Single-executable quick support: nine-digit ID, temporary password, consent prompt |
@@ -219,7 +239,7 @@ The full design, from the WireGuard mesh to the web client, is in [docs/plan.md]
 | 3 | Remote access product: Windows service, login/UAC screens, clipboard, files, audio | 🔶 QuickSupport, text clipboard, resumable file transfer, multi-monitor switching and adaptive video QoS are wired end to end; Windows service and privacy mode exist but the service worker does not yet route the QUIC session; audio, chat, terminal, FEC and LAN mode remain unwired; open findings: [#27](https://github.com/OmegaSoftDLL/omegadesk/issues/27) |
 | 4 | Web dashboard and browser client | 🔶 Browser client works end to end through `omegadesk-server --web-listen` (WebSocket gateway on the mesh, WebCodecs H.264, keyboard and mouse, latency readout), verified in-process and in CI; the policy model and connection manager are still library only, no dashboard, no WebTransport, latency against the native client not measured; open findings: [#28](https://github.com/OmegaSoftDLL/omegadesk/issues/28) |
 | 5 | Security, session recording and privileged access | 🔶 `HuJSON` policies filter every node's netmap at the coordinator and the agent enforces the compiled session grant: per-connection TOTP step-up with lockout, posture, clipboard limits, watermark, `.odrec` recording and JSON Lines audit on both ends, all verified in-process; approval tickets, live session sharing and the search UI remain library-only |
-| 6 | Remote monitoring and management (RMM) | 🧩 Library only: in-memory RMM models; the agent reports nothing; open findings: [#30](https://github.com/OmegaSoftDLL/omegadesk/issues/30) |
+| 6 | Remote monitoring and management (RMM) | 🔶 Agents report inventory and heartbeats, the coordinator evaluates checks, raises alerts, dispatches scripts and schedules, issues deployment links and persists to a state file; operated with `omegadesk-server admin`. No web dashboard, no agent self-update, Windows Update counts not scanned |
 | 7 | RDP/VNC compatibility, virtual displays, MCP server, Linux/macOS/mobile | 🔶 A real IddCx virtual display driver (`drivers/idd`, vendored signed QuickDesk driver) is wired into the agent (`--virtual-display <WxH@hz>`, `--privacy`); still no IronRDP dependency, no MCP server, no Linux/macOS capture; open findings: [#31](https://github.com/OmegaSoftDLL/omegadesk/issues/31), [#33](https://github.com/OmegaSoftDLL/omegadesk/issues/33) |
 
 ## Contributing

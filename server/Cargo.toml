@@ -16,7 +16,7 @@ clap.workspace = true
 data-encoding.workspace = true
 futures-util.workspace = true
 omegadesk-control.workspace = true
-omegadesk-identity.workspace = true
+omegadesk-identity = { workspace = true, features = ["serde"] }
 omegadesk-input.workspace = true
 omegadesk-magicsock.workspace = true
 omegadesk-mesh = { path = "../crates/mesh" }

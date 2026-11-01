@@ -50,8 +50,10 @@ use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 use tracing::warn;
 
+pub mod admin_api;
 pub mod control_server;
 pub mod rmm;
+pub mod rmm_service;
 pub mod web_gateway;
 pub mod web_server;
 pub mod web_session;
