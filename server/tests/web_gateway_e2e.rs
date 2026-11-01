@@ -122,6 +122,7 @@ async fn harness() -> Harness {
                 preauth_key,
                 hostname,
                 endpoints: Vec::new(),
+                quicksupport_id: None,
             });
             config.bind = "127.0.0.1:0".parse().unwrap();
             Node::start(Arc::new(DeviceIdentity::generate()), config)

@@ -16,6 +16,8 @@ message ControlEnvelope {
     RelayTicketResponse relay_ticket_response = 6;
     Keepalive keepalive = 7;
     ControlError error = 8;
+    QuickSupportLookupRequest quick_support_lookup_request = 9;
+    QuickSupportLookupResponse quick_support_lookup_response = 10;
   }
 }
 
@@ -29,6 +31,12 @@ message EnrollRequest {
   string hostname = 3;
   // Direct UDP endpoints currently known to the node (`ip:port`).
   repeated string endpoints = 4;
+  // QuickSupport nodes only: the nine-digit ID the node proposes (RustDesk
+  // `RegisterPk` model). The coordinator keeps it when it is free or already
+  // bound to this device and assigns another one otherwise; the result is in
+  // `NodeInfo.quicksupport_id`. QuickSupport enrollments are always ephemeral.
+  // Empty for agents and clients.
+  string quicksupport_id = 5;
 }
 
 // A node in the network map. Keys are raw 32-byte Ed25519 / X25519 public keys.
@@ -43,6 +51,9 @@ message NodeInfo {
   repeated string endpoints = 8;
   repeated string tags = 9;
   bool ephemeral = 10;
+  // Nine-digit QuickSupport ID assigned by the coordinator; empty for nodes
+  // that are not QuickSupport hosts.
+  string quicksupport_id = 11;
 }
 
 // A relay node the coordinator issued tickets for.
@@ -103,6 +114,21 @@ message Keepalive {
   uint64 sequence = 1;
 }
 
+// Resolves a QuickSupport ID the technician typed to the node that owns it.
+// The coordinator answers only for nodes of the requester's tenant.
+message QuickSupportLookupRequest {
+  // Nine digits, no separators.
+  string quicksupport_id = 1;
+}
+
+message QuickSupportLookupResponse {
+  // Echo of the request, so concurrent lookups can be matched.
+  string quicksupport_id = 1;
+  // The node that owns the ID; unset when no node of the requester's tenant
+  // currently holds it (the ID expires as soon as the QuickSupport node leaves).
+  NodeInfo node = 2;
+}
+
 message ControlError {
   ControlErrorCode code = 1;
   string message = 2;
@@ -114,4 +140,7 @@ enum ControlErrorCode {
   CONTROL_ERROR_CODE_INVALID_PREAUTH_KEY = 2;
   CONTROL_ERROR_CODE_NOT_ENROLLED = 3;
   CONTROL_ERROR_CODE_INTERNAL = 4;
+  // A field of the request could not be parsed (bad key length, bad address,
+  // malformed QuickSupport ID).
+  CONTROL_ERROR_CODE_MALFORMED_REQUEST = 5;
 }

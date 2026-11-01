@@ -23,7 +23,7 @@ OmegaDesk is a remote desktop you run on your own infrastructure, as an alternat
 ## Status
 
 > [!WARNING]
-> OmegaDesk is in early development. **Phases 0 and 1** of the [roadmap](docs/plan.md) are done: it works on a local network today, connecting by IP address, certificate fingerprint and password. **Phase 2** (coordinator, relay and mesh) is implemented end to end: agent and client enroll with a coordinator and connect by name through NAT traversal or the relay, verified in-process and in a two-machine test over Tailscale (a clean test across two distinct public NATs is still pending). The **browser client** (Phase 4) connects through the coordinator's web gateway with keyboard, mouse and H.264 video, verified in-process; its latency against the native client is not measured yet. Recording, RMM and compatibility layers (Phases 3, 5–7) exist only as library crates that no binary uses yet; the plan lists their known defects. It is not ready for production use.
+> OmegaDesk is in early development. **Phases 0 and 1** of the [roadmap](docs/plan.md) are done: it works on a local network today, connecting by IP address, certificate fingerprint and password. **Phase 2** (coordinator, relay and mesh) is implemented end to end: agent and client enroll with a coordinator and connect by name through NAT traversal or the relay, verified in-process and in a two-machine test over Tailscale (a clean test across two distinct public NATs is still pending). From **Phase 3**, QuickSupport works end to end (nine-digit ID, temporary password, console consent prompt), verified in-process. The **browser client** (Phase 4) connects through the coordinator's web gateway with keyboard, mouse and H.264 video, verified in-process; its latency against the native client is not measured yet. The rest of Phase 3 and the recording, RMM and compatibility layers (Phases 5–7) exist only as library crates that no binary uses yet; the plan lists their known defects. It is not ready for production use.
 
 What works today:
 
@@ -33,6 +33,7 @@ What works today:
 - **Remote keyboard and mouse** using physical scancodes, so any keyboard layout works (ABNT2 included). Multi-monitor aware.
 - **Native client** that shows a live latency breakdown in the title bar.
 - **Mesh mode**: a self-hosted coordinator (`omegadesk-server`) hands out addresses and names (`office-pc.omega`), nodes find each other with STUN and `disco` hole punching, fall back to a DERP-style relay (`omegadesk-relay`) in 1.5 s and upgrade to a direct path as soon as one validates. TLS is bound to the device identity the coordinator distributes, so there is no fingerprint to copy.
+- **QuickSupport**: the person who needs help runs one executable, reads a nine-digit ID and a temporary password to the technician and accepts a consent prompt; the technician connects with `omegadesk-client 123 456 789`. The ID lives in the coordinator only while the program runs, and ten wrong passwords rotate the password.
 
 First measurement (Intel Core Ultra 5 135U, 1920×1080, agent and client on the same machine): **60 fps and 24.5 ms end-to-end latency**. Host processing takes 15 ms (11 ms of it encoding), plus 0.2 ms network, 6 ms decode and 3 ms draw.
 
@@ -121,6 +122,22 @@ the remote operator keeps working. `service run` is the Service Control Manager
 entry point and is invoked by Windows, not manually. On Linux and macOS these
 subcommands report that the service is Windows-only.
 
+### QuickSupport (help someone once, TeamViewer style)
+
+The coordinator also prints a `quicksupport_preauth_key`: a reusable, ephemeral key for the support tenant. The person who needs help runs (the three values can also come from `OMEGADESK_SERVER`, `OMEGADESK_SERVER_KEY` and `OMEGADESK_PREAUTH_KEY`, so they can be baked into a wrapper or installer):
+
+```sh
+cargo run --release -p omegadesk-quicksupport -- --server coord.example:8080 --server-key <128 hex> --preauth-key odk_<quicksupport key>
+```
+
+It prints `Your ID: 123 456 789` and `Password: abc123`. The technician connects with the ID (digits with or without spaces) and the password; the end user is asked on the console to allow the session (`y`, `n`, or `a` to allow that technician for five minutes without asking again):
+
+```sh
+cargo run --release -p omegadesk-client -- 123 456 789 --server coord.example:8080 --server-key <128 hex> --preauth-key odk_... --password abc123
+```
+
+Closing QuickSupport ends the session and frees the ID. `--view-only` lets the technician watch without controlling the mouse and keyboard.
+
 ## Architecture
 
 ```
@@ -147,8 +164,9 @@ subcommands report that the service is Windows-only.
 | [`omegadesk-magicsock`](crates/magicsock) | The mesh as a QUIC socket: direct or relayed, virtual peer addresses |
 | [`omegadesk-relay`](relay) | DERP-style packet relay with single-use tickets and STUN |
 | [`omegadesk-server`](server) | Coordinator: keys, tenants, netmap stream, `*.omega` names |
-| [`omegadesk-agent`](agent) | The service that shares a machine |
+| [`omegadesk-agent`](agent) | The service that shares a machine (also a library: the session reused by QuickSupport) |
 | [`omegadesk-service`](crates/service) | Windows `LocalSystem` service and per-session worker (unattended access across the login screen and UAC) |
+| [`omegadesk-quicksupport`](quicksupport) | Single-executable quick support: nine-digit ID, temporary password, consent prompt |
 | [`omegadesk-client`](client) | The app you use to connect |
 
 The full design, from the WireGuard mesh to the web client, is in [docs/plan.md](docs/plan.md). [docs/language.md](docs/language.md) explains why we chose Rust.
@@ -160,7 +178,7 @@ The full design, from the WireGuard mesh to the web client, is in [docs/plan.md]
 | 0 | Foundation: workspace, CI on three platforms, license policy, protocol, identity | ✅ Done |
 | 1 | First image on screen: capture, hardware encoding, QUIC, input, ≤ 30 ms on LAN | ✅ Done |
 | 2 | Mesh network and coordination server: NAT traversal, relay, internal DNS | 🔶 Agent and client join the mesh (`--server`), connect by `name.omega`, traverse NAT with STUN + `disco` and fall back to the relay in 1.5 s; verified in-process and in a two-machine test, clean two-public-NAT test pending |
-| 3 | Remote access product: Windows service, login/UAC screens, clipboard, files, audio | 🧩 Library only: desktop switching, session channels, QoS/FEC, QuickSupport and LAN mode exist; nothing is wired into the agent; open findings: [#27](https://github.com/OmegaSoftDLL/omegadesk/issues/27) |
+| 3 | Remote access product: Windows service, login/UAC screens, clipboard, files, audio | 🔶 QuickSupport works end to end (ID registry in the coordinator, ephemeral mesh node, temporary password, console consent), verified in-process; desktop switching, session channels, QoS/FEC and LAN mode are still library only; open findings: [#27](https://github.com/OmegaSoftDLL/omegadesk/issues/27) |
 | 4 | Web dashboard and browser client | 🔶 Browser client works end to end through `omegadesk-server --web-listen` (WebSocket gateway on the mesh, WebCodecs H.264, keyboard and mouse, latency readout), verified in-process and in CI; the policy model and connection manager are still library only, no dashboard, no WebTransport, latency against the native client not measured; open findings: [#28](https://github.com/OmegaSoftDLL/omegadesk/issues/28) |
 | 5 | Security, session recording and privileged access | 🧩 Library only: recording, HuJSON policies, MFA, PAM, DLP and vault exist; no handshake consults them; open findings: [#29](https://github.com/OmegaSoftDLL/omegadesk/issues/29) |
 | 6 | Remote monitoring and management (RMM) | 🧩 Library only: in-memory RMM models; the agent reports nothing; open findings: [#30](https://github.com/OmegaSoftDLL/omegadesk/issues/30) |

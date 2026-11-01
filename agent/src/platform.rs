@@ -8,7 +8,7 @@
 /// to ~680 ms per frame). We disable `EcoQoS` execution-speed and timer
 /// throttling in addition to raising the process priority class
 /// (`HIGH_PRIORITY_CLASS`, as Sunshine does).
-pub(crate) fn prefer_performance() {
+pub fn prefer_performance() {
     #[cfg(windows)]
     windows_impl::prefer_performance();
 }

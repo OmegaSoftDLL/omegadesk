@@ -77,6 +77,7 @@ async fn testbed() -> Testbed {
             preauth_key,
             hostname: String::new(),
             endpoints: Vec::new(),
+            quicksupport_id: None,
         },
     }
 }

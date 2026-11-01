@@ -14,8 +14,17 @@ const ALPHABET: &[u8] = b"abcdefghjkmnpqrstuvwxyz23456789";
 /// Generated password length: 10 symbols out of 31 (~49.5 bits of entropy).
 const LENGTH: usize = 10;
 
+/// Error returned by the session handshake when the client's access password
+/// did not match. A marker type (not a message) so a caller can tell this
+/// failure apart from any other and act on it: QuickSupport counts these and
+/// rotates its temporary password after ten in a row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("invalid access password")]
+pub struct Rejected;
+
 /// Generates a random password using the operating system CSPRNG.
-pub(crate) fn generate() -> String {
+#[must_use]
+pub fn generate() -> String {
     let mut password = String::with_capacity(LENGTH);
     while password.len() < LENGTH {
         let mut byte = [0u8; 1];
@@ -30,7 +39,8 @@ pub(crate) fn generate() -> String {
 
 /// Compares two passwords in constant time with respect to character contents
 /// so response timing does not leak how many leading characters matched.
-pub(crate) fn matches(expected: &str, received: &str) -> bool {
+#[must_use]
+pub fn matches(expected: &str, received: &str) -> bool {
     let (expected, received) = (expected.as_bytes(), received.as_bytes());
     let mut difference = u8::from(expected.len() != received.len());
     for (index, &byte) in expected.iter().enumerate() {

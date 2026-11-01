@@ -22,7 +22,7 @@ const RETRY: Duration = Duration::from_millis(200);
 
 /// Video encoder selection policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
-pub(crate) enum EncoderChoice {
+pub enum EncoderChoice {
     /// Use hardware encoding when available, falling back to software.
     Auto,
     /// Require hardware encoding (fail if unavailable).

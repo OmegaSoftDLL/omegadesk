@@ -17,24 +17,19 @@
 //! On startup the agent prints its access password (and, on the local
 //! network, its TLS certificate fingerprint); the client requires it to connect.
 
-mod capture_loop;
-mod password;
-mod platform;
-mod session;
-
 use std::net::SocketAddr;
 use std::sync::Arc;
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
+use omegadesk_agent::capture_loop::EncoderChoice;
+use omegadesk_agent::session::SessionConfig;
+use omegadesk_agent::{password, platform, session};
 use omegadesk_codec::EncoderSettings;
 use omegadesk_control::{ControlConfig, parse_server_key};
 use omegadesk_magicsock::{Node, NodeConfig};
 use omegadesk_transport::server_endpoint;
 use tracing::{info, warn};
-
-use crate::capture_loop::EncoderChoice;
-use crate::session::SessionConfig;
 
 #[derive(Debug, Parser)]
 #[command(version, about = "OmegaDesk remote desktop agent")]
@@ -167,6 +162,7 @@ async fn run_share(args: Args) -> anyhow::Result<()> {
             max_fps: args.fps,
         },
         input: !args.no_input,
+        gate: None,
     });
 
     // Mesh mode keeps the `Node` alive for the whole run: dropping it stops
@@ -183,6 +179,7 @@ async fn run_share(args: Args) -> anyhow::Result<()> {
                 preauth_key: preauth_key.clone(),
                 hostname: config.name.clone(),
                 endpoints: Vec::new(),
+                quicksupport_id: None,
             });
             node_config.bind = args.listen;
             node_config.relay_only = args.relay_only;

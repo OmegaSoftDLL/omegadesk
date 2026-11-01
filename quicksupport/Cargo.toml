@@ -6,19 +6,47 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 publish.workspace = true
-description = "Single-executable QuickSupport with formatted ID, auto-rotating temporary password, Apollo PERM bitflags, and MeshCentral layered consent"
+description = "Single-executable QuickSupport: joins the mesh as an ephemeral node, shows a nine-digit ID and an auto-rotating temporary password, asks the end user for consent and serves the screen like the agent"
+
+[features]
+default = ["host"]
+# The mesh node, the agent session and the console binary. `omegadesk-policy`
+# only needs the permission and consent types, so it turns this off.
+host = [
+    "dep:anyhow",
+    "dep:clap",
+    "dep:omegadesk-agent",
+    "dep:omegadesk-codec",
+    "dep:omegadesk-control",
+    "dep:omegadesk-magicsock",
+    "dep:tokio",
+    "dep:tracing-subscriber",
+]
 
 [[bin]]
 name = "omegadesk-quicksupport"
 path = "src/main.rs"
+required-features = ["host"]
 
 [dependencies]
-anyhow.workspace = true
+anyhow = { workspace = true, optional = true }
+clap = { workspace = true, optional = true }
+omegadesk-agent = { path = "../agent", optional = true }
+omegadesk-codec = { workspace = true, optional = true }
+omegadesk-control = { workspace = true, optional = true }
 omegadesk-identity.workspace = true
+omegadesk-magicsock = { workspace = true, optional = true }
 rand_core.workspace = true
 thiserror.workspace = true
+tokio = { workspace = true, features = ["io-std"], optional = true }
 tracing.workspace = true
-tracing-subscriber.workspace = true
+tracing-subscriber = { workspace = true, optional = true }
+
+[dev-dependencies]
+omegadesk-protocol.workspace = true
+omegadesk-relay.workspace = true
+omegadesk-server.workspace = true
+omegadesk-transport.workspace = true
 
 [lints]
 workspace = true

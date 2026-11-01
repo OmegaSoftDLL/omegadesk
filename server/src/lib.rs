@@ -17,12 +17,21 @@
 //!   configured relay, each valid on that relay only (`omegadesk-relay`).
 //! - **Control protocol conversions** between the in-memory netmap and the
 //!   `omegadesk.control.v1` protobuf messages carried over Noise IK.
+//! - **QuickSupport ID registry** (modeled after RustDesk's `RegisterPk` /
+//!   `RegisterPeer` handling in `rustdesk-server/src/rendezvous_server.rs`): a
+//!   QuickSupport node enrolls as an ephemeral node proposing a nine-digit
+//!   [`QuickSupportId`]; the coordinator keeps the proposal when it is free or
+//!   already bound to that device, assigns a random free one otherwise, lets
+//!   technicians of the same tenant resolve it ([`Coordinator::lookup_quicksupport`])
+//!   and releases it the moment the node disconnects.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use data_encoding::HEXLOWER;
-use omegadesk_identity::{DeviceId, DevicePublic, IdentityError};
+use omegadesk_identity::{
+    DeviceId, DevicePublic, IdentityError, QUICKSUPPORT_ID_SPACE, QuickSupportId,
+};
 use omegadesk_protocol::control::v1 as control;
 use omegadesk_relay::{RelayTicket, TicketIssuer};
 use rand_core::{OsRng, RngCore};
@@ -77,6 +86,9 @@ pub enum CoordinatorError {
     /// A control message could not be converted (bad key length, bad address).
     #[error("malformed control message: {0}")]
     MalformedControlMessage(&'static str),
+    /// No free nine-digit QuickSupport ID was found after the bounded number of draws.
+    #[error("no QuickSupport ID available")]
+    QuickSupportIdUnavailable,
 }
 
 impl From<IdentityError> for CoordinatorError {
@@ -174,6 +186,8 @@ pub struct NodeRecord {
     pub tags: Vec<String>,
     /// Whether the node is ephemeral (deleted upon disconnect).
     pub ephemeral: bool,
+    /// Nine-digit QuickSupport ID, present only for QuickSupport hosts.
+    pub quicksupport_id: Option<QuickSupportId>,
 }
 
 impl NodeRecord {
@@ -191,6 +205,10 @@ impl NodeRecord {
             endpoints: self.endpoints.iter().map(ToString::to_string).collect(),
             tags: self.tags.clone(),
             ephemeral: self.ephemeral,
+            quicksupport_id: self
+                .quicksupport_id
+                .map(QuickSupportId::digits)
+                .unwrap_or_default(),
         }
     }
 
@@ -219,8 +237,24 @@ impl NodeRecord {
             endpoints: parse_endpoints(&info.endpoints),
             tags: info.tags.clone(),
             ephemeral: info.ephemeral,
+            quicksupport_id: parse_quicksupport_id(&info.quicksupport_id)?,
         })
     }
+}
+
+/// Parses the optional `quicksupport_id` field of control messages: empty
+/// means "none", anything else must be nine digits.
+///
+/// # Errors
+///
+/// Returns [`CoordinatorError::MalformedControlMessage`] for a malformed ID.
+pub fn parse_quicksupport_id(raw: &str) -> Result<Option<QuickSupportId>, CoordinatorError> {
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    raw.parse()
+        .map(Some)
+        .map_err(|_| CoordinatorError::MalformedControlMessage("quicksupport id"))
 }
 
 /// Parses `ip:port` strings, silently dropping malformed entries (a peer's bad
@@ -578,6 +612,15 @@ impl EnrollmentBundle {
     }
 }
 
+/// Splits an `odk_<prefix>_<secret>` token into its prefix and secret.
+fn split_preauth_token(token: &str) -> Result<(&str, &str), CoordinatorError> {
+    let mut parts = token.splitn(3, '_');
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some("odk"), Some(prefix), Some(secret_hex)) => Ok((prefix, secret_hex)),
+        _ => Err(CoordinatorError::MalformedPreAuthKey),
+    }
+}
+
 /// Computes the mesh IPv4 and IPv6 addresses for pool index `index`
 /// (`1..IPV4_POOL_SIZE`) without truncating the index: `100.64.0.0/10 + index`
 /// and `fd7a:115c:a1e0::/48` with `index` in the low 32 bits.
@@ -615,7 +658,14 @@ pub struct Coordinator {
     batcher: NetmapBatcher,
     ticket_issuer: TicketIssuer,
     relays: Vec<RelayNode>,
+    /// QuickSupport ID registry: which enrolled node currently owns each number.
+    quicksupport_ids: HashMap<QuickSupportId, DeviceId>,
 }
+
+/// Random draws attempted before giving up on assigning a QuickSupport ID.
+/// With a billion numbers the registry would have to be nearly full for this
+/// to be reached.
+const QUICKSUPPORT_ID_DRAWS: usize = 64;
 
 impl Coordinator {
     /// Creates a new [`Coordinator`] sharing `relay_ticket_secret` with the relay fleet.
@@ -632,6 +682,7 @@ impl Coordinator {
             batcher: NetmapBatcher::new(),
             ticket_issuer: TicketIssuer::new(relay_ticket_secret),
             relays: Vec::new(),
+            quicksupport_ids: HashMap::new(),
         }
     }
 
@@ -735,17 +786,114 @@ impl Coordinator {
         endpoints: Vec<SocketAddr>,
         now_unix_secs: u64,
     ) -> Result<EnrollmentBundle, CoordinatorError> {
-        let mut parts = preauth_token.splitn(3, '_');
-        let Some("odk") = parts.next() else {
-            return Err(CoordinatorError::MalformedPreAuthKey);
-        };
-        let Some(prefix) = parts.next() else {
-            return Err(CoordinatorError::MalformedPreAuthKey);
-        };
-        let Some(secret_hex) = parts.next() else {
-            return Err(CoordinatorError::MalformedPreAuthKey);
-        };
+        self.enroll(
+            preauth_token,
+            public,
+            hostname,
+            endpoints,
+            now_unix_secs,
+            None,
+        )
+    }
 
+    /// Enrolls a QuickSupport host: like [`Self::enroll_machine`], but the node
+    /// is always ephemeral and receives a nine-digit [`QuickSupportId`]
+    /// (`proposed` when it is free or already bound to this device, a random
+    /// free one otherwise) that peers of the tenant can resolve. The ID is
+    /// released by [`Self::handle_disconnect`].
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::enroll_machine`], plus
+    /// [`CoordinatorError::QuickSupportIdUnavailable`] when no free ID is found.
+    pub fn enroll_quicksupport(
+        &mut self,
+        preauth_token: &str,
+        public: DevicePublic,
+        hostname: &str,
+        endpoints: Vec<SocketAddr>,
+        proposed: QuickSupportId,
+        now_unix_secs: u64,
+    ) -> Result<EnrollmentBundle, CoordinatorError> {
+        self.enroll(
+            preauth_token,
+            public,
+            hostname,
+            endpoints,
+            now_unix_secs,
+            Some(proposed),
+        )
+    }
+
+    /// Resolves a QuickSupport ID for `requester`: the owning node when it is
+    /// enrolled in the same tenant as the requester, `None` otherwise (an ID of
+    /// another tenant is indistinguishable from an unknown one).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoordinatorError::UnknownNode`] if the requester is not enrolled.
+    pub fn lookup_quicksupport(
+        &self,
+        requester: DeviceId,
+        id: QuickSupportId,
+    ) -> Result<Option<&NodeRecord>, CoordinatorError> {
+        let requester = self
+            .nodes
+            .get(&requester)
+            .ok_or(CoordinatorError::UnknownNode(requester))?;
+        Ok(self
+            .quicksupport_ids
+            .get(&id)
+            .and_then(|owner| self.nodes.get(owner))
+            .filter(|node| node.tenant == requester.tenant && node.quicksupport_id == Some(id)))
+    }
+
+    /// Number of QuickSupport IDs currently assigned.
+    #[must_use]
+    pub fn quicksupport_count(&self) -> usize {
+        self.quicksupport_ids.len()
+    }
+
+    /// Picks the QuickSupport ID for `node_id`: `proposed` if free or already
+    /// its own, otherwise a random free number (RustDesk resolves the same
+    /// collision by making the client pick a new ID after `UUID_MISMATCH`).
+    fn assign_quicksupport_id(
+        &self,
+        node_id: DeviceId,
+        proposed: QuickSupportId,
+    ) -> Result<QuickSupportId, CoordinatorError> {
+        let free = |id: &QuickSupportId| match self.quicksupport_ids.get(id) {
+            None => true,
+            Some(owner) => *owner == node_id,
+        };
+        if free(&proposed) {
+            return Ok(proposed);
+        }
+        for _ in 0..QUICKSUPPORT_ID_DRAWS {
+            let candidate = QuickSupportId::from_u32(OsRng.next_u32() % QUICKSUPPORT_ID_SPACE)
+                .ok_or(CoordinatorError::QuickSupportIdUnavailable)?;
+            if free(&candidate) {
+                return Ok(candidate);
+            }
+        }
+        Err(CoordinatorError::QuickSupportIdUnavailable)
+    }
+
+    /// Drops the QuickSupport ID held by `node_id`, if any.
+    fn release_quicksupport_id(&mut self, node_id: DeviceId) {
+        self.quicksupport_ids.retain(|_, owner| *owner != node_id);
+    }
+
+    fn enroll(
+        &mut self,
+        preauth_token: &str,
+        public: DevicePublic,
+        hostname: &str,
+        endpoints: Vec<SocketAddr>,
+        now_unix_secs: u64,
+        quicksupport: Option<QuickSupportId>,
+    ) -> Result<EnrollmentBundle, CoordinatorError> {
+        let (prefix, secret_hex) = split_preauth_token(preauth_token)?;
         let key = self
             .preauth_keys
             .get_mut(prefix)
@@ -776,10 +924,20 @@ impl Coordinator {
             self.next_ip_index += 1;
             (v4, v6)
         };
+        // Decide the QuickSupport ID before consuming the key for the same reason.
+        let quicksupport_id = quicksupport
+            .map(|proposed| self.assign_quicksupport_id(node_id, proposed))
+            .transpose()?;
+        let key = self
+            .preauth_keys
+            .get_mut(prefix)
+            .ok_or(CoordinatorError::InvalidPreAuthKey)?;
         key.used = true;
         let tenant = key.tenant.clone();
         let tags = key.tags.clone();
-        let ephemeral = key.ephemeral;
+        // A QuickSupport host exists only while its session runs: its ID must
+        // expire with it, so the enrollment is ephemeral whatever the key says.
+        let ephemeral = key.ephemeral || quicksupport.is_some();
 
         // Re-enrollment with a new hostname must not leave the old name resolving,
         // and moving to another tenant must remove the node from the old tenant's
@@ -802,6 +960,11 @@ impl Coordinator {
         self.next_generation += 1;
         self.sessions.insert(node_id, generation);
         self.enrolled_with.insert(node_id, prefix.to_owned());
+        // Re-enrollment may change or drop the ID: never leave a stale number bound.
+        self.release_quicksupport_id(node_id);
+        if let Some(id) = quicksupport_id {
+            self.quicksupport_ids.insert(id, node_id);
+        }
         let (sanitized_label, fqdn) = self.dns.register(node_id, hostname, ipv4, ipv6);
         let record = NodeRecord {
             public,
@@ -813,6 +976,7 @@ impl Coordinator {
             endpoints,
             tags,
             ephemeral,
+            quicksupport_id,
         };
 
         let peers: Vec<NodeRecord> = self
@@ -889,8 +1053,10 @@ impl Coordinator {
             && node.ephemeral
             && let Some(removed) = self.nodes.remove(&node_id)
         {
-            // A removed ephemeral node is a stranger again: it needs a usable key.
+            // A removed ephemeral node is a stranger again: it needs a usable key,
+            // and its QuickSupport ID (if any) is free for the next host.
             self.enrolled_with.remove(&node_id);
+            self.release_quicksupport_id(node_id);
             self.dns.unregister(&removed.fqdn);
             self.batcher.enqueue(
                 &removed.tenant,
@@ -1308,6 +1474,120 @@ mod tests {
         assert_eq!(moved.node.tenant, "globex");
         let delta = watcher_bundle.netmap_rx.try_recv().unwrap();
         assert!(matches!(&delta[0], NetmapDelta::PeerRemoved { peer, .. } if *peer == mover.id()));
+    }
+
+    #[test]
+    fn quicksupport_ids_are_assigned_scoped_to_the_tenant_and_expire_with_the_host() {
+        let mut coord = Coordinator::new([6u8; 32]);
+        // A reusable, non-ephemeral key: QuickSupport still enrolls ephemeral.
+        let acme = coord
+            .create_preauth_key("acme", true, false, vec![], None)
+            .unwrap();
+        let globex = coord
+            .create_preauth_key("globex", true, false, vec![], None)
+            .unwrap();
+        let host = DeviceIdentity::generate();
+        let proposed = QuickSupportId::proposed_for(host.id());
+        let bundle = coord
+            .enroll_quicksupport(&acme, host.public(), "Reception PC", vec![], proposed, 10)
+            .unwrap();
+        assert_eq!(bundle.node.quicksupport_id, Some(proposed));
+        assert!(
+            bundle.node.ephemeral,
+            "QuickSupport hosts are always ephemeral"
+        );
+        assert_eq!(
+            bundle.to_proto().self_node.unwrap().quicksupport_id,
+            proposed.digits()
+        );
+        assert_eq!(coord.quicksupport_count(), 1);
+
+        // A technician of the same tenant resolves it; another tenant and a
+        // stranger do not.
+        let tech = DeviceIdentity::generate();
+        let tech_bundle = coord
+            .enroll_machine(&acme, tech.public(), "tech", vec![], 11)
+            .unwrap();
+        assert_eq!(
+            tech_bundle.peers[0].quicksupport_id,
+            Some(proposed),
+            "the netmap carries the ID"
+        );
+        assert_eq!(
+            coord
+                .lookup_quicksupport(tech.id(), proposed)
+                .unwrap()
+                .map(|n| n.public.id()),
+            Some(host.id())
+        );
+        let outsider = DeviceIdentity::generate();
+        coord
+            .enroll_machine(&globex, outsider.public(), "outsider", vec![], 12)
+            .unwrap();
+        assert_eq!(
+            coord.lookup_quicksupport(outsider.id(), proposed).unwrap(),
+            None
+        );
+        let stranger = DeviceIdentity::generate();
+        assert_eq!(
+            coord
+                .lookup_quicksupport(stranger.id(), proposed)
+                .unwrap_err(),
+            CoordinatorError::UnknownNode(stranger.id())
+        );
+
+        // A second host proposing the same number gets a different one...
+        let second = DeviceIdentity::generate();
+        let second_bundle = coord
+            .enroll_quicksupport(&acme, second.public(), "kiosk", vec![], proposed, 13)
+            .unwrap();
+        let second_id = second_bundle.node.quicksupport_id.unwrap();
+        assert_ne!(second_id, proposed);
+        assert_eq!(coord.quicksupport_count(), 2);
+        // ...while the first host keeps its number on re-enrollment.
+        let again = coord
+            .enroll_quicksupport(&acme, host.public(), "Reception PC", vec![], proposed, 14)
+            .unwrap();
+        assert_eq!(again.node.quicksupport_id, Some(proposed));
+        assert_eq!(coord.quicksupport_count(), 2);
+        // The stale first session cannot release the ID.
+        coord.handle_disconnect(host.id(), bundle.generation);
+        assert!(
+            coord
+                .lookup_quicksupport(tech.id(), proposed)
+                .unwrap()
+                .is_some()
+        );
+
+        // The host leaves: the ID expires immediately and can be proposed anew.
+        coord.handle_disconnect(host.id(), again.generation);
+        assert_eq!(
+            coord.lookup_quicksupport(tech.id(), proposed).unwrap(),
+            None
+        );
+        assert_eq!(coord.quicksupport_count(), 1);
+        assert_eq!(coord.node(host.id()), None);
+        let third = DeviceIdentity::generate();
+        let third_bundle = coord
+            .enroll_quicksupport(&acme, third.public(), "x", vec![], proposed, 15)
+            .unwrap();
+        assert_eq!(third_bundle.node.quicksupport_id, Some(proposed));
+
+        // Agents never get an ID, and a malformed ID on the wire is rejected.
+        assert_eq!(tech_bundle.node.quicksupport_id, None);
+        assert_eq!(tech_bundle.node.to_proto().quicksupport_id, "");
+        assert_eq!(parse_quicksupport_id("").unwrap(), None);
+        assert_eq!(
+            parse_quicksupport_id("123456789").unwrap(),
+            Some("123456789".parse().unwrap())
+        );
+        assert_eq!(
+            parse_quicksupport_id("12345").unwrap_err(),
+            CoordinatorError::MalformedControlMessage("quicksupport id")
+        );
+        let mut info = third_bundle.node.to_proto();
+        info.quicksupport_id = "nope".into();
+        assert!(NodeRecord::from_proto(&info).is_err());
     }
 
     #[test]

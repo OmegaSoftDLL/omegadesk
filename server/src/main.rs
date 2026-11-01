@@ -165,6 +165,7 @@ async fn start_web_gateway(
         preauth_key,
         hostname: "web-gateway".to_owned(),
         endpoints: Vec::new(),
+        quicksupport_id: None,
     });
     node_config.bind = args.web_mesh_bind;
     node_config.relay_only = args.web_relay_only;
@@ -266,12 +267,23 @@ async fn main() -> Result<()> {
         vec!["tag:default".to_owned()],
         None,
     )?;
+    // Key shipped with the QuickSupport executable of this tenant: reusable
+    // (every end user runs the same binary), ephemeral (a QuickSupport host
+    // and its ID vanish when the program exits), tagged for later ACLs.
+    let quicksupport_key = coord.create_preauth_key(
+        &args.tenant,
+        true,
+        true,
+        vec!["tag:quicksupport".to_owned()],
+        None,
+    )?;
 
     info!(
         id = %server_identity.id(),
         tenant = %args.tenant,
         server_key = %public_key_hex(&server_identity),
         bootstrap_preauth_key = %bootstrap_key,
+        quicksupport_preauth_key = %quicksupport_key,
         "omegadesk-server initialized; nodes need --server-key and --preauth-key"
     );
     if args.check_only {

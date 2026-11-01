@@ -8,7 +8,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, bail};
 use omegadesk_codec::{OpenH264Decoder, VideoDecoder};
-use omegadesk_identity::DeviceIdentity;
+use omegadesk_identity::{DeviceIdentity, QuickSupportId};
 use omegadesk_magicsock::{Node, NodeConfig};
 use omegadesk_protocol::PROTOCOL_VERSION;
 use omegadesk_protocol::v1::{
@@ -52,12 +52,30 @@ pub(crate) enum Route {
     Mesh(Box<MeshRoute>),
 }
 
-/// Mesh enrollment parameters and the agent name to reach.
+/// Mesh enrollment parameters and the peer to reach.
 #[derive(Debug, Clone)]
 pub(crate) struct MeshRoute {
     pub(crate) identity: Arc<DeviceIdentity>,
     pub(crate) node_config: NodeConfig,
-    pub(crate) name: String,
+    pub(crate) target: MeshTarget,
+}
+
+/// Who the client connects to on the mesh.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum MeshTarget {
+    /// An agent by `hostname`, `hostname.omega` or mesh IPv4 address.
+    Name(String),
+    /// A QuickSupport host by the nine-digit ID its user read aloud.
+    QuickSupport(QuickSupportId),
+}
+
+impl std::fmt::Display for MeshTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Name(name) => f.write_str(name),
+            Self::QuickSupport(id) => write!(f, "QuickSupport ID {id}"),
+        }
+    }
 }
 
 /// Connection parameters for reaching the remote agent.
@@ -133,7 +151,7 @@ async fn run(
             let MeshRoute {
                 identity,
                 node_config,
-                name,
+                target: mesh_target,
             } = mesh.as_ref();
             shared.set_status("joining the mesh…".to_owned());
             let _ = proxy.send_event(UserEvent::Status);
@@ -145,11 +163,11 @@ async fn run(
                 node.self_info().fqdn,
                 node.self_info().ipv4
             );
-            shared.set_status(format!("connecting to {name}…"));
+            shared.set_status(format!("connecting to {mesh_target}…"));
             let _ = proxy.send_event(UserEvent::Status);
-            let connection = wait_and_connect(&node, name)
+            let connection = wait_and_connect(&node, mesh_target)
                 .await
-                .with_context(|| format!("failed to connect to {name} through the mesh"))?;
+                .with_context(|| format!("failed to connect to {mesh_target} through the mesh"))?;
             if let Some(peer) = node.peer_at(connection.remote_address()) {
                 info!(
                     "mesh path to {}: {:?}",
@@ -185,18 +203,36 @@ async fn run(
     result
 }
 
-/// Waits (bounded) for the agent to appear in the netmap, then connects. The
-/// netmap snapshot arrives with the enrollment, but an agent that enrolls a
-/// moment later is only announced by a delta.
-async fn wait_and_connect(node: &Node, name: &str) -> anyhow::Result<Connection> {
-    let deadline = Instant::now() + Duration::from_secs(15);
-    while node.resolve(name).is_none() {
-        if Instant::now() >= deadline {
-            bail!("no agent named `{name}` is enrolled in this tenant");
+/// Time the client waits for the target to show up before giving up.
+const RESOLVE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Waits (bounded) for the target to be resolvable, then connects. The netmap
+/// snapshot arrives with the enrollment, but an agent that enrolls a moment
+/// later is only announced by a delta; a QuickSupport ID is also asked of the
+/// coordinator directly, so a typo is reported as soon as it answers.
+async fn wait_and_connect(node: &Node, target: &MeshTarget) -> anyhow::Result<Connection> {
+    let deadline = Instant::now() + RESOLVE_TIMEOUT;
+    match target {
+        MeshTarget::Name(name) => {
+            while node.resolve(name).is_none() {
+                if Instant::now() >= deadline {
+                    bail!("no agent named `{name}` is enrolled in this tenant");
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            Ok(node.connect(name).await?)
         }
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        MeshTarget::QuickSupport(id) => loop {
+            if let Some(peer) = node.lookup_quicksupport(*id).await? {
+                info!("QuickSupport ID {id} belongs to {}", peer.fqdn);
+                return Ok(node.connect_peer(&peer).await?);
+            }
+            if Instant::now() >= deadline {
+                bail!("no QuickSupport host with ID {id} is online in this tenant");
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        },
     }
-    Ok(node.connect(name).await?)
 }
 
 /// Logs the connection close reason and final QUIC path statistics.
