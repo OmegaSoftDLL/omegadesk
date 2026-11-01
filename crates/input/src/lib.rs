@@ -26,6 +26,31 @@ pub mod buttons {
     pub const FORWARD: u32 = 1 << 4;
 }
 
+/// Modifier, lock-key, and special action bitflags used in `KeyEvent::modifiers`.
+pub mod modifiers {
+    /// Either Shift key is held.
+    pub const SHIFT: u32 = 1;
+    /// Either Control key is held.
+    pub const CTRL: u32 = 1 << 1;
+    /// Either Alt key is held.
+    pub const ALT: u32 = 1 << 2;
+    /// Either Super / Windows / Command key is held.
+    pub const META: u32 = 1 << 3;
+    /// Caps Lock is active on the client.
+    pub const CAPS_LOCK: u32 = 1 << 4;
+    /// Num Lock is active on the client.
+    pub const NUM_LOCK: u32 = 1 << 5;
+    /// Requests the agent to trigger a Secure Attention Sequence (`Ctrl+Alt+Del` / `SendSAS`).
+    pub const CTRL_ALT_DEL: u32 = 1 << 6;
+    /// Indicates that [`CAPS_LOCK`] and [`NUM_LOCK`] carry the client's current lock states.
+    pub const LOCK_STATE_VALID: u32 = 1 << 7;
+}
+
+/// Marker stored in `dwExtraInfo` on events injected by OmegaDesk so low-level
+/// input hooks can distinguish them from local hardware input (matching
+/// `RustDesk`'s `enigo` marker).
+pub const INJECTED_MARKER: usize = 0x4F4D_4547; // "OMEG"
+
 /// One discrete scroll wheel notch, matching Windows `WHEEL_DELTA`.
 pub const WHEEL_STEP: i32 = 120;
 

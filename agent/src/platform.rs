@@ -34,8 +34,18 @@ mod windows_impl {
         ProcessPowerThrottling, SetPriorityClass, SetProcessInformation, SetThreadPriority,
         THREAD_PRIORITY_HIGHEST,
     };
+    use windows::Win32::UI::HiDpi::{
+        DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
+    };
 
     pub(super) fn prefer_performance() {
+        // Opt into Per-Monitor V2 DPI awareness so `GetSystemMetrics` and DXGI
+        // desktop coordinates always report physical pixels across mixed-DPI
+        // multi-monitor setups (matching Sunshine `display_base.cpp`).
+        // SAFETY: `DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2` is a valid system
+        // constant; fails harmlessly if DPI awareness was already locked.
+        let _ =
+            unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
         let state = PROCESS_POWER_THROTTLING_STATE {
             Version: PROCESS_POWER_THROTTLING_CURRENT_VERSION,
             // Control both execution speed and timer resolution, clearing the
