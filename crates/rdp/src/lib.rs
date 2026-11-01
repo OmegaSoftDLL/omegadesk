@@ -48,6 +48,12 @@ pub const MAX_SUPPORTED_MONITORS: u16 = 1024;
 /// Size in bytes of each `[MS-RDPEDISP]` `DISPLAYCONTROL_MONITOR_LAYOUT` entry (`40` bytes).
 pub const MONITOR_LAYOUT_ENTRY_SIZE: usize = 40;
 
+/// Smallest monitor width or height accepted by `[MS-RDPEDISP]` 2.2.2.2.1 (`200` pixels).
+pub const MIN_MONITOR_DIMENSION: u32 = 200;
+
+/// Largest monitor width or height accepted by `[MS-RDPEDISP]` 2.2.2.2.1 (`8192` pixels).
+pub const MAX_MONITOR_DIMENSION: u32 = 8192;
+
 /// Initial congestion window in bytes (`16 KiB`, `Congestion.cxx` line 67).
 pub const INITIAL_WINDOW: u32 = 16_384;
 
@@ -363,6 +369,35 @@ pub struct MonitorLayoutEntry {
     pub device_scale_factor: u32,
 }
 
+impl MonitorLayoutEntry {
+    /// Validates `width` and `height` against `[MS-RDPEDISP]` 2.2.2.2.1: both in
+    /// `200..=8192` and the width even. Shared by the encoder and the decoder, like the
+    /// `validate_dimensions!` macro in `ironrdp-displaycontrol/src/pdu/mod.rs` lines 239–252,
+    /// so a layout that a conforming server would reject can neither be sent nor decoded.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RdpError::InvalidDisplayControlPdu`] naming the violated constraint.
+    pub const fn validate_dimensions(&self) -> Result<(), RdpError> {
+        if self.width < MIN_MONITOR_DIMENSION || self.width > MAX_MONITOR_DIMENSION {
+            return Err(RdpError::InvalidDisplayControlPdu(
+                "monitor width out of range 200..=8192",
+            ));
+        }
+        if !self.width.is_multiple_of(2) {
+            return Err(RdpError::InvalidDisplayControlPdu(
+                "monitor width must be even",
+            ));
+        }
+        if self.height < MIN_MONITOR_DIMENSION || self.height > MAX_MONITOR_DIMENSION {
+            return Err(RdpError::InvalidDisplayControlPdu(
+                "monitor height out of range 200..=8192",
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// `[MS-RDPEDISP]` `DisplayControlPdu` ported from `Devolutions_IronRDP/crates/ironrdp-displaycontrol/src/pdu/mod.rs` (lines 28–120).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DisplayControlPdu {
@@ -381,7 +416,8 @@ impl DisplayControlPdu {
     /// # Errors
     ///
     /// Returns [`RdpError::InvalidDisplayControlPdu`] if a `MonitorLayout` has 0 or more than
-    /// [`MAX_SUPPORTED_MONITORS`] monitors or odd monitor width.
+    /// [`MAX_SUPPORTED_MONITORS`] monitors, or a monitor fails
+    /// [`MonitorLayoutEntry::validate_dimensions`].
     pub fn encode(&self, dst: &mut BytesMut) -> Result<(), RdpError> {
         match self {
             Self::Caps(caps) => {
@@ -405,11 +441,7 @@ impl DisplayControlPdu {
                     ));
                 }
                 for m in monitors {
-                    if m.width < 200 || m.height < 200 || !m.width.is_multiple_of(2) {
-                        return Err(RdpError::InvalidDisplayControlPdu(
-                            "monitor dimensions must be >= 200 and width must be even",
-                        ));
-                    }
+                    m.validate_dimensions()?;
                 }
                 let payload_len = 8 + monitors.len() * MONITOR_LAYOUT_ENTRY_SIZE;
                 let pdu_size = u32::try_from(Self::FIXED_HEADER_SIZE + payload_len)
@@ -439,7 +471,9 @@ impl DisplayControlPdu {
     ///
     /// # Errors
     ///
-    /// Returns [`RdpError::InvalidDisplayControlPdu`] if the header or body is malformed.
+    /// Returns [`RdpError::InvalidDisplayControlPdu`] if the header or body is malformed, or a
+    /// decoded monitor fails [`MonitorLayoutEntry::validate_dimensions`]: a well-framed PDU
+    /// carrying a `1x1` or odd-width monitor is rejected rather than returned as valid.
     pub fn decode(mut src: &[u8]) -> Result<Self, RdpError> {
         if src.len() < Self::FIXED_HEADER_SIZE {
             return Err(RdpError::InvalidDisplayControlPdu(
@@ -486,7 +520,7 @@ impl DisplayControlPdu {
                 }
                 let mut monitors = Vec::with_capacity(num_monitors);
                 for _ in 0..num_monitors {
-                    monitors.push(MonitorLayoutEntry {
+                    let entry = MonitorLayoutEntry {
                         flags: src.get_u32_le(),
                         left: src.get_i32_le(),
                         top: src.get_i32_le(),
@@ -497,7 +531,11 @@ impl DisplayControlPdu {
                         orientation: src.get_u32_le(),
                         desktop_scale_factor: src.get_u32_le(),
                         device_scale_factor: src.get_u32_le(),
-                    });
+                    };
+                    // Same check as the encoder (`MonitorLayoutEntry::decode` in IronRDP's
+                    // `pdu/mod.rs` validates every decoded entry the same way).
+                    entry.validate_dimensions()?;
+                    monitors.push(entry);
                 }
                 Ok(Self::MonitorLayout(monitors))
             }
@@ -574,13 +612,19 @@ impl VncCongestionController {
     }
 
     /// Updates the stream byte position (`Congestion::updatePosition` in `Congestion.cxx` lines 100–147).
+    ///
+    /// The idle interval is measured against the *previous* send before this call is recorded as
+    /// a send. `Congestion.cxx` lines 106–113 record first and measure after, which only detects
+    /// an idle gap when a zero-delta `updatePosition` call happens to land during the pause (its
+    /// writer polls that way; ours does not). Measuring first means the first bytes sent after a
+    /// long pause always close the window and redo the wire latency measurement, as intended.
     pub fn update_position(&mut self, pos: u32, now_ms: u64) {
         let delta = pos.wrapping_sub(self.last_position);
+        let idle_ms = u32::try_from(now_ms.saturating_sub(self.last_sent_ms)).unwrap_or(u32::MAX);
         if delta > 0 || self.extra_buffer > 0 {
             self.last_sent_ms = now_ms;
         }
 
-        let idle_ms = u32::try_from(now_ms.saturating_sub(self.last_sent_ms)).unwrap_or(u32::MAX);
         if let Some(base_rtt) = self.base_rtt_ms
             && idle_ms > 100
             && idle_ms > base_rtt.saturating_mul(2)
@@ -810,6 +854,138 @@ mod tests {
         assert_eq!(decoded, Ok(pdu));
     }
 
+    fn monitor(width: u32, height: u32) -> MonitorLayoutEntry {
+        MonitorLayoutEntry {
+            flags: DISPLAYCONTROL_MONITOR_PRIMARY,
+            left: 0,
+            top: 0,
+            width,
+            height,
+            physical_width_mm: 520,
+            physical_height_mm: 290,
+            orientation: 0,
+            desktop_scale_factor: 100,
+            device_scale_factor: 100,
+        }
+    }
+
+    /// Regression test for #31 `rdp/src/lib.rs:290`: the encoder enforces the `[MS-RDPEDISP]`
+    /// upper bound of 8192 pixels on both dimensions, not only the lower bound.
+    #[test]
+    fn monitor_layout_encoder_rejects_dimensions_above_8192() {
+        let mut buf = BytesMut::new();
+        let too_wide = DisplayControlPdu::MonitorLayout(vec![monitor(8194, 1080)]);
+        assert_eq!(
+            too_wide.encode(&mut buf),
+            Err(RdpError::InvalidDisplayControlPdu(
+                "monitor width out of range 200..=8192"
+            ))
+        );
+        let too_tall = DisplayControlPdu::MonitorLayout(vec![monitor(1920, 9000)]);
+        assert_eq!(
+            too_tall.encode(&mut buf),
+            Err(RdpError::InvalidDisplayControlPdu(
+                "monitor height out of range 200..=8192"
+            ))
+        );
+        // A valid primary followed by one oversized secondary fails as a whole.
+        let mixed = DisplayControlPdu::MonitorLayout(vec![monitor(1920, 1080), monitor(200, 8193)]);
+        assert!(mixed.encode(&mut buf).is_err());
+        assert_eq!(buf.len(), 0, "nothing is written for a rejected layout");
+
+        // Both bounds inclusive, and the pre-existing lower-bound / even-width rules still hold.
+        let max = DisplayControlPdu::MonitorLayout(vec![monitor(8192, 8192)]);
+        assert!(max.encode(&mut buf).is_ok());
+        assert_eq!(DisplayControlPdu::decode(&buf), Ok(max));
+        buf.clear();
+        assert!(
+            DisplayControlPdu::MonitorLayout(vec![monitor(200, 200)])
+                .encode(&mut buf)
+                .is_ok()
+        );
+        buf.clear();
+        assert!(
+            DisplayControlPdu::MonitorLayout(vec![monitor(198, 1080)])
+                .encode(&mut buf)
+                .is_err()
+        );
+        assert_eq!(
+            DisplayControlPdu::MonitorLayout(vec![monitor(1921, 1080)]).encode(&mut buf),
+            Err(RdpError::InvalidDisplayControlPdu(
+                "monitor width must be even"
+            ))
+        );
+    }
+
+    /// Builds a correctly framed `DISPLAYCONTROL_MONITOR_LAYOUT_PDU` without going through the
+    /// encoder's validation, the way a misbehaving peer would.
+    fn raw_monitor_layout_pdu(monitors: &[MonitorLayoutEntry]) -> BytesMut {
+        let mut buf = BytesMut::new();
+        buf.put_u32_le(DISPLAYCONTROL_PDU_TYPE_MONITOR_LAYOUT);
+        buf.put_u32_le(
+            u32::try_from(
+                DisplayControlPdu::FIXED_HEADER_SIZE
+                    + 8
+                    + monitors.len() * MONITOR_LAYOUT_ENTRY_SIZE,
+            )
+            .unwrap(),
+        );
+        buf.put_u32_le(u32::try_from(MONITOR_LAYOUT_ENTRY_SIZE).unwrap());
+        buf.put_u32_le(u32::try_from(monitors.len()).unwrap());
+        for m in monitors {
+            buf.put_u32_le(m.flags);
+            buf.put_i32_le(m.left);
+            buf.put_i32_le(m.top);
+            buf.put_u32_le(m.width);
+            buf.put_u32_le(m.height);
+            buf.put_u32_le(m.physical_width_mm);
+            buf.put_u32_le(m.physical_height_mm);
+            buf.put_u32_le(m.orientation);
+            buf.put_u32_le(m.desktop_scale_factor);
+            buf.put_u32_le(m.device_scale_factor);
+        }
+        buf
+    }
+
+    /// Regression test for #31 `rdp/src/lib.rs:378`: the decoder validates monitor dimensions
+    /// and the even-width rule instead of accepting any well-framed layout verbatim.
+    #[test]
+    fn monitor_layout_decoder_rejects_invalid_monitor_dimensions() {
+        let tiny = raw_monitor_layout_pdu(&[monitor(1, 1)]);
+        assert_eq!(
+            DisplayControlPdu::decode(&tiny),
+            Err(RdpError::InvalidDisplayControlPdu(
+                "monitor width out of range 200..=8192"
+            ))
+        );
+        let odd = raw_monitor_layout_pdu(&[monitor(1921, 1080)]);
+        assert_eq!(
+            DisplayControlPdu::decode(&odd),
+            Err(RdpError::InvalidDisplayControlPdu(
+                "monitor width must be even"
+            ))
+        );
+        let huge = raw_monitor_layout_pdu(&[monitor(1920, 1080), monitor(1920, 8194)]);
+        assert_eq!(
+            DisplayControlPdu::decode(&huge),
+            Err(RdpError::InvalidDisplayControlPdu(
+                "monitor height out of range 200..=8192"
+            ))
+        );
+        // The raw builder and the real encoder agree on a valid layout.
+        let valid = vec![monitor(1920, 1080)];
+        let raw = raw_monitor_layout_pdu(&valid);
+        let mut encoded = BytesMut::new();
+        DisplayControlPdu::MonitorLayout(valid.clone())
+            .encode(&mut encoded)
+            .unwrap();
+        assert_eq!(raw, encoded);
+        assert_eq!(
+            DisplayControlPdu::decode(&raw),
+            Ok(DisplayControlPdu::MonitorLayout(valid))
+        );
+    }
+
     #[test]
     fn tigervnc_congestion_controller_slow_start_and_vegas_backoff() {
         let mut cc = VncCongestionController::new(1_000);
@@ -825,15 +1001,67 @@ mod tests {
         }
         assert_eq!(cc.congestion_window(), INITIAL_WINDOW * 2);
 
-        // Simulate 3 pings with a latency spike (RTT jumps to 150 ms) -> leaves slow start and backs off.
+        // Simulate 3 pings with a latency spike (RTT jumps to 150 ms) -> leaves slow start and
+        // backs off. Sends stay 50 ms apart (<= 100 ms since the previous send at t=1040) so the
+        // idle reset does not fire and the back-off is exercised on its own.
         for i in 0..3u32 {
-            let t_send = 2_000 + u64::from(i) * 200;
+            let t_send = 1_100 + u64::from(i) * 50;
             cc.update_position(100_000 + (i + 1) * 40_000, t_send);
             cc.sent_ping(t_send);
             cc.got_pong(t_send + 150);
         }
         assert!(!cc.in_slow_start());
         assert!(cc.congestion_window() < INITIAL_WINDOW * 2);
+    }
+
+    /// Regression test for #31 `rdp/src/lib.rs:458`: the first send after a long pause resets
+    /// the window and the RTT baseline, because idle time is measured against the previous send
+    /// before the new send is recorded.
+    #[test]
+    fn congestion_controller_resets_window_when_sending_resumes_after_idle() {
+        let mut cc = VncCongestionController::new(1_000);
+        for i in 0..3u32 {
+            let t_send = 1_000 + u64::from(i) * 20;
+            cc.update_position((i + 1) * 20_000, t_send);
+            cc.sent_ping(t_send);
+            cc.got_pong(t_send + 10);
+        }
+        assert_eq!(cc.congestion_window(), INITIAL_WINDOW * 2);
+        assert!(cc.in_slow_start());
+
+        // Leave slow start with a mild RTT increase so a reset is observable on both fields.
+        for i in 0..3u32 {
+            let t_send = 1_100 + u64::from(i) * 50;
+            cc.update_position(100_000 + (i + 1) * 40_000, t_send);
+            cc.sent_ping(t_send);
+            cc.got_pong(t_send + 150);
+        }
+        assert!(!cc.in_slow_start());
+        let backed_off = cc.congestion_window();
+
+        // 5 s of silence (> 100 ms and > 2 * base RTT), then data is sent with no zero-byte
+        // position update during the pause. This send itself must trigger the idle reset.
+        cc.update_position(300_000, 6_200);
+        assert!(cc.in_slow_start());
+        assert_eq!(cc.congestion_window(), INITIAL_WINDOW.min(backed_off));
+        // The RTT baseline was discarded: the next pong re-measures it from scratch (300 ms
+        // instead of the 10 ms learned before the pause), which the bandwidth estimate exposes.
+        cc.sent_ping(6_200);
+        cc.got_pong(6_500);
+        let at_300ms_rtt = (cc.congestion_window() as usize) * 1000 / 300;
+        assert_eq!(cc.get_bandwidth(), at_300ms_rtt + at_300ms_rtt / 2);
+
+        // A short gap does not reset: the window keeps growing from where it was.
+        let mut steady = VncCongestionController::new(0);
+        for i in 0..3u32 {
+            let t_send = u64::from(i) * 20;
+            steady.update_position((i + 1) * 20_000, t_send);
+            steady.sent_ping(t_send);
+            steady.got_pong(t_send + 10);
+        }
+        assert_eq!(steady.congestion_window(), INITIAL_WINDOW * 2);
+        steady.update_position(80_000, 120);
+        assert_eq!(steady.congestion_window(), INITIAL_WINDOW * 2);
     }
 
     #[test]
