@@ -396,6 +396,9 @@ fn run_capture(
                     return;
                 };
                 let chunk = plane.chunk();
+                if chunk.size() == 0 {
+                    return;
+                }
                 let width = data.format.size().width as usize;
                 let height = data.format.size().height as usize;
                 let stride = usize::try_from(chunk.stride())

@@ -558,16 +558,29 @@ impl RdpBridge {
             })
     }
 
-    /// Sends the `[MS-RDPBCGR]` Shutdown Request and waits for the session to end.
+    /// Sends the `[MS-RDPBCGR]` Shutdown Request and waits up to five seconds for the
+    /// session to end, aborting the session task if the server stops responding.
     ///
     /// # Errors
     ///
-    /// Returns the session error when the connection failed before the shutdown completed.
-    pub async fn shutdown(self) -> Result<GracefulDisconnectReason, RdpBridgeError> {
-        let _ = self.commands.send(Command::Shutdown).await;
-        match self.task.await {
-            Ok(result) => result,
-            Err(join) => Err(RdpBridgeError::Disconnected(join.to_string())),
+    /// Returns the session error when the connection failed before the shutdown completed,
+    /// or [`RdpBridgeError::Timeout`] when the transport does not close in time.
+    pub async fn shutdown(mut self) -> Result<GracefulDisconnectReason, RdpBridgeError> {
+        const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+        if tokio::time::timeout(SHUTDOWN_TIMEOUT, self.commands.send(Command::Shutdown))
+            .await
+            .is_err()
+        {
+            self.task.abort();
+            return Err(RdpBridgeError::Timeout(SHUTDOWN_TIMEOUT));
+        }
+        match tokio::time::timeout(SHUTDOWN_TIMEOUT, &mut self.task).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(join)) => Err(RdpBridgeError::Disconnected(join.to_string())),
+            Err(_) => {
+                self.task.abort();
+                Err(RdpBridgeError::Timeout(SHUTDOWN_TIMEOUT))
+            }
         }
     }
 }
@@ -871,6 +884,29 @@ mod tests {
         assert!(matches!(
             capturer.next_frame(Duration::from_millis(5)),
             Err(CaptureError::Os(reason)) if reason.contains("server went away")
+        ));
+    }
+
+    #[tokio::test]
+    async fn shutdown_aborts_a_session_that_never_closes() {
+        let (commands, _receiver) = mpsc::channel(1);
+        let task = tokio::spawn(async {
+            std::future::pending::<Result<GracefulDisconnectReason, RdpBridgeError>>().await
+        });
+        let bridge = RdpBridge {
+            commands,
+            task,
+            slot: Arc::new(FrameSlot::default()),
+            capturer: None,
+            certificate_sha256: [0; 32],
+            desktop_size: RdpDesktopSize {
+                width: 800,
+                height: 600,
+            },
+        };
+        assert!(matches!(
+            bridge.shutdown().await,
+            Err(RdpBridgeError::Timeout(duration)) if duration == Duration::from_secs(5)
         ));
     }
 }

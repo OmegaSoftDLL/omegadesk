@@ -331,6 +331,7 @@ async fn run_script_is_confirmed_through_input_required_on_the_latest_protocol()
         assert_eq!(entry.tool_name, "run_script");
         assert_eq!(entry.risk_level, RiskLevel::High);
         assert_eq!(entry.recommendation, TrustRecommendation::Confirm);
+        assert!(entry.allowed);
     }
     finish(harness).await;
 }
@@ -372,6 +373,7 @@ async fn declined_confirmation_refuses_the_action_and_is_audited() {
             let entry = trust.audit_log().last().unwrap();
             assert_eq!(entry.tool_name, "run_script");
             assert_eq!(entry.recommendation, TrustRecommendation::Confirm);
+            assert!(!entry.allowed);
         }
         finish(harness).await;
     }

@@ -342,24 +342,23 @@ where
 }
 
 #[cfg(unix)]
-async fn terminate_process_group(child: &mut Child) -> std::io::Result<()> {
-    if let Some(pid) = child.id() {
+async fn terminate_process_group(child: &mut Child, pid: Option<u32>) -> std::io::Result<()> {
+    if let Some(pid) = pid {
         // The process group can already be gone; both outcomes close the script's pipes.
         let _ = Command::new("kill")
             .arg("-KILL")
             .arg(format!("-{pid}"))
             .status()
             .await?;
-    } else {
-        child.start_kill()?;
     }
+    let _ = child.start_kill();
     let _ = child.wait().await?;
     Ok(())
 }
 
 #[cfg(windows)]
-async fn terminate_process_group(child: &mut Child) -> std::io::Result<()> {
-    if let Some(pid) = child.id() {
+async fn terminate_process_group(child: &mut Child, pid: Option<u32>) -> std::io::Result<()> {
+    if let Some(pid) = pid {
         // `taskkill` also reports an already-exited process as an error, which is harmless.
         let _ = Command::new("taskkill")
             .arg("/PID")
@@ -368,9 +367,8 @@ async fn terminate_process_group(child: &mut Child) -> std::io::Result<()> {
             .arg("/F")
             .status()
             .await?;
-    } else {
-        child.start_kill()?;
     }
+    let _ = child.start_kill();
     let _ = child.wait().await?;
     Ok(())
 }
@@ -412,6 +410,7 @@ impl ScriptRunner {
         #[cfg(unix)]
         process.process_group(0);
         let mut child = process.spawn()?;
+        let pid = child.id();
         let stdout = child
             .stdout
             .take()
@@ -425,7 +424,7 @@ impl ScriptRunner {
         let started = Instant::now();
         let status = tokio::time::timeout(timeout, child.wait()).await;
         let timed_out = status.is_err();
-        terminate_process_group(&mut child).await?;
+        terminate_process_group(&mut child, pid).await?;
         let status = match status {
             Ok(status) => Some(status?),
             Err(_) => None,
@@ -547,5 +546,25 @@ mod tests {
         assert!(outcome.timed_out);
         assert!(outcome.stdout.contains("mcp-before"));
         assert!(!outcome.stdout_truncated);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn exited_shell_still_has_its_descendants_terminated() {
+        let runner = ScriptRunner {
+            default_timeout: Duration::from_secs(10),
+            max_timeout: Duration::from_secs(10),
+            max_output_bytes: 64,
+        };
+        let outcome = runner
+            .run(
+                "printf shell-exited; sleep 30 &",
+                Some(Duration::from_secs(2)),
+            )
+            .await
+            .unwrap();
+        assert!(!outcome.timed_out);
+        assert_eq!(outcome.exit_code, Some(0));
+        assert!(outcome.stdout.contains("shell-exited"));
     }
 }

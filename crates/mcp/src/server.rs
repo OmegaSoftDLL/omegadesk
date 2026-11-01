@@ -190,6 +190,8 @@ pub struct AuditRecord {
     pub risk_level: String,
     /// Decision (`proceed`, `confirm`, `block`).
     pub recommendation: String,
+    /// Whether the call was authorized to run.
+    pub allowed: bool,
     /// Unix time in milliseconds.
     pub timestamp_ms: u64,
 }
@@ -753,6 +755,7 @@ impl OmegaDeskMcpServer {
                     tool: entry.tool_name.clone(),
                     risk_level: risk_name(entry.risk_level).to_owned(),
                     recommendation: recommendation_name(entry.recommendation).to_owned(),
+                    allowed: entry.allowed,
                     timestamp_ms: entry.timestamp_ms,
                 })
                 .collect(),

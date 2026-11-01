@@ -187,6 +187,8 @@ pub struct McpAuditEntry {
     pub risk_level: RiskLevel,
     /// Policy recommendation (`Proceed`, `Confirm`, `Block`).
     pub recommendation: TrustRecommendation,
+    /// Whether the call was authorized to run.
+    pub allowed: bool,
     /// Timestamp in milliseconds since the Unix epoch.
     pub timestamp_ms: u64,
 }
@@ -359,11 +361,17 @@ impl McpTrustEngine {
         }
 
         let assessment = self.assess_risk(device_id, tool_name, arguments);
+        let allowed = match assessment.recommendation {
+            TrustRecommendation::Proceed => true,
+            TrustRecommendation::Block => false,
+            TrustRecommendation::Confirm => operator_confirmed,
+        };
         self.audit_log.push(McpAuditEntry {
             device_id,
             tool_name: tool_name.to_owned(),
             risk_level: assessment.risk_level,
             recommendation: assessment.recommendation,
+            allowed,
             timestamp_ms: now_ms,
         });
 
