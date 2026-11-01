@@ -408,8 +408,18 @@ async fn serve_control(
     loop {
         tokio::select! {
             envelope = control.next() => {
-                let Some(envelope) = envelope? else { return Ok(()) };
-                handle_control(envelope, control_send, channels, state, &mut target).await?;
+                match envelope {
+                    Ok(Some(envelope)) => {
+                        handle_control(envelope, control_send, channels, state, &mut target).await?;
+                    }
+                    Ok(None) => return Ok(()),
+                    Err(omegadesk_transport::TransportError::Read(
+                        quinn::ReadError::ConnectionLost(
+                            quinn::ConnectionError::ApplicationClosed(frame),
+                        ),
+                    )) if frame.error_code == close_code::NORMAL.into() => return Ok(()),
+                    Err(error) => return Err(error.into()),
+                }
             }
             outbound = channels.outbound_rx.recv() => {
                 if let Some(envelope) = outbound {

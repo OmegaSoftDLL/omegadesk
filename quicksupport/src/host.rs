@@ -233,7 +233,10 @@ impl QuickSupportHost {
                 warn!(rotated, "technician presented a wrong temporary password");
                 Ok(SessionOutcome::WrongPassword { rotated })
             }
-            Err(error) => Ok(SessionOutcome::Failed(error)),
+            Err(error) => {
+                warn!("session ended with error: {error:#}");
+                Ok(SessionOutcome::Failed(error))
+            }
         }
     }
 }

@@ -35,7 +35,7 @@ use omegadesk_relay::RelayRouter;
 use omegadesk_relay::service::{serve_relay, serve_stun};
 use omegadesk_server::control_server;
 use omegadesk_server::{Coordinator, RelayNode};
-use omegadesk_transport::{Connection, EnvelopeReader, send_envelope};
+use omegadesk_transport::{Connection, EnvelopeReader, SendStream, send_envelope};
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::task::JoinHandle;
 
@@ -198,6 +198,14 @@ async fn connect(tech: &Node, id: QuickSupportId) -> Connection {
 
 /// Runs the technician's half of the handshake and returns the host's reply.
 async fn hello(connection: &Connection, password: &str) -> Envelope {
+    hello_with_control(connection, password).await.0
+}
+
+/// Keeps the control stream alive for tests that continue past `HelloAck`.
+async fn hello_with_control(
+    connection: &Connection,
+    password: &str,
+) -> (Envelope, SendStream, EnvelopeReader) {
     let (mut send, recv) = connection.open_bi().await.unwrap();
     send_envelope(
         &mut send,
@@ -217,11 +225,12 @@ async fn hello(connection: &Connection, password: &str) -> Envelope {
     .await
     .unwrap();
     let mut reader = EnvelopeReader::new(recv);
-    tokio::time::timeout(Duration::from_secs(10), reader.next())
+    let reply = tokio::time::timeout(Duration::from_secs(10), reader.next())
         .await
         .expect("host reply timed out")
         .unwrap()
-        .expect("host closed the control stream")
+        .expect("host closed the control stream");
+    (reply, send, reader)
 }
 
 fn error_message(reply: &Envelope) -> &str {
@@ -331,7 +340,8 @@ async fn host_checks_the_password_then_asks_for_consent() {
     // Right password and consent: `HelloAck` carries the host's identity.
     let serving = serve_once(&host, &gate);
     let connection = connect(&tech, id).await;
-    let reply = hello(&connection, &password).await;
+    let (reply, _control_send, mut control_reader) =
+        hello_with_control(&connection, &password).await;
     let Some(Payload::HelloAck(ack)) = reply.payload else {
         panic!("expected HelloAck, got {reply:?}");
     };
@@ -345,6 +355,12 @@ async fn host_checks_the_password_then_asks_for_consent() {
     assert_eq!(asked.len(), 1);
     assert_eq!(asked[0].device_name, "tech-client");
     assert!(asked[0].device_id.is_some());
+    let catalog = tokio::time::timeout(Duration::from_secs(10), control_reader.next())
+        .await
+        .expect("display catalog timed out")
+        .unwrap()
+        .expect("host closed the control stream");
+    assert!(matches!(catalog.payload, Some(Payload::DisplayList(_))));
     // The video stream is opened by the host once the session is accepted.
     let _video = tokio::time::timeout(Duration::from_secs(10), connection.accept_uni())
         .await
