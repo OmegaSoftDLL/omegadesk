@@ -13,10 +13,18 @@
 //!   consecutive failures and trigger [`AlertTemplate`] failure and resolution actions.
 //! - **Scoped RMM Roles with `can_*` flags** (`docs/plan.md` §2.7 line 116): fine-grained RMM
 //!   capability bitflags restricted to specific tenants and device groups (sites).
+//! - **Check evaluation against telemetry** ([`evaluate_check`]): the pure function the
+//!   coordinator applies to every inventory report. Tactical RMM (idea only, `checks/models.py`
+//!   `CheckResult.handle_check`) evaluates `diskspace`, `cpuload`, `memory`, `winsvc` and
+//!   `script` results the same way: a sample either passes or fails, `fail_count` grows until
+//!   `fails_b4_alert`, and a passing sample resolves the alert. The `OfflineFor` kind is
+//!   Tactical RMM's agent `overdue_time` turned into a check so that "offline for more than X"
+//!   raises and clears like any other alert.
 
 use std::collections::{HashMap, HashSet};
 
 use omegadesk_identity::DeviceId;
+use serde::{Deserialize, Serialize};
 
 /// Capability flags for RMM operators (`can_*` flags, `docs/plan.md` §2.7 line 116).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -103,7 +111,7 @@ impl ScopedRmmRole {
 }
 
 /// Severity level of an RMM check or alert.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum AlertSeverity {
     /// Informational notice.
     Info,
@@ -113,8 +121,20 @@ pub enum AlertSeverity {
     Critical,
 }
 
+impl AlertSeverity {
+    /// Lowercase name (`info`, `warning`, `critical`).
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Info => "info",
+            Self::Warning => "warning",
+            Self::Critical => "critical",
+        }
+    }
+}
+
 /// Condition evaluated by an [`RmmCheck`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CheckKind {
     /// CPU utilization percentage (`0..=100`) must not exceed `max_percent`.
     CpuThreshold {
@@ -145,10 +165,210 @@ pub enum CheckKind {
         /// Expected process exit code (typically `0`).
         expected_exit_code: i32,
     },
+    /// Required Windows service (case-insensitive service name) must be in the running state
+    /// (Tactical RMM `winsvc` check, idea only).
+    ServiceRunning {
+        /// Service name as registered with the Service Control Manager (`Spooler`).
+        service_name: String,
+    },
+    /// The device must not stay offline longer than `max_offline_secs` (Tactical RMM agent
+    /// `overdue_time`, idea only).
+    OfflineFor {
+        /// Maximum tolerated time since the last heartbeat, in seconds.
+        max_offline_secs: u64,
+    },
+}
+
+/// One device's telemetry as seen by [`evaluate_check`]: the coordinator derives it from the
+/// latest inventory report plus its own connection bookkeeping.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TelemetrySample<'a> {
+    /// CPU utilization `0..=100`.
+    pub cpu_utilization_pct: u8,
+    /// Used memory `0..=100`.
+    pub memory_used_pct: u8,
+    /// `(mount point or drive letter, used percent)` per drive.
+    pub disks: &'a [(String, u8)],
+    /// Distinct executable names currently running.
+    pub running_processes: &'a [String],
+    /// Windows services currently running.
+    pub running_services: &'a [String],
+    /// Whether the device holds a live control connection.
+    pub is_online: bool,
+    /// Seconds since the last heartbeat (0 while online).
+    pub offline_for_secs: u64,
+}
+
+/// Outcome of evaluating one check kind against a [`TelemetrySample`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CheckVerdict {
+    /// The condition holds; the text describes the observed value.
+    Passed(String),
+    /// The condition is violated; the text describes the observed value.
+    Failed(String),
+    /// The sample does not carry what this check needs (a `ScriptExitCode` check is driven
+    /// by script results, a disk check names a mount the device does not have).
+    NotApplicable,
+}
+
+impl CheckVerdict {
+    /// `Some(passed)` for a decided verdict, `None` when not applicable.
+    #[must_use]
+    pub const fn passed(&self) -> Option<bool> {
+        match self {
+            Self::Passed(_) => Some(true),
+            Self::Failed(_) => Some(false),
+            Self::NotApplicable => None,
+        }
+    }
+
+    /// Human-readable detail (empty when not applicable).
+    #[must_use]
+    pub fn detail(&self) -> &str {
+        match self {
+            Self::Passed(text) | Self::Failed(text) => text,
+            Self::NotApplicable => "",
+        }
+    }
+}
+
+/// Normalizes a mount point or drive letter for comparison: case-insensitive, without
+/// trailing path separators, so `C:`, `c:\` and `C:\` are the same drive and `/` stays `/`.
+#[must_use]
+pub fn normalize_mount_point(raw: &str) -> String {
+    let trimmed = raw.trim();
+    let stripped = trimmed.trim_end_matches(['\\', '/']);
+    if stripped.is_empty() {
+        trimmed.to_ascii_lowercase()
+    } else {
+        stripped.to_ascii_lowercase()
+    }
+}
+
+/// Whether `name` names the same executable as `wanted`, ignoring case and a trailing `.exe`
+/// on either side (`spoolsv` matches `spoolsv.exe`).
+#[must_use]
+pub fn process_name_matches(name: &str, wanted: &str) -> bool {
+    let strip = |s: &str| {
+        let lower = s.trim().to_ascii_lowercase();
+        lower
+            .strip_suffix(".exe")
+            .map_or(lower.clone(), str::to_owned)
+    };
+    !wanted.trim().is_empty() && strip(name) == strip(wanted)
+}
+
+/// Evaluates `kind` against `sample`, returning what was observed. Pure and deterministic:
+/// the coordinator feeds the boolean into [`CheckEvaluator::record_sample`].
+#[must_use]
+pub fn evaluate_check(kind: &CheckKind, sample: &TelemetrySample<'_>) -> CheckVerdict {
+    match kind {
+        CheckKind::CpuThreshold { max_percent } => {
+            let observed = sample.cpu_utilization_pct;
+            let text = format!("cpu {observed}% (max {max_percent}%)");
+            if observed > *max_percent {
+                CheckVerdict::Failed(text)
+            } else {
+                CheckVerdict::Passed(text)
+            }
+        }
+        CheckKind::MemoryThreshold { max_percent } => {
+            let observed = sample.memory_used_pct;
+            let text = format!("memory {observed}% (max {max_percent}%)");
+            if observed > *max_percent {
+                CheckVerdict::Failed(text)
+            } else {
+                CheckVerdict::Passed(text)
+            }
+        }
+        CheckKind::DiskThreshold {
+            mount_point,
+            max_percent,
+        } => {
+            let wanted = normalize_mount_point(mount_point);
+            let Some((name, used)) = sample
+                .disks
+                .iter()
+                .find(|(name, _)| normalize_mount_point(name) == wanted)
+            else {
+                return CheckVerdict::NotApplicable;
+            };
+            let text = format!("disk {name} {used}% (max {max_percent}%)");
+            if *used > *max_percent {
+                CheckVerdict::Failed(text)
+            } else {
+                CheckVerdict::Passed(text)
+            }
+        }
+        CheckKind::ProcessRunning { process_name } => {
+            if sample
+                .running_processes
+                .iter()
+                .any(|p| process_name_matches(p, process_name))
+            {
+                CheckVerdict::Passed(format!("process {process_name} running"))
+            } else {
+                CheckVerdict::Failed(format!("process {process_name} not running"))
+            }
+        }
+        CheckKind::ServiceRunning { service_name } => {
+            if sample
+                .running_services
+                .iter()
+                .any(|s| s.eq_ignore_ascii_case(service_name.trim()))
+            {
+                CheckVerdict::Passed(format!("service {service_name} running"))
+            } else {
+                CheckVerdict::Failed(format!("service {service_name} not running"))
+            }
+        }
+        CheckKind::OfflineFor { max_offline_secs } => {
+            if sample.is_online {
+                CheckVerdict::Passed("online".to_owned())
+            } else if sample.offline_for_secs > *max_offline_secs {
+                CheckVerdict::Failed(format!(
+                    "offline for {}s (max {max_offline_secs}s)",
+                    sample.offline_for_secs
+                ))
+            } else {
+                CheckVerdict::Passed(format!(
+                    "offline for {}s (max {max_offline_secs}s)",
+                    sample.offline_for_secs
+                ))
+            }
+        }
+        CheckKind::ScriptExitCode { .. } => CheckVerdict::NotApplicable,
+    }
+}
+
+/// Evaluates a `ScriptExitCode` check against a finished script run.
+#[must_use]
+pub fn evaluate_script_exit(kind: &CheckKind, script_id: &str, exit_code: i32) -> CheckVerdict {
+    match kind {
+        CheckKind::ScriptExitCode {
+            script_id: wanted,
+            expected_exit_code,
+        } if wanted == script_id => {
+            let text =
+                format!("script {script_id} exited {exit_code} (expected {expected_exit_code})");
+            if exit_code == *expected_exit_code {
+                CheckVerdict::Passed(text)
+            } else {
+                CheckVerdict::Failed(text)
+            }
+        }
+        CheckKind::ScriptExitCode { .. }
+        | CheckKind::CpuThreshold { .. }
+        | CheckKind::MemoryThreshold { .. }
+        | CheckKind::DiskThreshold { .. }
+        | CheckKind::ProcessRunning { .. }
+        | CheckKind::ServiceRunning { .. }
+        | CheckKind::OfflineFor { .. } => CheckVerdict::NotApplicable,
+    }
 }
 
 /// Declarative health check definition (`docs/plan.md` §2.8 line 124).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RmmCheck {
     /// Unique check identifier.
     pub check_id: String,
@@ -163,7 +383,7 @@ pub struct RmmCheck {
 }
 
 /// Automated action executed by an [`AlertTemplate`] when an alert opens or resolves.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TemplateAction {
     /// Execute a saved remediation or recovery script on the affected device.
     RunScript {
@@ -178,7 +398,7 @@ pub enum TemplateAction {
 }
 
 /// Alert template defining automated failure and resolution actions (`docs/plan.md` §2.8 line 124).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AlertTemplate {
     /// Unique template identifier.
     pub template_id: String,
@@ -191,7 +411,7 @@ pub struct AlertTemplate {
 }
 
 /// Lifecycle state of an [`AlertRecord`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AlertState {
     /// Alert is currently active.
     Open,
@@ -199,8 +419,19 @@ pub enum AlertState {
     Resolved,
 }
 
+impl AlertState {
+    /// Lowercase name (`open`, `resolved`).
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Resolved => "resolved",
+        }
+    }
+}
+
 /// Active or resolved alert instance produced by [`CheckEvaluator`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AlertRecord {
     /// Unique alert identifier (`"<device_id>:<check_id>"`).
     pub alert_id: String,
@@ -237,11 +468,73 @@ pub struct CheckEvaluator {
     alerts: HashMap<(DeviceId, String), AlertRecord>,
 }
 
+/// Serializable snapshot of a [`CheckEvaluator`] (alerts plus in-progress failure streaks),
+/// so a coordinator restart neither forgets open alerts nor re-fires their actions.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckEvaluatorSnapshot {
+    /// Every alert the evaluator knows, open or resolved.
+    pub alerts: Vec<AlertRecord>,
+    /// Consecutive failures below the alert threshold, per `(device, check)`.
+    pub failure_streaks: Vec<(DeviceId, String, u32)>,
+}
+
 impl CheckEvaluator {
     /// Creates a new check evaluator.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Every alert, open or resolved, sorted by device then check id.
+    #[must_use]
+    pub fn alerts(&self) -> Vec<AlertRecord> {
+        let mut out: Vec<AlertRecord> = self.alerts.values().cloned().collect();
+        out.sort_by(|a, b| (a.device_id, &a.check_id).cmp(&(b.device_id, &b.check_id)));
+        out
+    }
+
+    /// The alert for `(device_id, check_id)`, if any.
+    #[must_use]
+    pub fn alert(&self, device_id: DeviceId, check_id: &str) -> Option<&AlertRecord> {
+        self.alerts.get(&(device_id, check_id.to_owned()))
+    }
+
+    /// Drops every alert and streak of `device_id` (the device was deleted).
+    pub fn forget_device(&mut self, device_id: DeviceId) {
+        self.alerts.retain(|(id, _), _| *id != device_id);
+        self.failure_counts.retain(|(id, _), _| *id != device_id);
+    }
+
+    /// Captures the evaluator state for persistence.
+    #[must_use]
+    pub fn snapshot(&self) -> CheckEvaluatorSnapshot {
+        let mut failure_streaks: Vec<(DeviceId, String, u32)> = self
+            .failure_counts
+            .iter()
+            .map(|((device, check), count)| (*device, check.clone(), *count))
+            .collect();
+        failure_streaks.sort();
+        CheckEvaluatorSnapshot {
+            alerts: self.alerts(),
+            failure_streaks,
+        }
+    }
+
+    /// Rebuilds an evaluator from a [`CheckEvaluatorSnapshot`].
+    #[must_use]
+    pub fn from_snapshot(snapshot: CheckEvaluatorSnapshot) -> Self {
+        Self {
+            failure_counts: snapshot
+                .failure_streaks
+                .into_iter()
+                .map(|(device, check, count)| ((device, check), count))
+                .collect(),
+            alerts: snapshot
+                .alerts
+                .into_iter()
+                .map(|alert| ((alert.device_id, alert.check_id.clone()), alert))
+                .collect(),
+        }
     }
 
     /// Records the boolean pass/fail result of `check` on `device_id` at `now_ms`, firing
@@ -327,7 +620,7 @@ impl CheckEvaluator {
 
 /// Inheritable RMM policy layer attached to a tenant (`Client`), device group (`Site`),
 /// or individual machine (`Device`) (`docs/plan.md` §2.8 line 123).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RmmPolicyLayer {
     /// Checks defined or overridden at this layer (keyed by `check_id`).
     pub checks: HashMap<String, RmmCheck>,
@@ -483,5 +776,189 @@ mod tests {
         let out3 = evaluator.record_sample(device_id, &check, true, Some(&template), 3_000);
         assert_eq!(out3.alert.map(|a| a.state), Some(AlertState::Resolved));
         assert_eq!(out3.triggered_actions, template.on_resolution_actions);
+    }
+
+    const DISKS: [(&str, u8); 2] = [("C:\\", 93), ("/", 40)];
+    const PROCESSES: [&str; 2] = ["spoolsv.exe", "sshd"];
+
+    fn sample<'a>(
+        disks: &'a [(String, u8)],
+        processes: &'a [String],
+        services: &'a [String],
+    ) -> TelemetrySample<'a> {
+        TelemetrySample {
+            cpu_utilization_pct: 95,
+            memory_used_pct: 50,
+            disks,
+            running_processes: processes,
+            running_services: services,
+            is_online: true,
+            offline_for_secs: 0,
+        }
+    }
+
+    #[test]
+    fn evaluate_check_thresholds_and_disks_like_tactical_rmm_check_results() {
+        let disks: Vec<(String, u8)> = DISKS.iter().map(|(n, p)| ((*n).to_owned(), *p)).collect();
+        let sample = sample(&disks, &[], &[]);
+
+        let cpu = evaluate_check(&CheckKind::CpuThreshold { max_percent: 90 }, &sample);
+        assert_eq!(cpu.passed(), Some(false));
+        assert_eq!(cpu.detail(), "cpu 95% (max 90%)");
+        assert_eq!(
+            evaluate_check(&CheckKind::MemoryThreshold { max_percent: 50 }, &sample).passed(),
+            Some(true),
+            "the threshold itself passes; only values above it fail"
+        );
+
+        // Mount points compare case-insensitively without trailing separators.
+        for mount in ["C:", "c:\\", "C:\\"] {
+            let verdict = evaluate_check(
+                &CheckKind::DiskThreshold {
+                    mount_point: mount.to_owned(),
+                    max_percent: 85,
+                },
+                &sample,
+            );
+            assert_eq!(verdict.passed(), Some(false), "{mount}");
+        }
+        assert_eq!(
+            evaluate_check(
+                &CheckKind::DiskThreshold {
+                    mount_point: "/".to_owned(),
+                    max_percent: 85,
+                },
+                &sample,
+            )
+            .passed(),
+            Some(true)
+        );
+        assert_eq!(
+            evaluate_check(
+                &CheckKind::DiskThreshold {
+                    mount_point: "D:".to_owned(),
+                    max_percent: 85,
+                },
+                &sample,
+            ),
+            CheckVerdict::NotApplicable,
+            "a mount the device does not have is not a failure"
+        );
+    }
+
+    #[test]
+    fn evaluate_check_processes_services_offline_and_scripts() {
+        let processes: Vec<String> = PROCESSES.iter().map(|p| (*p).to_owned()).collect();
+        let services = vec!["Spooler".to_owned()];
+        let sample = sample(&[], &processes, &services);
+
+        // Process names match with or without `.exe`, ignoring case.
+        for name in ["spoolsv", "SPOOLSV.EXE", "sshd"] {
+            assert_eq!(
+                evaluate_check(
+                    &CheckKind::ProcessRunning {
+                        process_name: name.to_owned(),
+                    },
+                    &sample,
+                )
+                .passed(),
+                Some(true),
+                "{name}"
+            );
+        }
+        assert_eq!(
+            evaluate_check(
+                &CheckKind::ProcessRunning {
+                    process_name: "nginx".to_owned(),
+                },
+                &sample,
+            )
+            .passed(),
+            Some(false)
+        );
+        assert_eq!(
+            evaluate_check(
+                &CheckKind::ServiceRunning {
+                    service_name: "spooler".to_owned(),
+                },
+                &sample,
+            )
+            .passed(),
+            Some(true)
+        );
+
+        // Offline checks: online passes, offline within the budget passes, beyond it fails.
+        let offline = CheckKind::OfflineFor {
+            max_offline_secs: 600,
+        };
+        assert_eq!(evaluate_check(&offline, &sample).passed(), Some(true));
+        let mut gone = sample.clone();
+        gone.is_online = false;
+        gone.offline_for_secs = 599;
+        assert_eq!(evaluate_check(&offline, &gone).passed(), Some(true));
+        gone.offline_for_secs = 601;
+        assert_eq!(evaluate_check(&offline, &gone).passed(), Some(false));
+
+        // Script checks are decided by script results, never by telemetry.
+        let script = CheckKind::ScriptExitCode {
+            script_id: "scr-health".to_owned(),
+            expected_exit_code: 0,
+        };
+        assert_eq!(
+            evaluate_check(&script, &sample),
+            CheckVerdict::NotApplicable
+        );
+        assert_eq!(
+            evaluate_script_exit(&script, "scr-health", 0).passed(),
+            Some(true)
+        );
+        assert_eq!(
+            evaluate_script_exit(&script, "scr-health", 3).passed(),
+            Some(false)
+        );
+        assert_eq!(
+            evaluate_script_exit(&script, "scr-other", 0),
+            CheckVerdict::NotApplicable
+        );
+    }
+
+    #[test]
+    fn evaluator_snapshot_round_trips_through_json_and_keeps_streaks() {
+        let device_id = DeviceIdentity::generate().id();
+        let check = RmmCheck {
+            check_id: "cpu".to_owned(),
+            name: "CPU".to_owned(),
+            kind: CheckKind::CpuThreshold { max_percent: 90 },
+            severity: AlertSeverity::Warning,
+            failures_before_alert: 3,
+        };
+        let mut evaluator = CheckEvaluator::new();
+        // Two failures: streak of 2, no alert yet.
+        evaluator.record_sample(device_id, &check, false, None, 1);
+        evaluator.record_sample(device_id, &check, false, None, 2);
+        let snapshot = evaluator.snapshot();
+        assert_eq!(snapshot.alerts.len(), 0);
+        assert_eq!(
+            snapshot.failure_streaks,
+            vec![(device_id, "cpu".to_owned(), 2)]
+        );
+
+        let json = serde_json::to_string(&snapshot).unwrap();
+        let restored: CheckEvaluatorSnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored, snapshot);
+        let mut evaluator = CheckEvaluator::from_snapshot(restored);
+        // The third failure after the restart opens the alert: the streak survived.
+        let out = evaluator.record_sample(device_id, &check, false, None, 3);
+        assert_eq!(out.alert.map(|a| a.state), Some(AlertState::Open));
+        assert_eq!(evaluator.alerts().len(), 1);
+        assert!(evaluator.alert(device_id, "cpu").is_some());
+        evaluator.forget_device(device_id);
+        assert_eq!(evaluator.alerts().len(), 0);
+
+        let check_json = serde_json::to_string(&check).unwrap();
+        assert_eq!(
+            serde_json::from_str::<RmmCheck>(&check_json).unwrap(),
+            check
+        );
     }
 }

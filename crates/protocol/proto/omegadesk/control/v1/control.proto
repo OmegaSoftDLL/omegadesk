@@ -18,6 +18,11 @@ message ControlEnvelope {
     ControlError error = 8;
     QuickSupportLookupRequest quick_support_lookup_request = 9;
     QuickSupportLookupResponse quick_support_lookup_response = 10;
+    // RMM (Phase 6) rides the same connection. Numbers start at 100 so that
+    // concurrent additions to the control plane never collide.
+    InventoryReport inventory_report = 100;
+    ScriptDispatch script_dispatch = 101;
+    ScriptResult script_result = 102;
   }
 }
 
@@ -37,6 +42,12 @@ message EnrollRequest {
   // `NodeInfo.quicksupport_id`. QuickSupport enrollments are always ephemeral.
   // Empty for agents and clients.
   string quicksupport_id = 5;
+  // Deployment-link token (`odl_<link_id>_<mac hex>`) issued by
+  // `omegadesk-server admin links create`. The coordinator redeems it and
+  // enrolls the node with the pre-auth key bound to the link, so a technician
+  // installs the agent with one token and the device lands in the right
+  // tenant and site. Used only when `preauth_key` is empty.
+  string deployment_token = 100;
 }
 
 // A node in the network map. Keys are raw 32-byte Ed25519 / X25519 public keys.
@@ -181,4 +192,468 @@ enum ControlErrorCode {
   // A field of the request could not be parsed (bad key length, bad address,
   // malformed QuickSupport ID).
   CONTROL_ERROR_CODE_MALFORMED_REQUEST = 5;
+  CONTROL_ERROR_CODE_INVALID_DEPLOYMENT_TOKEN = 100;
+}
+
+// ---------------------------------------------------------------------------
+// RMM: inventory, heartbeat and scripts (Phase 6).
+//
+// Inventory follows MeshCentral `agents/meshcore.js` (`sysinfo`,
+// `computerIdentifiers`, `networkinfo`, `sendPeriodicServerUpdate`: a timer plus
+// "send only when the serialized object changed") and Remotely
+// `Agent/Services/DeviceInfoGenerator*.cs` (`DeviceHeartbeat` every 5 minutes
+// carrying the fields of `Shared/Entities/Device.cs`).
+// ---------------------------------------------------------------------------
+
+// Logical drive or mount point (Remotely `Drive.cs`).
+message DriveReport {
+  // Mount point or drive letter (`C:\`, `/`).
+  string name = 1;
+  // File system name (`NTFS`, `ext4`).
+  string filesystem = 2;
+  uint64 total_bytes = 3;
+  uint64 used_bytes = 4;
+}
+
+// Network interface that is up and has at least one address.
+message NicReport {
+  string name = 1;
+  // `aa:bb:cc:dd:ee:ff`, empty when the interface has no hardware address.
+  string mac_address = 2;
+  // IP addresses in CIDR form (`192.168.1.10/24`).
+  repeated string addresses = 3;
+}
+
+// Windows Update state read from the registry (MeshCentral `win-info.js`
+// `pendingReboot`). Counting pending updates needs a Windows Update Agent
+// search, which the agent does not run inside a heartbeat: `scanned` says
+// whether the counts are meaningful.
+message WindowsUpdateReport {
+  uint32 pending_security_updates = 1;
+  uint32 pending_optional_updates = 2;
+  bool reboot_required = 3;
+  // Unix time of the last successful update detection (registry `LastSuccessTime`).
+  uint64 last_scan_unix_secs = 4;
+  // Why a reboot is pending (`Component Based Servicing`, `Windows Update`, ...).
+  repeated string reboot_reasons = 5;
+  // Whether `pending_*` counts were computed on this host.
+  bool scanned = 6;
+}
+
+enum InventoryReason {
+  INVENTORY_REASON_UNSPECIFIED = 0;
+  // First report after (re-)enrollment.
+  INVENTORY_REASON_ENROLLMENT = 1;
+  // The inventory timer fired (`--inventory-interval-minutes`).
+  INVENTORY_REASON_PERIODIC = 2;
+  // A stable field changed (user logged on, drive appeared, OS updated).
+  INVENTORY_REASON_CHANGE = 3;
+}
+
+// Device inventory and heartbeat sent by the agent (node -> coordinator).
+message InventoryReport {
+  InventoryReason reason = 1;
+  uint64 collected_at_unix_secs = 2;
+  string hostname = 3;
+  // `Windows`, `Linux`, `macOS`.
+  string platform = 4;
+  // Human description (`Windows 11 Pro`, `Ubuntu 24.04`).
+  string os_description = 5;
+  // Version (`10.0.26200`, `24.04`).
+  string os_version = 6;
+  // Build or kernel (`26200.1234`, `6.8.0-45-generic`).
+  string os_build = 7;
+  // `x86_64`, `aarch64`.
+  string architecture = 8;
+  bool is_64_bit = 9;
+  string cpu_model = 10;
+  uint32 processor_count = 11;
+  uint32 cpu_utilization_pct = 12;
+  uint64 total_memory_bytes = 13;
+  uint64 used_memory_bytes = 14;
+  repeated DriveReport drives = 15;
+  repeated NicReport nics = 16;
+  // Interactive user (console or RDP session on Windows), empty when none.
+  string current_user = 17;
+  uint64 uptime_secs = 18;
+  string agent_version = 19;
+  WindowsUpdateReport windows_update = 20;
+  // Distinct executable names, sorted (feeds `ProcessRunning` checks).
+  repeated string running_processes = 21;
+  // Windows services in `SERVICE_RUNNING` state, sorted (feeds `ServiceRunning` checks).
+  repeated string running_services = 22;
+}
+
+// Interpreter for a script (Remotely `ScriptingShell.cs`).
+enum ScriptShell {
+  SCRIPT_SHELL_UNSPECIFIED = 0;
+  // Windows PowerShell (`powershell.exe`).
+  SCRIPT_SHELL_POWERSHELL = 1;
+  // PowerShell Core (`pwsh`).
+  SCRIPT_SHELL_PWSH = 2;
+  // POSIX shell (`bash` when present, otherwise `sh`).
+  SCRIPT_SHELL_SH = 3;
+  // Windows command prompt (`cmd.exe`).
+  SCRIPT_SHELL_CMD = 4;
+}
+
+// A script the coordinator asks the agent to run (coordinator -> node).
+message ScriptDispatch {
+  // Coordinator-assigned, unique per dispatch; echoed in `ScriptResult`.
+  uint64 run_id = 1;
+  string script_id = 2;
+  string name = 3;
+  ScriptShell shell = 4;
+  string content = 5;
+  // The agent kills the interpreter after this long (0 = agent default).
+  uint32 timeout_secs = 6;
+}
+
+// Outcome of a `ScriptDispatch` (node -> coordinator).
+message ScriptResult {
+  uint64 run_id = 1;
+  string script_id = 2;
+  int32 exit_code = 3;
+  // Captured output, each truncated by the agent to a bounded size.
+  string stdout = 4;
+  string stderr = 5;
+  uint64 started_at_unix_secs = 6;
+  uint32 duration_ms = 7;
+  bool timed_out = 8;
+  // The interpreter could not be started; `error` says why.
+  bool failed_to_start = 9;
+  string error = 10;
+}
+
+// ---------------------------------------------------------------------------
+// Local administration API served by `omegadesk-server` on a loopback socket
+// (Headscale serves its CLI over a unix socket, `cmd/headscale/cli/utils.go`
+// `newSocketClient`). One length-prefixed `AdminRequest` per connection,
+// answered by one `AdminResponse`; `token` must match the server's admin token.
+// ---------------------------------------------------------------------------
+
+message AdminRequest {
+  string token = 1;
+  oneof request {
+    ListDevicesRequest list_devices = 10;
+    ShowDeviceRequest show_device = 11;
+    UpdateDeviceRequest update_device = 12;
+    ListAlertsRequest list_alerts = 13;
+    ListScriptsRequest list_scripts = 14;
+    SaveScriptRequest save_script = 15;
+    RunScriptRequest run_script = 16;
+    AddScheduleRequest add_schedule = 17;
+    ListSchedulesRequest list_schedules = 18;
+    ListScriptResultsRequest list_script_results = 19;
+    AddCheckRequest add_check = 20;
+    ListChecksRequest list_checks = 21;
+    CreateDeploymentLinkRequest create_deployment_link = 22;
+    CreatePreauthKeyRequest create_preauth_key = 23;
+    AddAlertTemplateRequest add_alert_template = 24;
+  }
+}
+
+message AdminResponse {
+  oneof response {
+    AdminError error = 1;
+    DeviceList devices = 10;
+    DeviceDetail device = 11;
+    AlertList alerts = 13;
+    ScriptList scripts = 14;
+    SavedScriptInfo script = 15;
+    RunScriptResponse run = 16;
+    ScheduleInfo schedule = 17;
+    ScheduleList schedules = 18;
+    ScriptResultList script_results = 19;
+    CheckInfo check = 20;
+    CheckList checks = 21;
+    DeploymentLinkInfo deployment_link = 22;
+    PreauthKeyInfo preauth_key = 23;
+    AlertTemplateInfo alert_template = 24;
+  }
+}
+
+message AdminError {
+  string message = 1;
+}
+
+message ListDevicesRequest {
+  // Restrict to one tenant (empty = all).
+  string tenant = 1;
+}
+
+// Device liveness as derived from heartbeats (Tactical RMM `Agent.status`:
+// online / offline / overdue thresholds on `last_seen`, idea only).
+enum DeviceStatus {
+  DEVICE_STATUS_UNSPECIFIED = 0;
+  DEVICE_STATUS_ONLINE = 1;
+  DEVICE_STATUS_OFFLINE = 2;
+  // Connected but the heartbeat is late.
+  DEVICE_STATUS_OVERDUE = 3;
+}
+
+message DeviceSummary {
+  string device_id = 1;
+  string tenant = 2;
+  string site_id = 3;
+  string hostname = 4;
+  string alias = 5;
+  string platform = 6;
+  string os_description = 7;
+  DeviceStatus status = 8;
+  uint64 last_seen_unix_secs = 9;
+  uint32 cpu_pct = 10;
+  uint32 memory_pct = 11;
+  uint32 storage_pct = 12;
+  uint32 open_alerts = 13;
+  string agent_version = 14;
+  string current_user = 15;
+}
+
+message DeviceList {
+  repeated DeviceSummary devices = 1;
+}
+
+message ShowDeviceRequest {
+  // Device id, hostname or alias.
+  string device = 1;
+}
+
+message DeviceDetail {
+  DeviceSummary summary = 1;
+  InventoryReport inventory = 2;
+  repeated AlertInfo alerts = 3;
+  repeated ScriptResultInfo recent_results = 4;
+  // Script ids queued for the next connection (`run_on_next_connect`).
+  repeated string queued_scripts = 5;
+}
+
+message UpdateDeviceRequest {
+  string device = 1;
+  // Empty strings leave the field unchanged; `-` clears it.
+  string site_id = 2;
+  string alias = 3;
+}
+
+message ListAlertsRequest {
+  // Include resolved alerts.
+  bool include_resolved = 1;
+}
+
+message AlertInfo {
+  string alert_id = 1;
+  string device_id = 2;
+  string hostname = 3;
+  string check_id = 4;
+  string check_name = 5;
+  string severity = 6;
+  // `open` or `resolved`.
+  string state = 7;
+  uint32 consecutive_failures = 8;
+  uint64 opened_at_unix_secs = 9;
+  uint64 resolved_at_unix_secs = 10;
+  // Last evaluation detail (`disk C:\ 93% > 85%`).
+  string detail = 11;
+  // Template actions executed on the last transition.
+  repeated string actions = 12;
+}
+
+message AlertList {
+  repeated AlertInfo alerts = 1;
+}
+
+message ListScriptsRequest {}
+
+message SavedScriptInfo {
+  string script_id = 1;
+  string name = 2;
+  ScriptShell shell = 3;
+  string content = 4;
+}
+
+message ScriptList {
+  repeated SavedScriptInfo scripts = 1;
+}
+
+message SaveScriptRequest {
+  // Empty = derive one from the name.
+  string script_id = 1;
+  string name = 2;
+  ScriptShell shell = 3;
+  string content = 4;
+}
+
+message RunScriptRequest {
+  // Device id, hostname or alias.
+  string device = 1;
+  // Saved script to run; when empty, `shell` + `content` run ad hoc.
+  string script_id = 2;
+  ScriptShell shell = 3;
+  string content = 4;
+  uint32 timeout_secs = 5;
+}
+
+message RunScriptResponse {
+  string device_id = 1;
+  // Zero when the script was queued for the device's next connection.
+  uint64 run_id = 2;
+  bool queued = 3;
+}
+
+enum ScheduleInterval {
+  SCHEDULE_INTERVAL_UNSPECIFIED = 0;
+  SCHEDULE_INTERVAL_HOURLY = 1;
+  SCHEDULE_INTERVAL_DAILY = 2;
+  SCHEDULE_INTERVAL_WEEKLY = 3;
+  SCHEDULE_INTERVAL_MONTHLY = 4;
+}
+
+message AddScheduleRequest {
+  string schedule_id = 1;
+  string name = 2;
+  string tenant = 3;
+  string script_id = 4;
+  ScheduleInterval interval = 5;
+  // First run (0 = now).
+  uint64 start_at_unix_secs = 6;
+  bool run_on_next_connect = 7;
+  repeated string device_ids = 8;
+  repeated string site_ids = 9;
+}
+
+message ScheduleInfo {
+  string schedule_id = 1;
+  string name = 2;
+  string tenant = 3;
+  string script_id = 4;
+  ScheduleInterval interval = 5;
+  uint64 next_run_unix_secs = 6;
+  uint64 last_run_unix_secs = 7;
+  bool run_on_next_connect = 8;
+  repeated string device_ids = 9;
+  repeated string site_ids = 10;
+}
+
+message ListSchedulesRequest {}
+
+message ScheduleList {
+  repeated ScheduleInfo schedules = 1;
+}
+
+message ListScriptResultsRequest {
+  // Device id, hostname or alias (empty = all devices).
+  string device = 1;
+  uint32 limit = 2;
+}
+
+message ScriptResultInfo {
+  string device_id = 1;
+  string hostname = 2;
+  ScriptResult result = 3;
+  uint64 received_at_unix_secs = 4;
+}
+
+message ScriptResultList {
+  repeated ScriptResultInfo results = 1;
+}
+
+enum CheckKind {
+  CHECK_KIND_UNSPECIFIED = 0;
+  CHECK_KIND_CPU = 1;
+  CHECK_KIND_MEMORY = 2;
+  CHECK_KIND_DISK = 3;
+  CHECK_KIND_PROCESS_RUNNING = 4;
+  CHECK_KIND_SERVICE_RUNNING = 5;
+  CHECK_KIND_SCRIPT_EXIT_CODE = 6;
+  CHECK_KIND_OFFLINE = 7;
+}
+
+enum CheckSeverity {
+  CHECK_SEVERITY_UNSPECIFIED = 0;
+  CHECK_SEVERITY_INFO = 1;
+  CHECK_SEVERITY_WARNING = 2;
+  CHECK_SEVERITY_CRITICAL = 3;
+}
+
+// Declarative health check (`omegadesk-policy` `RmmCheck`), attached to a
+// tenant, a site or a device layer of the inheritable policy.
+message CheckInfo {
+  string check_id = 1;
+  string name = 2;
+  CheckKind kind = 3;
+  // CPU, memory, disk: maximum percentage.
+  uint32 max_percent = 4;
+  // Disk mount point, process name, service name or script id.
+  string target = 5;
+  int32 expected_exit_code = 6;
+  uint64 max_offline_secs = 7;
+  CheckSeverity severity = 8;
+  uint32 failures_before_alert = 9;
+  // Policy layer: tenant (required) and optionally site or device.
+  string tenant = 10;
+  string site_id = 11;
+  string device_id = 12;
+}
+
+message AddCheckRequest {
+  CheckInfo check = 1;
+}
+
+message ListChecksRequest {}
+
+message CheckList {
+  repeated CheckInfo checks = 1;
+}
+
+message CreateDeploymentLinkRequest {
+  string tenant = 1;
+  string site_id = 2;
+  uint64 expires_in_secs = 3;
+  // 0 = unlimited.
+  uint32 max_uses = 4;
+  repeated string tags = 5;
+  bool ephemeral = 6;
+}
+
+message DeploymentLinkInfo {
+  string link_id = 1;
+  // `odl_<link_id>_<mac hex>`: the value for `omegadesk-agent --deployment-token`.
+  string token = 2;
+  string tenant = 3;
+  string site_id = 4;
+  uint64 expires_at_unix_secs = 5;
+  uint32 max_uses = 6;
+}
+
+message CreatePreauthKeyRequest {
+  string tenant = 1;
+  bool reusable = 2;
+  bool ephemeral = 3;
+  repeated string tags = 4;
+  // 0 = never expires.
+  uint64 expires_in_secs = 5;
+}
+
+message PreauthKeyInfo {
+  string key = 1;
+}
+
+// Alert template of a tenant: saved scripts to run when any check of that
+// tenant opens or resolves an alert (`omegadesk-policy` `AlertTemplate`).
+message AddAlertTemplateRequest {
+  string template_id = 1;
+  string name = 2;
+  string tenant = 3;
+  // Saved script dispatched to the device when an alert opens (empty = none).
+  string on_failure_script_id = 4;
+  // Saved script dispatched to the device when an alert resolves (empty = none).
+  string on_resolution_script_id = 5;
+}
+
+message AlertTemplateInfo {
+  string template_id = 1;
+  string name = 2;
+  string tenant = 3;
+  repeated string on_failure_actions = 4;
+  repeated string on_resolution_actions = 5;
 }

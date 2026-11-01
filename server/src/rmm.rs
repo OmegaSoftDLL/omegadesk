@@ -31,9 +31,32 @@ use std::sync::Arc;
 use bytes::{BufMut, Bytes, BytesMut};
 use data_encoding::{HEXLOWER, HEXLOWER_PERMISSIVE};
 use omegadesk_identity::DeviceId;
+use omegadesk_protocol::control::v1 as control;
 use ring::hmac;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
+
+/// Prefix of a deployment-link token: `odl_<link_id>_<mac hex>`.
+pub const DEPLOYMENT_TOKEN_PREFIX: &str = "odl";
+
+/// Formats the bearer token an installer passes as `--deployment-token`.
+#[must_use]
+pub fn format_deployment_token(link: &SiteDeploymentLink) -> String {
+    format!(
+        "{DEPLOYMENT_TOKEN_PREFIX}_{}_{}",
+        link.link_id, link.token_hex
+    )
+}
+
+/// Splits `odl_<link_id>_<mac hex>` into `(link_id, mac hex)`.
+#[must_use]
+pub fn parse_deployment_token(token: &str) -> Option<(&str, &str)> {
+    let rest = token.trim().strip_prefix(DEPLOYMENT_TOKEN_PREFIX)?;
+    let rest = rest.strip_prefix('_')?;
+    let (link_id, mac) = rest.split_once('_')?;
+    (!link_id.is_empty() && !mac.is_empty()).then_some((link_id, mac))
+}
 
 /// Default block size in bytes for chunked agent binary updates (`16 KiB`, `meshagent.js` line 315).
 pub const DEFAULT_AGENT_UPDATE_BLOCK_SIZE: usize = 16_384;
@@ -58,7 +81,7 @@ pub const CMD_AGENT_DOWNLOAD: u16 = 13;
 pub const CMD_AGENT_BINARY_BLOCK: u16 = 14;
 
 /// Errors returned by RMM subsystems.
-#[derive(Debug, Error, PartialEq, Eq)]
+#[derive(Debug, Clone, Error, PartialEq, Eq)]
 pub enum RmmError {
     /// Deployment link does not exist, has expired, or exhausted its enrollment quota.
     #[error("invalid or expired site deployment link: {0}")]
@@ -77,14 +100,28 @@ pub enum RmmError {
 }
 
 /// Logical drive or mount point capacity reported in [`DeviceInventory`] (`Device.cs` line 37).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DriveInventory {
     /// Drive name or mount point (e.g. `"C:\\"` or `"/"`).
     pub name: String,
+    /// File system (`NTFS`, `ext4`); empty when unknown.
+    #[serde(default)]
+    pub filesystem: String,
     /// Total capacity in bytes.
     pub total_bytes: u64,
     /// Used capacity in bytes.
     pub used_bytes: u64,
+}
+
+/// Network interface reported in [`DeviceInventory`] (MeshCentral `networkinfo`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NicInventory {
+    /// Interface name (`Ethernet`, `eth0`).
+    pub name: String,
+    /// `aa:bb:cc:dd:ee:ff`, empty when the interface has none.
+    pub mac_address: String,
+    /// Addresses in CIDR form.
+    pub addresses: Vec<String>,
 }
 
 impl DriveInventory {
@@ -101,7 +138,7 @@ impl DriveInventory {
 }
 
 /// OS patch and Windows Update telemetry attached to [`DeviceInventory`] (`docs/plan.md` §2.8 line 126).
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct WindowsUpdateStatus {
     /// Count of pending critical or security updates.
     pub pending_security_updates: u32,
@@ -111,11 +148,42 @@ pub struct WindowsUpdateStatus {
     pub reboot_required: bool,
     /// Unix timestamp (seconds) of the last update scan.
     pub last_scan_unix_secs: u64,
+    /// Why a reboot is pending (MeshCentral `win-info.js` `pendingReboot` reasons).
+    #[serde(default)]
+    pub reboot_reasons: Vec<String>,
+    /// Whether the pending counts were computed on the host.
+    #[serde(default)]
+    pub scanned: bool,
+}
+
+impl WindowsUpdateStatus {
+    fn from_proto(report: &control::WindowsUpdateReport) -> Self {
+        Self {
+            pending_security_updates: report.pending_security_updates,
+            pending_optional_updates: report.pending_optional_updates,
+            reboot_required: report.reboot_required,
+            last_scan_unix_secs: report.last_scan_unix_secs,
+            reboot_reasons: report.reboot_reasons.clone(),
+            scanned: report.scanned,
+        }
+    }
+
+    fn to_proto(&self) -> control::WindowsUpdateReport {
+        control::WindowsUpdateReport {
+            pending_security_updates: self.pending_security_updates,
+            pending_optional_updates: self.pending_optional_updates,
+            reboot_required: self.reboot_required,
+            last_scan_unix_secs: self.last_scan_unix_secs,
+            reboot_reasons: self.reboot_reasons.clone(),
+            scanned: self.scanned,
+        }
+    }
 }
 
 /// Complete device hardware, OS, storage, and custom-field inventory ported from
-/// `immense_Remotely/Shared/Entities/Device.cs` (lines 9–134).
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// `immense_Remotely/Shared/Entities/Device.cs` (lines 9–134), filled from the agent's
+/// [`control::InventoryReport`] heartbeats.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeviceInventory {
     /// Cryptographic device identity.
     pub device_id: DeviceId,
@@ -135,8 +203,17 @@ pub struct DeviceInventory {
     pub os_architecture: String,
     /// OS build description (`OSDescription` in `Device.cs` line 63).
     pub os_description: String,
+    /// OS version (`10.0.26200`, `24.04`).
+    #[serde(default)]
+    pub os_version: String,
+    /// OS build or kernel (`26200.1234`, `6.8.0-45-generic`).
+    #[serde(default)]
+    pub os_build: String,
     /// Whether the OS is 64-bit (`Is64Bit` in `Device.cs` line 42).
     pub is_64_bit: bool,
+    /// CPU model string.
+    #[serde(default)]
+    pub cpu_model: String,
     /// Logical processor count (`ProcessorCount` in `Device.cs` line 71).
     pub processor_count: u32,
     /// CPU utilization percentage (`0..=100`, `CpuUtilization` in `Device.cs` line 25).
@@ -147,10 +224,22 @@ pub struct DeviceInventory {
     pub total_memory_bytes: u64,
     /// Attached storage drives (`Drives` in `Device.cs` line 37).
     pub drives: Vec<DriveInventory>,
-    /// Hardware MAC addresses (`MacAddresses` in `Device.cs` line 50).
+    /// Network interfaces (MeshCentral `networkinfo`).
+    #[serde(default)]
+    pub nics: Vec<NicInventory>,
+    /// Hardware MAC addresses (`MacAddresses` in `Device.cs` line 50), derived from `nics`.
     pub mac_addresses: Vec<String>,
     /// Currently logged-in interactive user (`CurrentUser` in `Device.cs` line 29).
     pub current_user: Option<String>,
+    /// Seconds since boot at collection time.
+    #[serde(default)]
+    pub uptime_secs: u64,
+    /// Distinct running executable names (sorted).
+    #[serde(default)]
+    pub running_processes: Vec<String>,
+    /// Running Windows services (sorted).
+    #[serde(default)]
+    pub running_services: Vec<String>,
     /// Operator-defined custom fields (`docs/plan.md` §2.8 line 126).
     pub custom_fields: HashMap<String, String>,
     /// Patch and Windows Update status (`docs/plan.md` §2.8 line 126).
@@ -159,9 +248,169 @@ pub struct DeviceInventory {
     pub is_online: bool,
     /// Unix timestamp (seconds) when the agent was last seen (`LastOnline` in `Device.cs` line 47).
     pub last_online_unix_secs: u64,
+    /// Unix timestamp (seconds) of the last inventory report (0 = none yet).
+    #[serde(default)]
+    pub collected_at_unix_secs: u64,
+    /// Unix timestamp (seconds) of the first enrollment seen by the RMM service.
+    #[serde(default)]
+    pub first_seen_unix_secs: u64,
 }
 
 impl DeviceInventory {
+    /// An inventory with identity and tenant only; every other field waits for the first
+    /// [`control::InventoryReport`].
+    #[must_use]
+    pub fn new(device_id: DeviceId, tenant_id: impl Into<String>) -> Self {
+        Self {
+            device_id,
+            tenant_id: tenant_id.into(),
+            site_id: None,
+            device_name: String::new(),
+            alias: None,
+            agent_version: String::new(),
+            platform: String::new(),
+            os_architecture: String::new(),
+            os_description: String::new(),
+            os_version: String::new(),
+            os_build: String::new(),
+            is_64_bit: false,
+            cpu_model: String::new(),
+            processor_count: 0,
+            cpu_utilization_pct: 0,
+            used_memory_bytes: 0,
+            total_memory_bytes: 0,
+            drives: Vec::new(),
+            nics: Vec::new(),
+            mac_addresses: Vec::new(),
+            current_user: None,
+            uptime_secs: 0,
+            running_processes: Vec::new(),
+            running_services: Vec::new(),
+            custom_fields: HashMap::new(),
+            windows_update: WindowsUpdateStatus::default(),
+            is_online: false,
+            last_online_unix_secs: 0,
+            collected_at_unix_secs: 0,
+            first_seen_unix_secs: 0,
+        }
+    }
+
+    /// Merges an agent heartbeat into this record. Operator-owned fields (`site_id`, `alias`,
+    /// `custom_fields`) are never touched by the agent.
+    pub fn apply_report(&mut self, report: &control::InventoryReport, now_unix_secs: u64) {
+        if !report.hostname.is_empty() {
+            self.device_name.clone_from(&report.hostname);
+        }
+        self.agent_version.clone_from(&report.agent_version);
+        self.platform.clone_from(&report.platform);
+        self.os_architecture.clone_from(&report.architecture);
+        self.os_description.clone_from(&report.os_description);
+        self.os_version.clone_from(&report.os_version);
+        self.os_build.clone_from(&report.os_build);
+        self.is_64_bit = report.is_64_bit;
+        self.cpu_model.clone_from(&report.cpu_model);
+        self.processor_count = report.processor_count;
+        self.cpu_utilization_pct = u8::try_from(report.cpu_utilization_pct.min(100)).unwrap_or(100);
+        self.used_memory_bytes = report.used_memory_bytes;
+        self.total_memory_bytes = report.total_memory_bytes;
+        self.drives = report
+            .drives
+            .iter()
+            .map(|d| DriveInventory {
+                name: d.name.clone(),
+                filesystem: d.filesystem.clone(),
+                total_bytes: d.total_bytes,
+                used_bytes: d.used_bytes.min(d.total_bytes),
+            })
+            .collect();
+        self.nics = report
+            .nics
+            .iter()
+            .map(|n| NicInventory {
+                name: n.name.clone(),
+                mac_address: n.mac_address.clone(),
+                addresses: n.addresses.clone(),
+            })
+            .collect();
+        self.mac_addresses = self
+            .nics
+            .iter()
+            .filter(|n| !n.mac_address.is_empty())
+            .map(|n| n.mac_address.clone())
+            .collect();
+        self.current_user = (!report.current_user.is_empty()).then(|| report.current_user.clone());
+        self.uptime_secs = report.uptime_secs;
+        self.running_processes.clone_from(&report.running_processes);
+        self.running_services.clone_from(&report.running_services);
+        self.windows_update = report
+            .windows_update
+            .as_ref()
+            .map(WindowsUpdateStatus::from_proto)
+            .unwrap_or_default();
+        self.is_online = true;
+        self.last_online_unix_secs = now_unix_secs;
+        self.collected_at_unix_secs = if report.collected_at_unix_secs == 0 {
+            now_unix_secs
+        } else {
+            report.collected_at_unix_secs
+        };
+    }
+
+    /// Rebuilds the last report from the stored record (for operators reading the inventory).
+    #[must_use]
+    pub fn to_report(&self) -> control::InventoryReport {
+        control::InventoryReport {
+            reason: control::InventoryReason::Unspecified as i32,
+            collected_at_unix_secs: self.collected_at_unix_secs,
+            hostname: self.device_name.clone(),
+            platform: self.platform.clone(),
+            os_description: self.os_description.clone(),
+            os_version: self.os_version.clone(),
+            os_build: self.os_build.clone(),
+            architecture: self.os_architecture.clone(),
+            is_64_bit: self.is_64_bit,
+            cpu_model: self.cpu_model.clone(),
+            processor_count: self.processor_count,
+            cpu_utilization_pct: u32::from(self.cpu_utilization_pct),
+            total_memory_bytes: self.total_memory_bytes,
+            used_memory_bytes: self.used_memory_bytes,
+            drives: self
+                .drives
+                .iter()
+                .map(|d| control::DriveReport {
+                    name: d.name.clone(),
+                    filesystem: d.filesystem.clone(),
+                    total_bytes: d.total_bytes,
+                    used_bytes: d.used_bytes,
+                })
+                .collect(),
+            nics: self
+                .nics
+                .iter()
+                .map(|n| control::NicReport {
+                    name: n.name.clone(),
+                    mac_address: n.mac_address.clone(),
+                    addresses: n.addresses.clone(),
+                })
+                .collect(),
+            current_user: self.current_user.clone().unwrap_or_default(),
+            uptime_secs: self.uptime_secs,
+            agent_version: self.agent_version.clone(),
+            windows_update: Some(self.windows_update.to_proto()),
+            running_processes: self.running_processes.clone(),
+            running_services: self.running_services.clone(),
+        }
+    }
+
+    /// `(mount point, used percent)` per drive, the shape checks evaluate.
+    #[must_use]
+    pub fn disk_usage(&self) -> Vec<(String, u8)> {
+        self.drives
+            .iter()
+            .map(|d| (d.name.clone(), d.used_percent()))
+            .collect()
+    }
+
     /// Returns used memory percentage (`0..=100`), matching `UsedMemoryPercent` in
     /// `Device.cs` lines 105–115 (`TotalMemory == 0 ? 0 : UsedMemory / TotalMemory`).
     #[must_use]
@@ -188,7 +437,7 @@ impl DeviceInventory {
 }
 
 /// Scripting shell interpreter ported from `immense_Remotely/Shared/Enums/ScriptingShell.cs`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ScriptingShell {
     /// Cross-platform `PowerShell` Core (`pwsh`, `ScriptingShell.PSCore`).
     PsCore,
@@ -200,9 +449,46 @@ pub enum ScriptingShell {
     Cmd,
 }
 
+impl ScriptingShell {
+    /// Wire representation.
+    #[must_use]
+    pub const fn to_proto(self) -> control::ScriptShell {
+        match self {
+            Self::PsCore => control::ScriptShell::Pwsh,
+            Self::WinPs => control::ScriptShell::Powershell,
+            Self::Bash => control::ScriptShell::Sh,
+            Self::Cmd => control::ScriptShell::Cmd,
+        }
+    }
+
+    /// Parses the wire representation (`None` for `UNSPECIFIED`).
+    #[must_use]
+    pub fn from_proto(shell: control::ScriptShell) -> Option<Self> {
+        match shell {
+            control::ScriptShell::Pwsh => Some(Self::PsCore),
+            control::ScriptShell::Powershell => Some(Self::WinPs),
+            control::ScriptShell::Sh => Some(Self::Bash),
+            control::ScriptShell::Cmd => Some(Self::Cmd),
+            control::ScriptShell::Unspecified => None,
+        }
+    }
+
+    /// Parses the operator spelling (`powershell`, `pwsh`, `sh`/`bash`, `cmd`).
+    #[must_use]
+    pub fn parse(name: &str) -> Option<Self> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "powershell" | "winps" | "ps" => Some(Self::WinPs),
+            "pwsh" | "pscore" => Some(Self::PsCore),
+            "sh" | "bash" | "shell" => Some(Self::Bash),
+            "cmd" | "bat" => Some(Self::Cmd),
+            _ => None,
+        }
+    }
+}
+
 /// Recurrence interval for a [`ScriptSchedule`], ported from `Remotely` `RepeatInterval`
 /// (`ScriptScheduleDispatcher.cs` lines 127–146).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RepeatInterval {
     /// Every hour (`3600 s`).
     Hourly,
@@ -293,7 +579,7 @@ pub fn add_calendar_months(start_unix_secs: u64, months: u32) -> u64 {
 }
 
 /// Saved script definition stored in the RMM library (`SavedScript.cs`).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SavedScript {
     /// Unique script identifier.
     pub script_id: String,
@@ -306,7 +592,7 @@ pub struct SavedScript {
 }
 
 /// Recurring script schedule ported from `immense_Remotely/Shared/Entities/ScriptSchedule.cs` (lines 7–44).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScriptSchedule {
     /// Unique schedule ID.
     pub schedule_id: String,
@@ -386,7 +672,7 @@ pub struct ScriptRun {
 
 /// Stateful script scheduler ported from `immense_Remotely/Server/Services/ScriptScheduler.cs`
 /// and `ScriptScheduleDispatcher.cs`.
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ScriptScheduler {
     schedules: Vec<ScriptSchedule>,
     next_run_id: u64,
@@ -400,9 +686,35 @@ impl ScriptScheduler {
         Self::default()
     }
 
-    /// Registers a [`ScriptSchedule`].
+    /// Registers a [`ScriptSchedule`], replacing one with the same `schedule_id`.
     pub fn add_schedule(&mut self, schedule: ScriptSchedule) {
+        self.schedules
+            .retain(|s| s.schedule_id != schedule.schedule_id);
         self.schedules.push(schedule);
+    }
+
+    /// Registered schedules.
+    #[must_use]
+    pub fn schedules(&self) -> &[ScriptSchedule] {
+        &self.schedules
+    }
+
+    /// Queues `script_id` for `device_id`'s next connection (an ad-hoc run requested while
+    /// the device is offline, Remotely `ScriptRun.RunOnNextConnect`). Duplicates are kept out.
+    pub fn queue_script_for_device(&mut self, device_id: DeviceId, script_id: impl Into<String>) {
+        let script_id = script_id.into();
+        let queue = self.pending_offline_runs.entry(device_id).or_default();
+        if !queue.contains(&script_id) {
+            queue.push(script_id);
+        }
+    }
+
+    /// Script IDs waiting for `device_id` to reconnect.
+    #[must_use]
+    pub fn queued_scripts_for_device(&self, device_id: DeviceId) -> &[String] {
+        self.pending_offline_runs
+            .get(&device_id)
+            .map_or(&[], Vec::as_slice)
     }
 
     /// Evaluates all registered schedules at `now_unix_secs`, resolving the union of direct
@@ -486,7 +798,7 @@ impl ScriptScheduler {
 
 /// Per-site agent deployment link with an expiring HMAC-SHA256 token and enrollment quota
 /// (`docs/plan.md` §2.8 line 125 & §4 Phase 6).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SiteDeploymentLink {
     /// Unique deployment link ID.
     pub link_id: String,
@@ -520,6 +832,29 @@ impl DeploymentLinkManager {
         Self {
             signing_key: hmac::Key::new(hmac::HMAC_SHA256, signing_key_material),
             links: HashMap::new(),
+        }
+    }
+
+    /// Every issued link (for persistence); use [`Self::restore_links`] to load them back
+    /// into a manager built with the same key material.
+    #[must_use]
+    pub fn links(&self) -> Vec<SiteDeploymentLink> {
+        let mut out: Vec<SiteDeploymentLink> = self.links.values().cloned().collect();
+        out.sort_by(|a, b| a.link_id.cmp(&b.link_id));
+        out
+    }
+
+    /// Looks up a link by id.
+    #[must_use]
+    pub fn link(&self, link_id: &str) -> Option<&SiteDeploymentLink> {
+        self.links.get(link_id)
+    }
+
+    /// Loads previously issued links; their tags keep verifying only if the key material
+    /// is the one they were signed with.
+    pub fn restore_links(&mut self, links: Vec<SiteDeploymentLink>) {
+        for link in links {
+            self.links.insert(link.link_id.clone(), link);
         }
     }
 
@@ -1029,67 +1364,53 @@ mod tests {
         let dev_offline = DeviceIdentity::generate().id();
 
         let mut inventories = HashMap::new();
-        inventories.insert(
-            dev_online,
-            DeviceInventory {
-                device_id: dev_online,
-                tenant_id: "tenant-1".to_owned(),
-                site_id: Some("site-hq".to_owned()),
-                device_name: "srv-web-01".to_owned(),
-                alias: None,
-                agent_version: "0.1.0".to_owned(),
-                platform: "Linux".to_owned(),
-                os_architecture: "x86_64".to_owned(),
-                os_description: "Ubuntu 24.04".to_owned(),
-                is_64_bit: true,
-                processor_count: 8,
-                cpu_utilization_pct: 25,
-                used_memory_bytes: 4_000,
-                total_memory_bytes: 16_000,
-                drives: vec![DriveInventory {
-                    name: "/".to_owned(),
-                    total_bytes: 100_000,
-                    used_bytes: 40_000,
-                }],
-                mac_addresses: vec!["00:11:22:33:44:55".to_owned()],
-                current_user: Some("root".to_owned()),
-                custom_fields: HashMap::from([("asset_tag".to_owned(), "HQ-001".to_owned())]),
-                windows_update: WindowsUpdateStatus::default(),
-                is_online: true,
-                last_online_unix_secs: 1_000,
-            },
-        );
-        inventories.insert(
-            dev_offline,
-            DeviceInventory {
-                device_id: dev_offline,
-                tenant_id: "tenant-1".to_owned(),
-                site_id: Some("site-hq".to_owned()),
-                device_name: "wks-fin-02".to_owned(),
-                alias: None,
-                agent_version: "0.1.0".to_owned(),
-                platform: "Windows".to_owned(),
-                os_architecture: "x86_64".to_owned(),
-                os_description: "Windows 11 Pro".to_owned(),
-                is_64_bit: true,
-                processor_count: 12,
-                cpu_utilization_pct: 10,
-                used_memory_bytes: 8_000,
-                total_memory_bytes: 16_000,
-                drives: Vec::new(),
-                mac_addresses: Vec::new(),
-                current_user: None,
-                custom_fields: HashMap::new(),
-                windows_update: WindowsUpdateStatus {
-                    pending_security_updates: 2,
-                    pending_optional_updates: 0,
-                    reboot_required: true,
-                    last_scan_unix_secs: 900,
-                },
-                is_online: false,
-                last_online_unix_secs: 900,
-            },
-        );
+        let mut online = DeviceInventory::new(dev_online, "tenant-1");
+        online.site_id = Some("site-hq".to_owned());
+        online.device_name = "srv-web-01".to_owned();
+        online.agent_version = "0.1.0".to_owned();
+        online.platform = "Linux".to_owned();
+        online.os_architecture = "x86_64".to_owned();
+        online.os_description = "Ubuntu 24.04".to_owned();
+        online.is_64_bit = true;
+        online.processor_count = 8;
+        online.cpu_utilization_pct = 25;
+        online.used_memory_bytes = 4_000;
+        online.total_memory_bytes = 16_000;
+        online.drives = vec![DriveInventory {
+            name: "/".to_owned(),
+            filesystem: "ext4".to_owned(),
+            total_bytes: 100_000,
+            used_bytes: 40_000,
+        }];
+        online.mac_addresses = vec!["00:11:22:33:44:55".to_owned()];
+        online.current_user = Some("root".to_owned());
+        online.custom_fields = HashMap::from([("asset_tag".to_owned(), "HQ-001".to_owned())]);
+        online.is_online = true;
+        online.last_online_unix_secs = 1_000;
+        inventories.insert(dev_online, online);
+
+        let mut offline = DeviceInventory::new(dev_offline, "tenant-1");
+        offline.site_id = Some("site-hq".to_owned());
+        offline.device_name = "wks-fin-02".to_owned();
+        offline.agent_version = "0.1.0".to_owned();
+        offline.platform = "Windows".to_owned();
+        offline.os_architecture = "x86_64".to_owned();
+        offline.os_description = "Windows 11 Pro".to_owned();
+        offline.is_64_bit = true;
+        offline.processor_count = 12;
+        offline.cpu_utilization_pct = 10;
+        offline.used_memory_bytes = 8_000;
+        offline.total_memory_bytes = 16_000;
+        offline.windows_update = WindowsUpdateStatus {
+            pending_security_updates: 2,
+            pending_optional_updates: 0,
+            reboot_required: true,
+            last_scan_unix_secs: 900,
+            reboot_reasons: vec!["Windows Update".to_owned()],
+            scanned: true,
+        };
+        offline.last_online_unix_secs = 900;
+        inventories.insert(dev_offline, offline);
 
         assert_eq!(inventories[&dev_online].used_memory_percent(), 25);
         assert_eq!(inventories[&dev_online].used_storage_percent(), 40);
@@ -1125,29 +1446,199 @@ mod tests {
         site_id: Option<&str>,
         is_online: bool,
     ) -> DeviceInventory {
-        DeviceInventory {
-            device_id,
-            tenant_id: tenant_id.to_owned(),
-            site_id: site_id.map(str::to_owned),
-            device_name: "host".to_owned(),
-            alias: None,
-            agent_version: "0.1.0".to_owned(),
-            platform: "Linux".to_owned(),
-            os_architecture: "x86_64".to_owned(),
-            os_description: "Debian 13".to_owned(),
+        let mut inventory = DeviceInventory::new(device_id, tenant_id);
+        inventory.site_id = site_id.map(str::to_owned);
+        inventory.device_name = "host".to_owned();
+        inventory.agent_version = "0.1.0".to_owned();
+        inventory.platform = "Linux".to_owned();
+        inventory.os_architecture = "x86_64".to_owned();
+        inventory.os_description = "Debian 13".to_owned();
+        inventory.is_64_bit = true;
+        inventory.processor_count = 4;
+        inventory.is_online = is_online;
+        inventory
+    }
+
+    fn sample_report() -> control::InventoryReport {
+        control::InventoryReport {
+            reason: control::InventoryReason::Enrollment as i32,
+            collected_at_unix_secs: 1_700_000_000,
+            hostname: "WKS-FIN-02".to_owned(),
+            platform: "Windows".to_owned(),
+            os_description: "Windows 11 Pro".to_owned(),
+            os_version: "10.0.26200".to_owned(),
+            os_build: "26200.1234".to_owned(),
+            architecture: "x86_64".to_owned(),
             is_64_bit: true,
-            processor_count: 4,
-            cpu_utilization_pct: 0,
-            used_memory_bytes: 0,
-            total_memory_bytes: 0,
-            drives: Vec::new(),
-            mac_addresses: Vec::new(),
-            current_user: None,
-            custom_fields: HashMap::new(),
-            windows_update: WindowsUpdateStatus::default(),
-            is_online,
-            last_online_unix_secs: 0,
+            cpu_model: "Intel Core i7".to_owned(),
+            processor_count: 12,
+            cpu_utilization_pct: 37,
+            total_memory_bytes: 32_000,
+            used_memory_bytes: 8_000,
+            drives: vec![
+                control::DriveReport {
+                    name: "C:\\".to_owned(),
+                    filesystem: "NTFS".to_owned(),
+                    total_bytes: 1_000,
+                    used_bytes: 930,
+                },
+                control::DriveReport {
+                    name: "D:\\".to_owned(),
+                    filesystem: "NTFS".to_owned(),
+                    total_bytes: 500,
+                    used_bytes: 9_999,
+                },
+            ],
+            nics: vec![
+                control::NicReport {
+                    name: "Ethernet".to_owned(),
+                    mac_address: "00:11:22:33:44:55".to_owned(),
+                    addresses: vec!["192.168.1.10/24".to_owned()],
+                },
+                control::NicReport {
+                    name: "tun0".to_owned(),
+                    mac_address: String::new(),
+                    addresses: vec!["100.64.0.5/10".to_owned()],
+                },
+            ],
+            current_user: "OMEGA\\ricardo".to_owned(),
+            uptime_secs: 86_400,
+            agent_version: "0.1.0".to_owned(),
+            windows_update: Some(control::WindowsUpdateReport {
+                pending_security_updates: 0,
+                pending_optional_updates: 0,
+                reboot_required: true,
+                last_scan_unix_secs: 1_699_999_000,
+                reboot_reasons: vec!["Component Based Servicing".to_owned()],
+                scanned: false,
+            }),
+            running_processes: vec!["explorer.exe".to_owned(), "spoolsv.exe".to_owned()],
+            running_services: vec!["Spooler".to_owned()],
         }
+    }
+
+    #[test]
+    fn inventory_report_applies_and_round_trips_through_json_and_proto() {
+        let device_id = DeviceIdentity::generate().id();
+        let mut inventory = DeviceInventory::new(device_id, "acme");
+        inventory.site_id = Some("site-sp".to_owned());
+        inventory.alias = Some("finance-02".to_owned());
+        let report = sample_report();
+        inventory.apply_report(&report, 1_700_000_005);
+
+        assert_eq!(inventory.device_name, "WKS-FIN-02");
+        assert_eq!(inventory.os_version, "10.0.26200");
+        assert_eq!(inventory.cpu_utilization_pct, 37);
+        assert_eq!(inventory.used_memory_percent(), 25);
+        assert_eq!(
+            inventory.mac_addresses,
+            vec!["00:11:22:33:44:55".to_owned()]
+        );
+        assert_eq!(inventory.current_user.as_deref(), Some("OMEGA\\ricardo"));
+        assert!(inventory.is_online);
+        assert_eq!(inventory.last_online_unix_secs, 1_700_000_005);
+        assert_eq!(inventory.collected_at_unix_secs, 1_700_000_000);
+        assert_eq!(
+            inventory.site_id.as_deref(),
+            Some("site-sp"),
+            "operator-owned fields survive a report"
+        );
+        assert_eq!(inventory.alias.as_deref(), Some("finance-02"));
+        // A drive reporting more used than total is clamped, so percentages stay in range.
+        assert_eq!(
+            inventory.disk_usage(),
+            vec![("C:\\".to_owned(), 93), ("D:\\".to_owned(), 100)]
+        );
+        assert!(inventory.windows_update.reboot_required);
+
+        let json = serde_json::to_string(&inventory).unwrap();
+        let restored: DeviceInventory = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored, inventory);
+
+        let mut back = inventory.to_report();
+        assert_eq!(back.hostname, report.hostname);
+        assert_eq!(back.drives[0], report.drives[0]);
+        assert_eq!(back.nics, report.nics);
+        assert_eq!(back.running_services, report.running_services);
+        assert_eq!(back.windows_update, report.windows_update);
+        // Only the clamp and the reason differ from what the agent sent.
+        back.drives[1].used_bytes = 9_999;
+        back.reason = report.reason;
+        assert_eq!(back, report);
+
+        // An empty hostname in a later heartbeat keeps the known name.
+        let mut unnamed = report.clone();
+        unnamed.hostname.clear();
+        inventory.apply_report(&unnamed, 1_700_000_900);
+        assert_eq!(inventory.device_name, "WKS-FIN-02");
+    }
+
+    #[test]
+    fn deployment_tokens_format_and_parse() {
+        let mut manager = DeploymentLinkManager::new(&[7u8; 32]);
+        let link = manager.create_link("ab12", "acme", "site-sp", "any", 5_000, 0);
+        let token = format_deployment_token(&link);
+        assert!(token.starts_with("odl_ab12_"));
+        assert_eq!(
+            parse_deployment_token(&token),
+            Some(("ab12", link.token_hex.as_str()))
+        );
+        assert_eq!(parse_deployment_token("odk_ab12_zz"), None);
+        assert_eq!(parse_deployment_token("odl_ab12"), None);
+        assert_eq!(parse_deployment_token("odl__zz"), None);
+        assert_eq!(parse_deployment_token("odl_ab12_"), None);
+
+        // Links persist and verify again under the same key material only.
+        let saved = manager.links();
+        assert_eq!(saved.len(), 1);
+        let mut same_key = DeploymentLinkManager::new(&[7u8; 32]);
+        same_key.restore_links(saved.clone());
+        assert!(same_key.link("ab12").is_some());
+        assert_eq!(
+            same_key.redeem_link("ab12", &link.token_hex, 1_000),
+            Ok(("acme".to_owned(), "site-sp".to_owned()))
+        );
+        let mut other_key = DeploymentLinkManager::new(&[8u8; 32]);
+        other_key.restore_links(saved);
+        assert!(
+            other_key
+                .redeem_link("ab12", &link.token_hex, 1_000)
+                .is_err()
+        );
+
+        assert_eq!(
+            ScriptingShell::parse("PowerShell"),
+            Some(ScriptingShell::WinPs)
+        );
+        assert_eq!(ScriptingShell::parse("bash"), Some(ScriptingShell::Bash));
+        assert_eq!(ScriptingShell::parse("zsh"), None);
+        for shell in [
+            ScriptingShell::PsCore,
+            ScriptingShell::WinPs,
+            ScriptingShell::Bash,
+            ScriptingShell::Cmd,
+        ] {
+            assert_eq!(ScriptingShell::from_proto(shell.to_proto()), Some(shell));
+        }
+        assert_eq!(
+            ScriptingShell::from_proto(control::ScriptShell::Unspecified),
+            None
+        );
+
+        let mut scheduler = ScriptScheduler::new();
+        let device = DeviceIdentity::generate().id();
+        scheduler.queue_script_for_device(device, "scr-a");
+        scheduler.queue_script_for_device(device, "scr-a");
+        scheduler.queue_script_for_device(device, "scr-b");
+        assert_eq!(
+            scheduler.queued_scripts_for_device(device),
+            ["scr-a".to_owned(), "scr-b".to_owned()]
+        );
+        assert_eq!(
+            scheduler.drain_queued_scripts_for_device(device),
+            vec!["scr-a".to_owned(), "scr-b".to_owned()]
+        );
+        assert_eq!(scheduler.queued_scripts_for_device(device).len(), 0);
     }
 
     fn schedule(tenant_id: &str, device_ids: Vec<DeviceId>, site_ids: Vec<&str>) -> ScriptSchedule {

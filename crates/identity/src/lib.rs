@@ -492,6 +492,43 @@ impl fmt::Debug for DeviceId {
     }
 }
 
+impl std::str::FromStr for DeviceId {
+    type Err = IdentityError;
+
+    /// Parses the textual form produced by [`fmt::Display`]: 32 base32
+    /// characters, case-insensitive, with or without the `-` group separators.
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        let compact: String = text
+            .trim()
+            .chars()
+            .filter(|c| *c != '-')
+            .map(|c| c.to_ascii_uppercase())
+            .collect();
+        let bytes = data_encoding::BASE32_NOPAD
+            .decode(compact.as_bytes())
+            .map_err(|_| IdentityError::InvalidEncoding)?;
+        let id: [u8; 20] = bytes
+            .try_into()
+            .map_err(|_| IdentityError::InvalidEncoding)?;
+        Ok(Self(id))
+    }
+}
+
+#[cfg(feature = "serde")]
+impl serde::Serialize for DeviceId {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<'de> serde::Deserialize<'de> for DeviceId {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text = <std::borrow::Cow<'de, str>>::deserialize(deserializer)?;
+        text.parse().map_err(serde::de::Error::custom)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{DeviceIdentity, DevicePublic, IdentityError, MemoryStore};
@@ -514,6 +551,24 @@ mod tests {
         let restored = DeviceIdentity::from_secret_bytes(&identity.to_secret_bytes()).unwrap();
         assert_eq!(identity.public(), restored.public());
         assert_eq!(identity.id(), restored.id());
+    }
+
+    #[test]
+    fn device_id_text_round_trips() {
+        let id = DeviceIdentity::generate().id();
+        let text = id.to_string();
+        assert_eq!(text.len(), 39, "32 base32 characters in 8 groups: {text}");
+        assert_eq!(text.parse::<super::DeviceId>().unwrap(), id);
+        let upper_compact: String = text.chars().filter(|c| *c != '-').collect();
+        assert_eq!(
+            upper_compact
+                .to_ascii_uppercase()
+                .parse::<super::DeviceId>()
+                .unwrap(),
+            id
+        );
+        assert!("not-an-id".parse::<super::DeviceId>().is_err());
+        assert!("".parse::<super::DeviceId>().is_err());
     }
 
     #[test]

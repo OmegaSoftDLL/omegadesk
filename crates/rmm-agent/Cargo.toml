@@ -1,0 +1,39 @@
+[package]
+name = "omegadesk-rmm-agent"
+description = "Agent side of OmegaDesk RMM: inventory collection, heartbeat and script execution over the coordinator control channel"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+omegadesk-control.workspace = true
+omegadesk-protocol.workspace = true
+rand_core.workspace = true
+sysinfo.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["process", "fs"] }
+tracing.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_JobObjects",
+    "Win32_System_Registry",
+    "Win32_System_RemoteDesktop",
+    "Win32_System_Services",
+    "Win32_System_Threading",
+] }
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[dev-dependencies]
+omegadesk-identity.workspace = true
+omegadesk-server.workspace = true
+
+[lints]
+workspace = true

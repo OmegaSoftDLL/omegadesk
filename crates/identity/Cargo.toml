@@ -14,10 +14,15 @@ ed25519-dalek.workspace = true
 keyring.workspace = true
 rand_core.workspace = true
 ring.workspace = true
+serde = { workspace = true, optional = true }
 sha2.workspace = true
 thiserror.workspace = true
 x25519-dalek.workspace = true
 zeroize.workspace = true
+
+[features]
+# `DeviceId` as its textual form (`k3xq-7f2m-...`) in serde formats.
+serde = ["dep:serde"]
 
 [lints]
 workspace = true

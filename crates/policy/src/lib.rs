@@ -51,8 +51,10 @@ pub use posture::{
 };
 pub use rmm_policy::{
     AlertRecord, AlertSeverity, AlertState, AlertTemplate, CheckEvaluationOutcome, CheckEvaluator,
-    CheckKind, EffectiveRmmPolicy, RmmCapabilityFlags, RmmCheck, RmmPolicyLayer, ScopedRmmRole,
-    TemplateAction, resolve_effective_rmm_policy,
+    CheckEvaluatorSnapshot, CheckKind, CheckVerdict, EffectiveRmmPolicy, RmmCapabilityFlags,
+    RmmCheck, RmmPolicyLayer, ScopedRmmRole, TelemetrySample, TemplateAction, evaluate_check,
+    evaluate_script_exit, normalize_mount_point, process_name_matches,
+    resolve_effective_rmm_policy,
 };
 pub use sessions::{
     SessionAction, SessionDecision, SessionPosture, SessionRule, os_family_name, parse_cidr,

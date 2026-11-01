@@ -242,3 +242,31 @@ async fn relay_only_policy_holds_against_a_normal_peer() {
         "{second:?}"
     );
 }
+
+/// The RMM task of an agent gets `Enrolled` as soon as the node is up and can
+/// reach the coordinator through the node's current control handle.
+#[tokio::test]
+async fn node_exposes_the_control_handle_and_rmm_events_for_the_agent() {
+    let testbed = testbed().await;
+    let node = start_node(&testbed, "rmm-host", true).await;
+    let mut events = node
+        .take_rmm_events()
+        .expect("first take returns the stream");
+    assert!(
+        node.take_rmm_events().is_none(),
+        "the stream is handed out once"
+    );
+    let first = tokio::time::timeout(Duration::from_secs(5), events.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(first, omegadesk_control::RmmEvent::Enrolled);
+    let handle = node.control_handle().expect("enrolled nodes have a handle");
+    handle
+        .send_inventory(omegadesk_protocol::control::v1::InventoryReport {
+            hostname: "rmm-host".to_owned(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+}

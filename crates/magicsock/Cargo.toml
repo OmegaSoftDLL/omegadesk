@@ -24,6 +24,7 @@ tokio.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+omegadesk-protocol.workspace = true
 omegadesk-server.workspace = true
 tracing-subscriber.workspace = true
 

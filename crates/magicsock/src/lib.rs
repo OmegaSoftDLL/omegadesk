@@ -39,10 +39,12 @@ mod relay_client;
 mod socket;
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use omegadesk_control::{ControlClient, ControlConfig, ControlError, Enrollment, PeerInfo};
+use omegadesk_control::{
+    ControlClient, ControlConfig, ControlError, ControlHandle, Enrollment, PeerInfo, RmmEvent,
+};
 use omegadesk_identity::{DeviceId, DeviceIdentity, QuickSupportId};
 use omegadesk_mesh::{ConnectionPath, MeshNode};
 use omegadesk_relay::RelayError;
@@ -122,12 +124,17 @@ impl NodeConfig {
     }
 }
 
+/// Events buffered for the RMM task before it starts reading (a dispatch
+/// arriving during startup must not be lost).
+const RMM_EVENT_BUFFER: usize = 64;
+
 /// A node connected to the mesh: owns the socket, the control and relay links
 /// and the QUIC endpoint bound to the device identity.
 pub struct Node {
     socket: Arc<MagicSocket>,
     endpoint: quinn::Endpoint,
     control: Arc<control_link::SharedControl>,
+    rmm_events: Mutex<Option<mpsc::Receiver<RmmEvent>>>,
     tasks: Vec<tokio::task::JoinHandle<()>>,
 }
 
@@ -216,12 +223,18 @@ impl Node {
                 driver_tx.clone(),
             )));
         }
+        let (rmm_tx, rmm_rx) = mpsc::channel(RMM_EVENT_BUFFER);
+        // The first enrollment just happened: the RMM task reports inventory on it.
+        let _ = rmm_tx.try_send(RmmEvent::Enrolled);
         tasks.push(tokio::spawn(control_link::supervise(
             Arc::clone(&identity),
             control_config,
             Arc::clone(&control_link),
             client,
-            driver_tx,
+            control_link::Sinks {
+                driver: driver_tx,
+                rmm: rmm_tx,
+            },
             endpoint_updates_rx,
         )));
         tasks.push(tokio::spawn(driver::run(
@@ -244,8 +257,27 @@ impl Node {
             socket,
             endpoint,
             control: control_link,
+            rmm_events: Mutex::new(Some(rmm_rx)),
             tasks,
         })
+    }
+
+    /// Handle of the current control connection (`None` while re-enrolling).
+    /// Agents use it to send inventory reports and script results.
+    #[must_use]
+    pub fn control_handle(&self) -> Option<ControlHandle> {
+        self.control.current()
+    }
+
+    /// Takes the RMM event stream: [`RmmEvent::Enrolled`] after every
+    /// (re-)enrollment and [`RmmEvent::ScriptDispatch`] for scripts the
+    /// coordinator pushes. Only the first call returns the receiver.
+    #[must_use]
+    pub fn take_rmm_events(&self) -> Option<mpsc::Receiver<RmmEvent>> {
+        match self.rmm_events.lock() {
+            Ok(mut guard) => guard.take(),
+            Err(poisoned) => poisoned.into_inner().take(),
+        }
     }
 
     /// This node's record as assigned by the coordinator (current enrollment;
