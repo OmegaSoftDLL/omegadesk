@@ -90,13 +90,14 @@ async fn session(
         .await
         .map_err(|_| anyhow::anyhow!("mesh driver stopped"))?;
     info!(relay = %grant.address, "relay connected");
-    let mut writer_task = tokio::spawn(writer_loop(writer, rx));
-    let result = tokio::select! {
+    // Both halves are owned by this future: cancelling the session (for
+    // example `Node::shutdown` aborting `run_relay`) drops the writer and its
+    // TCP half too, instead of leaving a detached task pinging the relay.
+    let writer = writer_loop(writer, rx);
+    tokio::select! {
         result = reader_loop(reader, index, driver) => result,
-        _ = &mut writer_task => Err(anyhow::anyhow!("relay writer ended")),
-    };
-    writer_task.abort();
-    result
+        () = writer => Err(anyhow::anyhow!("relay writer ended")),
+    }
 }
 
 async fn login(

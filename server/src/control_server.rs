@@ -419,6 +419,11 @@ mod tests {
             panic!("first message must be the EnrollResponse");
         };
         assert_eq!(first.peers.len(), MAX_NODES_PER_MESSAGE);
+        assert_eq!(
+            first.peer_count as usize,
+            peers.len(),
+            "peer_count covers the whole snapshot"
+        );
         let mut total = first.peers.len();
         for msg in &messages[1..] {
             let Some(control::control_envelope::Payload::NetmapBatch(batch)) = msg.payload.as_ref()

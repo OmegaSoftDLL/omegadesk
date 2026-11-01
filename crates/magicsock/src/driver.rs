@@ -34,8 +34,12 @@ pub(crate) enum DriverMsg {
     RelayPeerGone { index: usize, peer_key: [u8; 32] },
     /// A netmap change from the coordinator.
     Netmap(NetmapEvent),
-    /// Full peer snapshot after a re-enrollment.
-    Resync(Vec<PeerInfo>),
+    /// Complete snapshot after a re-enrollment: the node's own record and
+    /// every peer.
+    Resync {
+        self_node: Box<PeerInfo>,
+        peers: Vec<PeerInfo>,
+    },
 }
 
 /// Runs until the message channel closes.
@@ -89,7 +93,7 @@ fn handle_message(socket: &MagicSocket, message: DriverMsg) {
         }
         DriverMsg::RelayPeerGone { index, peer_key } => socket.relay_peer_gone(index, peer_key),
         DriverMsg::Netmap(event) => apply_netmap(socket, event),
-        DriverMsg::Resync(peers) => socket.apply_snapshot(&peers),
+        DriverMsg::Resync { self_node, peers } => socket.apply_snapshot(&self_node, &peers),
     }
 }
 

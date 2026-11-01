@@ -127,7 +127,6 @@ impl NodeConfig {
 pub struct Node {
     socket: Arc<MagicSocket>,
     endpoint: quinn::Endpoint,
-    self_info: PeerInfo,
     tasks: Vec<tokio::task::JoinHandle<()>>,
 }
 
@@ -160,11 +159,13 @@ impl Node {
             self_node,
             peers,
             relays,
+            total_peers,
         } = enrollment;
         info!(
             fqdn = %self_node.fqdn,
             ipv4 = %self_node.ipv4,
             peers = peers.len(),
+            total_peers,
             relays = relays.len(),
             "enrolled in the mesh"
         );
@@ -174,19 +175,20 @@ impl Node {
         } else {
             resolve_stun_servers(&relays).await
         };
-        let mesh = MeshNode::new(
+        let mut mesh = MeshNode::new(
             DeviceIdentity::from_secret_bytes(&identity.to_secret_bytes())
                 .map_err(|_| ControlError::Malformed("device identity"))?,
             local_candidates,
             stun_servers,
         );
+        mesh.set_relay_only(config.relay_only);
 
         let (inbound_tx, inbound_rx) = mpsc::channel(1024);
         let (endpoint_updates_tx, endpoint_updates_rx) = mpsc::unbounded_channel();
         let (driver_tx, driver_rx) = mpsc::channel(256);
         let control_link = Arc::new(control_link::SharedControl::new(client.handle()));
         let socket = Arc::new(MagicSocket::new(
-            self_node.ipv4,
+            self_node.clone(),
             Arc::clone(&udp),
             mesh,
             relays.len(),
@@ -195,7 +197,8 @@ impl Node {
             endpoint_updates_tx,
             driver_tx.clone(),
         ));
-        socket.apply_snapshot(&peers);
+        // The first chunk of the snapshot; any remainder arrives as deltas.
+        socket.apply_snapshot(&self_node, &peers);
 
         let mut tasks = Vec::new();
         for (index, grant) in relays.iter().cloned().enumerate() {
@@ -234,21 +237,21 @@ impl Node {
         Ok(Self {
             socket,
             endpoint,
-            self_info: self_node,
             tasks,
         })
     }
 
-    /// This node's record as assigned by the coordinator.
+    /// This node's record as assigned by the coordinator (current enrollment;
+    /// a re-enrolled ephemeral node may receive a new address).
     #[must_use]
-    pub fn self_info(&self) -> &PeerInfo {
-        &self.self_info
+    pub fn self_info(&self) -> PeerInfo {
+        self.socket.self_info()
     }
 
     /// Virtual address of this node on the mesh (`<mesh IPv4>:7070`).
     #[must_use]
     pub fn virtual_addr(&self) -> SocketAddr {
-        SocketAddr::new(IpAddr::V4(self.self_info.ipv4), MESH_PORT)
+        SocketAddr::new(IpAddr::V4(self.socket.local_ipv4()), MESH_PORT)
     }
 
     /// The QUIC endpoint running over the mesh. It accepts incoming
@@ -329,9 +332,10 @@ impl Drop for Node {
 
 impl std::fmt::Debug for Node {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let info = self.self_info();
         f.debug_struct("Node")
-            .field("fqdn", &self.self_info.fqdn)
-            .field("ipv4", &self.self_info.ipv4)
+            .field("fqdn", &info.fqdn)
+            .field("ipv4", &info.ipv4)
             .finish_non_exhaustive()
     }
 }

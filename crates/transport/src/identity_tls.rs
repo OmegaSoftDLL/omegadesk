@@ -111,7 +111,7 @@ pub fn ed25519_key_from_certificate(der: &[u8]) -> Option<[u8; 32]> {
     let (algorithm, after_alg) = der_tlv(spki, 0x30)?;
     let (alg_oid_len, _) = der_tlv(algorithm, 0x06).map(|(oid, _)| (oid.len(), oid))?;
     if algorithm.len() != alg_oid_len + 2
-        || spki[..ED25519_ALGORITHM_IDENTIFIER.len()] != ED25519_ALGORITHM_IDENTIFIER
+        || spki.get(..ED25519_ALGORITHM_IDENTIFIER.len()) != Some(&ED25519_ALGORITHM_IDENTIFIER[..])
     {
         return None;
     }
@@ -255,5 +255,56 @@ mod tests {
         assert_eq!(der_length(&[0x82, 0x01, 0x00]), Some((256, 3)));
         assert_eq!(der_length(&[0x85, 0, 0, 0, 0, 0]), None);
         assert_eq!(der_length(&[]), None);
+    }
+
+    /// Minimal DER TLV encoder for hand-built malformed certificates.
+    fn tlv(tag: u8, body: &[u8]) -> Vec<u8> {
+        let mut out = vec![tag];
+        match body.len() {
+            len if len < 0x80 => out.push(u8::try_from(len).unwrap()),
+            len if len < 0x100 => out.extend_from_slice(&[0x81, u8::try_from(len).unwrap()]),
+            len => {
+                out.push(0x82);
+                out.extend_from_slice(&u16::try_from(len).unwrap().to_be_bytes());
+            }
+        }
+        out.extend_from_slice(body);
+        out
+    }
+
+    #[test]
+    fn malformed_certificates_never_panic() {
+        // An SPKI whose AlgorithmIdentifier holds a one-byte OID is only five
+        // bytes long: shorter than the Ed25519 identifier it is compared with.
+        let short_alg = tlv(0x30, &tlv(0x06, &[0x2b]));
+        let spki = tlv(0x30, &[short_alg, tlv(0x03, &[0u8; 33])].concat());
+        let tbs_body = [
+            tlv(0xa0, &tlv(0x02, &[0x02])),
+            tlv(0x02, &[0x01]),
+            tlv(0x30, &[]),
+            tlv(0x30, &[]),
+            tlv(0x30, &[]),
+            tlv(0x30, &[]),
+            spki,
+        ]
+        .concat();
+        let cert = tlv(0x30, &tlv(0x30, &tbs_body));
+        assert_eq!(ed25519_key_from_certificate(&cert), None);
+
+        // Every truncation and every single-byte corruption of a real
+        // certificate is rejected or parsed, never a panic (this runs on
+        // untrusted peer input before signature verification).
+        let identity = DeviceIdentity::generate();
+        let der = certificate_for(&identity);
+        for cut in 0..der.len() {
+            let _ = ed25519_key_from_certificate(&der[..cut]);
+        }
+        for i in 0..der.len() {
+            for flip in [0x00u8, 0x7f, 0x80, 0xff] {
+                let mut mutated = der.clone();
+                mutated[i] = flip;
+                let _ = ed25519_key_from_certificate(&mutated);
+            }
+        }
     }
 }

@@ -208,3 +208,36 @@ async fn relay_only_nodes_still_carry_quic() {
     ));
     let _: SocketAddr = bob.virtual_addr();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn relay_only_policy_holds_against_a_normal_peer() {
+    let testbed = testbed().await;
+    // The relay-only node sits in a tenant with a normal node that advertises
+    // loopback candidates and would happily hole-punch.
+    let locked = start_node(&testbed, "locked-down", true).await;
+    let open = start_node(&testbed, "open", false).await;
+    wait_for_peer(&open, "locked-down").await;
+    wait_for_peer(&locked, "open").await;
+    assert_eq!(open.resolve("locked-down").unwrap().endpoints.len(), 0);
+
+    let first = echo_round_trip(&open, &locked, b"relay only, please").await;
+    assert!(matches!(first, ConnectionPath::Relayed { .. }), "{first:?}");
+    // Give the open node every chance to validate a direct path: it probes for
+    // longer than the fallback budget and keeps re-probing afterwards.
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    let open_view = open.peer_path(locked.self_info().id());
+    let locked_view = locked.peer_path(open.self_info().id());
+    assert!(
+        matches!(open_view, Some(ConnectionPath::Relayed { .. })),
+        "{open_view:?}"
+    );
+    assert!(
+        matches!(locked_view, Some(ConnectionPath::Relayed { .. })),
+        "{locked_view:?}"
+    );
+    let second = echo_round_trip(&locked, &open, b"and back").await;
+    assert!(
+        matches!(second, ConnectionPath::Relayed { .. }),
+        "{second:?}"
+    );
+}

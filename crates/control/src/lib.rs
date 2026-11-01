@@ -36,6 +36,13 @@ pub const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
 /// Time allowed for the TCP connect, handshake and enrollment reply.
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// A control connection on which nothing arrives for this long is considered
+/// dead and reported as [`NetmapEvent::Disconnected`]. The coordinator echoes
+/// every keepalive ([`KEEPALIVE_INTERVAL`]), so this tolerates three lost
+/// echoes; a blackholed TCP path (no FIN/RST) is detected instead of waiting
+/// forever.
+pub const READ_IDLE_TIMEOUT: Duration = Duration::from_secs(100);
+
 /// Errors returned by the control client.
 #[derive(Debug, thiserror::Error)]
 pub enum ControlError {
@@ -210,10 +217,22 @@ impl RelayGrant {
 pub struct Enrollment {
     /// This node's record as assigned by the coordinator.
     pub self_node: PeerInfo,
-    /// Peers of the same tenant known at enrollment time.
+    /// Peers of the same tenant known at enrollment time. May be only the
+    /// first chunk of a large tenant: the rest follows as
+    /// [`NetmapEvent::PeerUpserted`] until `total_peers` have been seen.
     pub peers: Vec<PeerInfo>,
     /// Relays with tickets.
     pub relays: Vec<RelayGrant>,
+    /// Size of the complete peer snapshot (`peers.len()` once complete).
+    pub total_peers: usize,
+}
+
+impl Enrollment {
+    /// Whether `peers` already holds the whole snapshot.
+    #[must_use]
+    pub fn is_complete(&self) -> bool {
+        self.peers.len() >= self.total_peers
+    }
 }
 
 /// Netmap changes pushed by the coordinator after enrollment.
@@ -338,14 +357,32 @@ impl ControlClient {
         identity: Arc<DeviceIdentity>,
         config: ControlConfig,
     ) -> Result<(Self, Enrollment), ControlError> {
-        tokio::time::timeout(CONNECT_TIMEOUT, Self::connect_inner(identity, config))
-            .await
-            .map_err(|_| ControlError::Timeout)?
+        Self::connect_with(identity, config, READ_IDLE_TIMEOUT).await
+    }
+
+    /// Like [`Self::connect`], with an explicit read-idle timeout after which a
+    /// silent connection is reported as [`NetmapEvent::Disconnected`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControlError`] if the connection, handshake or enrollment fails.
+    pub async fn connect_with(
+        identity: Arc<DeviceIdentity>,
+        config: ControlConfig,
+        read_idle_timeout: Duration,
+    ) -> Result<(Self, Enrollment), ControlError> {
+        tokio::time::timeout(
+            CONNECT_TIMEOUT,
+            Self::connect_inner(identity, config, read_idle_timeout),
+        )
+        .await
+        .map_err(|_| ControlError::Timeout)?
     }
 
     async fn connect_inner(
         identity: Arc<DeviceIdentity>,
         config: ControlConfig,
+        read_idle_timeout: Duration,
     ) -> Result<(Self, Enrollment), ControlError> {
         let stream = TcpStream::connect(&config.server_addr).await?;
         stream.set_nodelay(true)?;
@@ -397,12 +434,22 @@ impl ControlClient {
             .iter()
             .map(RelayGrant::from_proto)
             .collect::<Result<Vec<_>, _>>()?;
+        // Coordinators that predate `peer_count` send 0: the list is then complete.
+        let total_peers = usize::try_from(response.peer_count)
+            .unwrap_or(usize::MAX)
+            .max(peers.len());
 
         let (outbound_tx, outbound_rx) = mpsc::channel(64);
         let (events_tx, events_rx) = mpsc::channel(256);
         let (ticket_waiters_tx, ticket_waiters_rx) = mpsc::unbounded_channel();
         tokio::spawn(writer_loop(writer, tx, outbound_rx, ticket_waiters_tx));
-        tokio::spawn(reader_loop(reader, rx, events_tx, ticket_waiters_rx));
+        tokio::spawn(reader_loop(
+            reader,
+            rx,
+            events_tx,
+            ticket_waiters_rx,
+            read_idle_timeout,
+        ));
 
         Ok((
             Self {
@@ -415,6 +462,7 @@ impl ControlClient {
                 self_node,
                 peers,
                 relays,
+                total_peers,
             },
         ))
     }
@@ -504,11 +552,15 @@ async fn reader_loop(
     mut rx: NoiseReceiver,
     events: mpsc::Sender<NetmapEvent>,
     mut ticket_waiters: mpsc::UnboundedReceiver<oneshot::Sender<Vec<RelayGrant>>>,
+    read_idle_timeout: Duration,
 ) {
     let reason = loop {
-        let msg = match read_control(&mut reader, &mut rx).await {
-            Ok(msg) => msg,
-            Err(error) => break error.to_string(),
+        let msg = match tokio::time::timeout(read_idle_timeout, read_control(&mut reader, &mut rx))
+            .await
+        {
+            Ok(Ok(msg)) => msg,
+            Ok(Err(error)) => break error.to_string(),
+            Err(_) => break format!("no control traffic for {read_idle_timeout:?}"),
         };
         match msg.payload {
             Some(control::control_envelope::Payload::NetmapBatch(batch)) => {
@@ -756,5 +808,34 @@ mod tests {
             parse_server_key("abcd"),
             Err(ControlError::InvalidServerKey)
         ));
+    }
+
+    #[tokio::test]
+    async fn silent_coordinator_is_reported_as_disconnected() {
+        let (addr, server_public, key, _coord) = start_coordinator([3u8; 32]).await;
+        let node = Arc::new(DeviceIdentity::generate());
+        // The coordinator only echoes keepalives (sent every 30 s), so a tight
+        // idle deadline fires without any traffic: a blackholed path is
+        // detected and reported instead of waiting forever.
+        let (mut ctl, _enrollment) = ControlClient::connect_with(
+            node,
+            ControlConfig {
+                server_addr: addr.to_string(),
+                server_public,
+                preauth_key: key,
+                hostname: "quiet".into(),
+                endpoints: vec![],
+            },
+            Duration::from_millis(300),
+        )
+        .await
+        .unwrap();
+        let event = tokio::time::timeout(Duration::from_secs(5), ctl.next_event())
+            .await
+            .expect("idle deadline must fire");
+        assert!(
+            matches!(event, Some(NetmapEvent::Disconnected(ref reason)) if reason.contains("no control traffic")),
+            "{event:?}"
+        );
     }
 }

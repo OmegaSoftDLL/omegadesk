@@ -571,6 +571,7 @@ impl EnrollmentBundle {
             self_node: Some(self.node.to_proto()),
             peers: self.peers.iter().map(NodeRecord::to_proto).collect(),
             relays: self.relays.iter().map(RelayGrant::to_proto).collect(),
+            peer_count: u32::try_from(self.peers.len()).unwrap_or(u32::MAX),
         }
     }
 }

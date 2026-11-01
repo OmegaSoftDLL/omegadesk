@@ -87,7 +87,8 @@ pub struct SocketStats {
 
 /// [`quinn::AsyncUdpSocket`] whose "network" is the OmegaDesk mesh.
 pub struct MagicSocket {
-    local_ipv4: Ipv4Addr,
+    /// This node's record; replaced when a re-enrollment assigns a new address.
+    self_info: Mutex<PeerInfo>,
     udp: Arc<UdpSocket>,
     state: Mutex<State>,
     inbound_tx: mpsc::Sender<Datagram>,
@@ -100,7 +101,7 @@ pub struct MagicSocket {
 impl std::fmt::Debug for MagicSocket {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MagicSocket")
-            .field("local_ipv4", &self.local_ipv4)
+            .field("local_ipv4", &self.local_ipv4())
             .finish_non_exhaustive()
     }
 }
@@ -111,7 +112,7 @@ impl MagicSocket {
         reason = "constructor wiring, called once by Node"
     )]
     pub(crate) fn new(
-        local_ipv4: Ipv4Addr,
+        self_info: PeerInfo,
         udp: Arc<UdpSocket>,
         mesh: MeshNode,
         relay_count: usize,
@@ -122,7 +123,7 @@ impl MagicSocket {
     ) -> Self {
         let relays = (0..relay_count).map(|_| RelaySlot::default()).collect();
         Self {
-            local_ipv4,
+            self_info: Mutex::new(self_info),
             udp,
             state: Mutex::new(State {
                 mesh,
@@ -146,10 +147,22 @@ impl MagicSocket {
         &self.stats
     }
 
-    /// Mesh IPv4 address of this node.
+    /// This node's record as assigned by the coordinator (current enrollment).
+    #[must_use]
+    pub fn self_info(&self) -> PeerInfo {
+        match self.self_info.lock() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+
+    /// Mesh IPv4 address of this node (current enrollment).
     #[must_use]
     pub fn local_ipv4(&self) -> Ipv4Addr {
-        self.local_ipv4
+        match self.self_info.lock() {
+            Ok(guard) => guard.ipv4,
+            Err(poisoned) => poisoned.into_inner().ipv4,
+        }
     }
 
     pub(crate) fn lock(&self) -> MutexGuard<'_, State> {
@@ -201,11 +214,32 @@ impl MagicSocket {
         self.lock().mesh.peer_path(peer)
     }
 
-    /// Replaces the peer set with `peers` (enrollment or re-enrollment
-    /// snapshot): upserts every listed peer and removes the ones that vanished.
-    pub(crate) fn apply_snapshot(&self, peers: &[PeerInfo]) {
+    /// Applies a complete (re-)enrollment: adopts the node's own record (a
+    /// re-enrolled ephemeral node may get a new address, which existing
+    /// sessions cannot survive, so pending datagrams are dropped), upserts every
+    /// listed peer and removes the ones that vanished.
+    pub(crate) fn apply_snapshot(&self, self_node: &PeerInfo, peers: &[PeerInfo]) {
         let now = Instant::now();
+        let address_changed = {
+            let mut current = match self.self_info.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            let changed = current.ipv4 != self_node.ipv4;
+            if changed {
+                warn!(
+                    old = %current.ipv4,
+                    new = %self_node.ipv4,
+                    "re-enrollment assigned a new mesh address; open sessions will drop"
+                );
+            }
+            *current = self_node.clone();
+            changed
+        };
         let mut state = self.lock();
+        if address_changed {
+            state.pending.clear();
+        }
         let keep: HashSet<DeviceId> = peers.iter().map(PeerInfo::id).collect();
         let stale: Vec<DeviceId> = state
             .peers
@@ -324,7 +358,7 @@ impl MagicSocket {
     ) -> Option<Datagram> {
         let peer = state.peers.get(&peer_id)?;
         let (src, dst, payload) = udp_payload(packet)?;
-        if *src.ip() != peer.ipv4 || *dst.ip() != self.local_ipv4 || dst.port() != MESH_PORT {
+        if *src.ip() != peer.ipv4 || *dst.ip() != self.local_ipv4() || dst.port() != MESH_PORT {
             return None;
         }
         Some(Datagram {
@@ -475,7 +509,7 @@ impl MagicSocket {
         };
         let dst_port = MESH_PORT;
         let Ok(packet) =
-            IpPacket::ipv4_udp(self.local_ipv4, peer_ipv4, MESH_PORT, dst_port, datagram)
+            IpPacket::ipv4_udp(self.local_ipv4(), peer_ipv4, MESH_PORT, dst_port, datagram)
         else {
             return;
         };
@@ -588,8 +622,12 @@ impl AsyncUdpSocket for MagicSocket {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
+        let local_ipv4 = self.local_ipv4();
+        let slots = bufs.len().min(meta.len());
+        // Successful receives always occupy the prefix `0..filled`: an
+        // oversized datagram is dropped without consuming a slot.
         let mut filled = 0;
-        for (buf, slot) in bufs.iter_mut().zip(meta.iter_mut()) {
+        while filled < slots {
             let datagram = if filled == 0 {
                 match rx.poll_recv(cx) {
                     Poll::Ready(Some(datagram)) => datagram,
@@ -607,30 +645,26 @@ impl AsyncUdpSocket for MagicSocket {
                     Err(_) => break,
                 }
             };
-            if datagram.payload.len() > buf.len() {
+            let len = datagram.payload.len();
+            if len > bufs[filled].len() {
                 self.stats.dropped_rx.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
-            buf[..datagram.payload.len()].copy_from_slice(&datagram.payload);
-            *slot = RecvMeta {
+            bufs[filled][..len].copy_from_slice(&datagram.payload);
+            meta[filled] = RecvMeta {
                 addr: datagram.from,
-                len: datagram.payload.len(),
-                stride: datagram.payload.len(),
+                len,
+                stride: len,
                 ecn: None,
-                dst_ip: Some(IpAddr::V4(self.local_ipv4)),
+                dst_ip: Some(IpAddr::V4(local_ipv4)),
             };
             filled += 1;
-        }
-        if filled == 0 {
-            // Every received datagram was oversized; ask to be polled again.
-            cx.waker().wake_by_ref();
-            return Poll::Pending;
         }
         Poll::Ready(Ok(filled))
     }
 
     fn local_addr(&self) -> io::Result<SocketAddr> {
-        Ok(SocketAddr::new(IpAddr::V4(self.local_ipv4), MESH_PORT))
+        Ok(SocketAddr::new(IpAddr::V4(self.local_ipv4()), MESH_PORT))
     }
 
     fn max_transmit_segments(&self) -> usize {
@@ -677,5 +711,93 @@ mod tests {
         raw[10..12].copy_from_slice(&csum.to_be_bytes());
         let tcp = IpPacket::parse(raw).unwrap();
         assert!(udp_payload(&tcp).is_none());
+    }
+
+    fn peer(ipv4: Ipv4Addr, name: &str) -> PeerInfo {
+        PeerInfo {
+            public: omegadesk_identity::DeviceIdentity::generate().public(),
+            tenant: "t".into(),
+            hostname: name.into(),
+            fqdn: format!("{name}.omega"),
+            ipv4,
+            ipv6: std::net::Ipv6Addr::LOCALHOST,
+            endpoints: vec![],
+            tags: vec![],
+            ephemeral: true,
+        }
+    }
+
+    async fn test_socket() -> (MagicSocket, mpsc::Sender<Datagram>) {
+        let udp = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let mesh = MeshNode::new(
+            omegadesk_identity::DeviceIdentity::generate(),
+            vec![],
+            vec![],
+        );
+        let (inbound_tx, inbound_rx) = mpsc::channel(16);
+        let (updates_tx, _updates_rx) = mpsc::unbounded_channel();
+        let (driver_tx, _driver_rx) = mpsc::channel(16);
+        let socket = MagicSocket::new(
+            peer(Ipv4Addr::new(100, 64, 0, 1), "me"),
+            udp,
+            mesh,
+            0,
+            inbound_tx.clone(),
+            inbound_rx,
+            updates_tx,
+            driver_tx,
+        );
+        (socket, inbound_tx)
+    }
+
+    #[tokio::test]
+    async fn oversized_datagrams_never_leave_holes_in_the_returned_prefix() {
+        let (socket, inbound) = test_socket().await;
+        let from = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 2)), MESH_PORT);
+        inbound
+            .try_send(Datagram {
+                from,
+                payload: vec![1u8; 64],
+            })
+            .unwrap();
+        inbound
+            .try_send(Datagram {
+                from,
+                payload: vec![2u8; 8],
+            })
+            .unwrap();
+        let mut storage = [[0u8; 16], [0u8; 16]];
+        let [first, second] = &mut storage;
+        let mut bufs = [IoSliceMut::new(first), IoSliceMut::new(second)];
+        let mut meta = [RecvMeta::default(), RecvMeta::default()];
+        let waker = std::task::Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        let polled = socket.poll_recv(&mut cx, &mut bufs, &mut meta);
+        assert!(matches!(polled, Poll::Ready(Ok(1))), "{polled:?}");
+        assert_eq!(meta[0].len, 8);
+        assert_eq!(&bufs[0][..8], &[2u8; 8]);
+        assert_eq!(socket.stats().dropped_rx.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn re_enrollment_with_a_new_address_updates_the_self_record() {
+        let (socket, _inbound) = test_socket().await;
+        let bob = peer(Ipv4Addr::new(100, 64, 0, 2), "bob");
+        socket.apply_snapshot(
+            &peer(Ipv4Addr::new(100, 64, 0, 1), "me"),
+            std::slice::from_ref(&bob),
+        );
+        assert_eq!(socket.local_ipv4(), Ipv4Addr::new(100, 64, 0, 1));
+        let moved = peer(Ipv4Addr::new(100, 64, 0, 9), "me");
+        socket.apply_snapshot(&moved, std::slice::from_ref(&bob));
+        assert_eq!(socket.local_ipv4(), Ipv4Addr::new(100, 64, 0, 9));
+        assert_eq!(
+            socket.local_addr().unwrap(),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 9)), MESH_PORT)
+        );
+        assert_eq!(socket.self_info().fqdn, "me.omega");
+        // Peers missing from the snapshot are gone, listed ones stay.
+        socket.apply_snapshot(&moved, &[]);
+        assert!(socket.peer_by_ipv4(bob.ipv4).is_none());
     }
 }
