@@ -1,197 +1,639 @@
-//! Windows `IddCx` 1.4 Indirect Display Driver (UMDF 2) device contract, IOCTL
-//! framing, and VESA E-EDID 1.4 128-byte block synthesizer (`drivers/idd`).
+//! Safe Rust API over the QuickDesk Windows Indirect Display (IddCx) virtual
+//! display driver (`drivers/idd`).
 //!
-//! Reference implementations:
-//! - `ClassicOldSong_Apollo/src/platform/windows/virtual_display.h` &
-//!   `virtual_display.cpp` (`docs/plan.md` §2.3 line 65 & §3 line 223): hardware ID
-//!   `Root\OmegaDeskIdd`, device interface GUID, monitor plug-in/plug-out IOCTLs,
-//!   and dynamic EDID synthesis for arbitrary client resolutions and refresh rates.
+//! The driver is vendored under `vendor/`: the user-mode controller
+//! (`vendor/control/IddController.c`, compiled by `build.rs` with the normal
+//! Windows SDK) drives the prebuilt, signed kernel driver
+//! (`vendor/prebuilt/x64/quickdesk_display.{dll,cat,inf}`), installed and
+//! removed with the bundled `nefconw.exe`. See `vendor/README.md` and
+//! `THIRD_PARTY.md` for provenance and the MIT license.
+//!
+//! Everything is Windows-only at runtime: on Linux and macOS the API compiles
+//! unchanged and every operation returns [`Error::Unsupported`], so the rest of
+//! the workspace builds and tests on all three operating systems.
+//!
+//! ```no_run
+//! use omegadesk_idd::{DisplayMode, VirtualDisplay};
+//!
+//! # fn main() -> Result<(), omegadesk_idd::Error> {
+//! let display = VirtualDisplay::install()?; // needs administrator rights
+//! let monitor = display.plug_monitor(DisplayMode::new(1920, 1080, 60)?)?;
+//! // ... stream the virtual monitor ...
+//! monitor.unplug()?;
+//! VirtualDisplay::uninstall()?;
+//! # Ok(())
+//! # }
+//! ```
+
+use std::sync::{Mutex, OnceLock, PoisonError};
 
 use thiserror::Error;
 
-/// Hardware ID matched by `drivers/idd/omegadesk-idd.inf`.
-pub const OMEGADESK_IDD_HARDWARE_ID: &str = r"Root\OmegaDeskIdd";
+/// Maximum number of virtual monitors the adapter exposes
+/// (`QUICKDESK_VD_MAX_MONITORS` in `vendor/driver/Public.h`).
+pub const MAX_MONITORS: u32 = 4;
 
-/// `FILE_DEVICE_VIDEO` (`0x0000_0023`) device type used for `CTL_CODE` definitions.
-pub const FILE_DEVICE_VIDEO: u32 = 0x0000_0023;
-
-/// `METHOD_BUFFERED` (`0`) transfer type for UMDF `DeviceIoControl` requests.
-pub const METHOD_BUFFERED: u32 = 0;
-
-/// `FILE_WRITE_ACCESS` (`0x0002`) required to mutate virtual monitors.
-pub const FILE_WRITE_ACCESS: u32 = 0x0002;
-
-/// Computes a Windows `CTL_CODE(DeviceType, Function, Method, Access)` constant.
-#[must_use]
-pub const fn ctl_code(device_type: u32, function: u32, method: u32, access: u32) -> u32 {
-    (device_type << 16) | (access << 14) | (function << 2) | method
-}
-
-/// IOCTL to hot-plug a virtual monitor with a 128-byte VESA EDID block (`Function = 0x801`).
-pub const IOCTL_OMEGADESK_IDD_PLUG_IN: u32 =
-    ctl_code(FILE_DEVICE_VIDEO, 0x801, METHOD_BUFFERED, FILE_WRITE_ACCESS);
-
-/// IOCTL to hot-unplug a virtual monitor by connector index (`Function = 0x802`).
-pub const IOCTL_OMEGADESK_IDD_PLUG_OUT: u32 =
-    ctl_code(FILE_DEVICE_VIDEO, 0x802, METHOD_BUFFERED, FILE_WRITE_ACCESS);
-
-/// IOCTL to update the mode list (`width`, `height`, `refresh_millihz`) on an active connector (`Function = 0x803`).
-pub const IOCTL_OMEGADESK_IDD_UPDATE_MODES: u32 =
-    ctl_code(FILE_DEVICE_VIDEO, 0x803, METHOD_BUFFERED, FILE_WRITE_ACCESS);
-
-/// Size in bytes of a standard VESA E-EDID 1.4 base block.
-pub const EDID_BLOCK_SIZE: usize = 128;
-
-/// Errors returned when synthesizing an EDID block or validating an `IddCx` IOCTL payload.
-#[derive(Debug, Error, PartialEq, Eq)]
-pub enum IddError {
-    /// Requested resolution or refresh rate is outside the valid VESA Detailed Timing range.
-    #[error("invalid virtual monitor timing: {width}x{height} @ {refresh_hz} Hz")]
-    InvalidTiming {
-        /// Width in pixels.
-        width: u16,
-        /// Height in pixels.
-        height: u16,
-        /// Refresh rate in Hz.
-        refresh_hz: u16,
+/// Errors returned by the virtual display API.
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum Error {
+    /// The virtual display driver is only available on Windows.
+    #[error("virtual display is Windows-only and unavailable on this platform")]
+    Unsupported,
+    /// Installing or removing the driver requires an elevated (administrator) process.
+    #[error("the virtual display driver requires administrator privileges")]
+    NotElevated,
+    /// An operation needed the driver but it is not installed.
+    #[error("the virtual display driver is not installed")]
+    NotInstalled,
+    /// Every connector is already in use; unplug a monitor before plugging another.
+    #[error("all {max} virtual monitor connectors are in use")]
+    NoFreeConnector {
+        /// The adapter's connector count ([`MAX_MONITORS`]).
+        max: u32,
     },
-    /// Connector index exceeds the adapter's maximum connector count (`0..16`).
-    #[error("connector index {0} exceeds maximum adapter connectors (16)")]
-    InvalidConnectorIndex(u32),
+    /// The requested [`DisplayMode`] is outside the supported range.
+    #[error("invalid display mode {width}x{height}@{refresh_hz}Hz: {reason}")]
+    InvalidMode {
+        /// Requested width in pixels.
+        width: u32,
+        /// Requested height in pixels.
+        height: u32,
+        /// Requested refresh rate in Hz.
+        refresh_hz: u32,
+        /// Why the mode was rejected.
+        reason: &'static str,
+    },
+    /// A driver IOCTL or device-management call failed; the string is the
+    /// controller's last error message.
+    #[error("virtual display driver call failed: {0}")]
+    Driver(String),
+    /// Running the bundled `nefconw.exe` installer failed.
+    #[error("virtual display driver installer failed: {0}")]
+    Installer(String),
 }
 
-/// Payload sent with [`IOCTL_OMEGADESK_IDD_PLUG_IN`] to attach a virtual monitor
-/// with a synthesized 128-byte VESA E-EDID 1.4 block.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct IddPlugInRequest {
-    /// Adapter connector slot (`0..16`).
-    pub connector_index: u32,
-    /// Deterministic RFC 4122 v5 per-client monitor UUID bytes (`Apollo` `virtual_display.cpp`).
-    pub container_id: [u8; 16],
-    /// Synthesized 128-byte VESA E-EDID 1.4 base block.
-    pub edid: [u8; EDID_BLOCK_SIZE],
+/// Result alias for this crate.
+pub type Result<T> = core::result::Result<T, Error>;
+
+/// A validated virtual monitor mode: resolution and refresh rate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DisplayMode {
+    width: u32,
+    height: u32,
+    refresh_hz: u32,
 }
 
-impl IddPlugInRequest {
-    /// Builds a validated [`IddPlugInRequest`] with a synthesized EDID block for
-    /// `width x height @ refresh_hz` and `serial_number`.
+impl DisplayMode {
+    /// Smallest accepted width/height edge, in pixels.
+    pub const MIN_WIDTH: u32 = 640;
+    /// Smallest accepted height, in pixels.
+    pub const MIN_HEIGHT: u32 = 480;
+    /// Largest accepted width or height, in pixels (8K super-ultrawide headroom).
+    pub const MAX_EDGE: u32 = 16_384;
+    /// Highest accepted refresh rate, in Hz.
+    pub const MAX_REFRESH_HZ: u32 = 240;
+
+    /// Validates and builds a [`DisplayMode`].
     ///
     /// # Errors
     ///
-    /// Returns [`IddError`] if `connector_index >= 16` or timing values are out of range.
-    pub fn new(
-        connector_index: u32,
-        container_id: [u8; 16],
-        width: u16,
-        height: u16,
-        refresh_hz: u16,
-        serial_number: u32,
-    ) -> Result<Self, IddError> {
-        if connector_index >= 16 {
-            return Err(IddError::InvalidConnectorIndex(connector_index));
+    /// Returns [`Error::InvalidMode`] when `width` is not in
+    /// `MIN_WIDTH..=MAX_EDGE`, `height` is not in `MIN_HEIGHT..=MAX_EDGE`, or
+    /// `refresh_hz` is not in `1..=MAX_REFRESH_HZ`.
+    pub const fn new(width: u32, height: u32, refresh_hz: u32) -> Result<Self> {
+        if width < Self::MIN_WIDTH || width > Self::MAX_EDGE {
+            return Err(Error::InvalidMode {
+                width,
+                height,
+                refresh_hz,
+                reason: "width out of range",
+            });
         }
-        let edid = synthesize_edid_128(width, height, refresh_hz, serial_number)?;
+        if height < Self::MIN_HEIGHT || height > Self::MAX_EDGE {
+            return Err(Error::InvalidMode {
+                width,
+                height,
+                refresh_hz,
+                reason: "height out of range",
+            });
+        }
+        if refresh_hz == 0 || refresh_hz > Self::MAX_REFRESH_HZ {
+            return Err(Error::InvalidMode {
+                width,
+                height,
+                refresh_hz,
+                reason: "refresh rate out of range",
+            });
+        }
         Ok(Self {
-            connector_index,
-            container_id,
-            edid,
-        })
-    }
-}
-
-/// Synthesizes a standards-compliant 128-byte VESA E-EDID 1.4 base block for an
-/// arbitrary client resolution (`width` x `height` in `200..=4095`) and refresh
-/// rate (`refresh_hz` in `15..=240` Hz) so Windows `IddCx` exposes the exact
-/// native client mode without registry overrides.
-///
-/// # Errors
-///
-/// Returns [`IddError::InvalidTiming`] if `width` or `height` is outside `200..=4095`
-/// (12-bit Detailed Timing Descriptor limit) or `refresh_hz` is outside `15..=240`.
-pub fn synthesize_edid_128(
-    width: u16,
-    height: u16,
-    refresh_hz: u16,
-    serial_number: u32,
-) -> Result<[u8; EDID_BLOCK_SIZE], IddError> {
-    if !(200..=4095).contains(&width)
-        || !(200..=4095).contains(&height)
-        || !(15..=240).contains(&refresh_hz)
-    {
-        return Err(IddError::InvalidTiming {
             width,
             height,
             refresh_hz,
-        });
+        })
     }
 
-    let mut edid = [0u8; EDID_BLOCK_SIZE];
+    /// Width in pixels.
+    #[must_use]
+    pub const fn width(self) -> u32 {
+        self.width
+    }
 
-    // 1. Fixed 8-byte VESA EDID 1.4 header (`00 FF FF FF FF FF FF 00`).
-    edid[1..7].fill(0xFF);
+    /// Height in pixels.
+    #[must_use]
+    pub const fn height(self) -> u32 {
+        self.height
+    }
 
-    // 2. ISA 3-letter Plug-and-Play Manufacturer ID `"OMD"` (`O`=15, `M`=13, `D`=4):
-    //    `(15 << 10) | (13 << 5) | 4 = 0x3DA4` big-endian.
-    edid[8] = 0x3D;
-    edid[9] = 0xA4;
+    /// Refresh rate in Hz.
+    #[must_use]
+    pub const fn refresh_hz(self) -> u32 {
+        self.refresh_hz
+    }
+}
 
-    // Product code (`0x0001` LE) & 32-bit serial number (LE).
-    edid[10] = 0x01;
-    edid[11] = 0x00;
-    edid[12..16].copy_from_slice(&serial_number.to_le_bytes());
+/// Bitmask connector allocator for the adapter's [`MAX_MONITORS`] slots.
+///
+/// This is the pure state machine behind [`VirtualDisplay::plug_monitor`] and
+/// [`MonitorHandle`]: a slot is claimed on plug-in and returned on unplug (or on
+/// a failed plug-in), so a connector index is never handed out twice.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ConnectorAllocator {
+    mask: u8,
+}
 
-    // Manufactured week 44, year 2026 (`2026 - 1990 = 36`).
-    edid[16] = 44;
-    edid[17] = 36;
+impl ConnectorAllocator {
+    const fn new() -> Self {
+        Self { mask: 0 }
+    }
 
-    // EDID version 1, revision 4.
-    edid[18] = 1;
-    edid[19] = 4;
+    /// Claims the lowest free connector index, or `None` if all are in use.
+    fn allocate(&mut self) -> Option<u32> {
+        for index in 0..MAX_MONITORS {
+            let bit = 1u8 << index;
+            if self.mask & bit == 0 {
+                self.mask |= bit;
+                return Some(index);
+            }
+        }
+        None
+    }
 
-    // Digital input (`0xA5`: DisplayPort, 8 bits per color, RGB444, sRGB, preferred timing in DTD 1).
-    edid[20] = 0xA5;
-    edid[21] = 52; // 52 cm horizontal
-    edid[22] = 29; // 29 cm vertical
-    edid[23] = 120; // Gamma 2.20 (`(2.20 * 100) - 100 = 120`)
-    edid[24] = 0x06; // Preferred timing mode includes native pixel format
+    /// Releases `index`; returns `true` if it had been claimed.
+    fn release(&mut self, index: u32) -> bool {
+        if index >= MAX_MONITORS {
+            return false;
+        }
+        let bit = 1u8 << index;
+        if self.mask & bit == 0 {
+            return false;
+        }
+        self.mask &= !bit;
+        true
+    }
 
-    // 3. Detailed Timing Descriptor #1 at bytes 54..72 (18 bytes).
-    // Use reduced blanking (`h_blank = 160`, `v_blank = 45`) to compute pixel clock in 10 kHz units.
-    let h_blank: u16 = 160;
-    let v_blank: u16 = 45;
-    let h_total = u32::from(width) + u32::from(h_blank);
-    let v_total = u32::from(height) + u32::from(v_blank);
-    let pixel_clock_hz = h_total * v_total * u32::from(refresh_hz);
-    let pixel_clock_10khz = u16::try_from((pixel_clock_hz / 10_000).clamp(1, 65_535)).unwrap_or(1);
+    fn in_use(&self, index: u32) -> bool {
+        index < MAX_MONITORS && self.mask & (1u8 << index) != 0
+    }
 
-    let dtd = &mut edid[54..72];
-    dtd[0..2].copy_from_slice(&pixel_clock_10khz.to_le_bytes());
-    dtd[2] = u8::try_from(width & 0xFF).unwrap_or(0);
-    dtd[3] = u8::try_from(h_blank & 0xFF).unwrap_or(0);
-    dtd[4] = u8::try_from(((width >> 8) & 0x0F) << 4 | ((h_blank >> 8) & 0x0F)).unwrap_or(0);
-    dtd[5] = u8::try_from(height & 0xFF).unwrap_or(0);
-    dtd[6] = u8::try_from(v_blank & 0xFF).unwrap_or(0);
-    dtd[7] = u8::try_from(((height >> 8) & 0x0F) << 4 | ((v_blank >> 8) & 0x0F)).unwrap_or(0);
-    dtd[8] = 48; // H sync offset
-    dtd[9] = 32; // H sync pulse width
-    dtd[10] = (3 << 4) | 5; // V sync offset = 3, V sync pulse width = 5
-    dtd[11] = 0;
-    dtd[12] = 0x08; // 520 mm width low bits
-    dtd[13] = 0x22; // 290 mm height low bits
-    dtd[14] = 0x21; // High bits of mm size
-    dtd[17] = 0x1E; // Digital separate sync, positive H/V
+    fn count(&self) -> u32 {
+        u32::from(self.mask.count_ones().min(MAX_MONITORS) as u8)
+    }
+}
 
-    // 4. Monitor Name Descriptor (`0xFC`) at bytes 72..90 (`"OmegaDesk IDD"`).
-    let name_desc = &mut edid[72..90];
-    name_desc[3] = 0xFC;
-    let name_bytes = b"OmegaDesk IDD";
-    name_desc[5..5 + name_bytes.len()].copy_from_slice(name_bytes);
+/// Runs `f` against the process-global connector allocator.
+///
+/// The driver adapter is a single device shared by the whole process, so one
+/// allocator tracks every live [`MonitorHandle`]. A poisoned lock is recovered
+/// rather than propagated: the allocator holds only a bitmask.
+fn with_allocator<R>(f: impl FnOnce(&mut ConnectorAllocator) -> R) -> R {
+    static ALLOCATOR: OnceLock<Mutex<ConnectorAllocator>> = OnceLock::new();
+    let mutex = ALLOCATOR.get_or_init(|| Mutex::new(ConnectorAllocator::new()));
+    let mut guard = mutex.lock().unwrap_or_else(PoisonError::into_inner);
+    f(&mut guard)
+}
 
-    // 5. Modulo-256 checksum at byte 127 so `sum(edid[0..128]) & 0xFF == 0`.
-    let sum: u8 = edid[..127].iter().fold(0u8, |acc, &b| acc.wrapping_add(b));
-    edid[127] = 0u8.wrapping_sub(sum);
+/// Handle to the installed virtual display adapter.
+///
+/// Obtain one with [`VirtualDisplay::install`] (first run, needs administrator
+/// rights) or [`VirtualDisplay::open`] (driver already installed, no elevation
+/// needed), then hot-plug monitors with [`VirtualDisplay::plug_monitor`].
+#[derive(Debug, Clone, Copy)]
+pub struct VirtualDisplay {
+    _private: (),
+}
 
-    Ok(edid)
+impl VirtualDisplay {
+    /// Returns whether the virtual display driver is installed and its device
+    /// node is present.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Unsupported`] off Windows, or [`Error::Driver`] if the
+    /// device enumeration call fails.
+    pub fn is_installed() -> Result<bool> {
+        imp::is_installed()
+    }
+
+    /// Installs the bundled signed driver (idempotent) and returns a handle.
+    ///
+    /// Creates the `Root\QuickDesk\VDD` device node and installs the driver
+    /// package with the bundled `nefconw.exe`. Safe to call repeatedly: an
+    /// existing node is reused and the driver package is updated in place.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Unsupported`] off Windows, [`Error::NotElevated`] if the
+    /// process is not elevated, or [`Error::Installer`] if `nefconw.exe` fails.
+    pub fn install() -> Result<Self> {
+        imp::install_driver()?;
+        Ok(Self { _private: () })
+    }
+
+    /// Returns a handle to an already-installed driver without elevating.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Unsupported`] off Windows, [`Error::NotInstalled`] if the
+    /// driver is not installed, or [`Error::Driver`] if enumeration fails.
+    pub fn open() -> Result<Self> {
+        if imp::is_installed()? {
+            Ok(Self { _private: () })
+        } else {
+            Err(Error::NotInstalled)
+        }
+    }
+
+    /// Removes the driver's device node (uninstall).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Unsupported`] off Windows, [`Error::NotElevated`] if the
+    /// process is not elevated, or [`Error::Installer`] if `nefconw.exe` fails.
+    pub fn uninstall() -> Result<()> {
+        imp::uninstall_driver()
+    }
+
+    /// Hot-plugs a new virtual monitor at `mode` and returns its [`MonitorHandle`].
+    ///
+    /// The connector index is reserved for the returned handle and released when
+    /// it is [`unplugged`](MonitorHandle::unplug) or dropped.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::NoFreeConnector`] if all [`MAX_MONITORS`] connectors are
+    /// in use, [`Error::Unsupported`] off Windows, or [`Error::Driver`] if the
+    /// plug-in IOCTL fails (the reserved connector is released first).
+    pub fn plug_monitor(&self, mode: DisplayMode) -> Result<MonitorHandle> {
+        let index =
+            with_allocator(ConnectorAllocator::allocate).ok_or(Error::NoFreeConnector {
+                max: MAX_MONITORS,
+            })?;
+        match imp::plug_in(index, mode) {
+            Ok(()) => Ok(MonitorHandle {
+                index,
+                mode,
+                plugged: true,
+            }),
+            Err(err) => {
+                with_allocator(|allocator| allocator.release(index));
+                Err(err)
+            }
+        }
+    }
+}
+
+/// A plugged-in virtual monitor. Unplugs itself on drop if still plugged.
+#[derive(Debug)]
+pub struct MonitorHandle {
+    index: u32,
+    mode: DisplayMode,
+    plugged: bool,
+}
+
+impl MonitorHandle {
+    /// The adapter connector index this monitor occupies (`0..`[`MAX_MONITORS`]).
+    #[must_use]
+    pub const fn index(&self) -> u32 {
+        self.index
+    }
+
+    /// The monitor's current [`DisplayMode`].
+    #[must_use]
+    pub const fn mode(&self) -> DisplayMode {
+        self.mode
+    }
+
+    /// Changes the monitor's mode (resolution and refresh rate) in place.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Unsupported`] off Windows or [`Error::Driver`] if the
+    /// update IOCTL fails; on error the recorded mode is unchanged.
+    pub fn set_mode(&mut self, mode: DisplayMode) -> Result<()> {
+        imp::update_modes(self.index, mode)?;
+        self.mode = mode;
+        Ok(())
+    }
+
+    /// Unplugs the monitor, freeing its connector.
+    ///
+    /// The connector is released even if the IOCTL reports an error, so a failed
+    /// unplug never leaks a slot.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Unsupported`] off Windows or [`Error::Driver`] if the
+    /// plug-out IOCTL fails.
+    pub fn unplug(mut self) -> Result<()> {
+        let result = imp::plug_out(self.index);
+        with_allocator(|allocator| allocator.release(self.index));
+        self.plugged = false;
+        result
+    }
+}
+
+impl Drop for MonitorHandle {
+    fn drop(&mut self) {
+        if self.plugged {
+            let _ = imp::plug_out(self.index);
+            with_allocator(|allocator| allocator.release(self.index));
+        }
+    }
+}
+
+#[cfg(windows)]
+mod imp {
+    //! Windows implementation: links the controller compiled by `build.rs` and
+    //! drives the signed driver through IOCTLs and `nefconw.exe`.
+    #![allow(
+        unsafe_code,
+        reason = "FFI into the vendored C IddCx controller and Win32 token APIs"
+    )]
+
+    use std::ffi::CStr;
+    use std::os::raw::{c_char, c_int, c_uint};
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+    use std::{fs, mem};
+
+    use tracing::debug;
+    use windows::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows::Win32::Security::{
+        GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation,
+    };
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    use crate::{DisplayMode, Error, Result};
+
+    /// Root-enumerated hardware ID of the virtual display device node, matching
+    /// `vendor/prebuilt/x64/quickdesk_display.inf`.
+    const HARDWARE_ID: &str = r"Root\QuickDesk\VDD";
+    /// `Display` setup class GUID.
+    const CLASS_GUID: &str = "{4D36E968-E325-11CE-BFC1-08002BE10318}";
+
+    const NEFCONW_EXE: &[u8] = include_bytes!("../vendor/prebuilt/x64/nefconw.exe");
+    const DRIVER_DLL: &[u8] = include_bytes!("../vendor/prebuilt/x64/quickdesk_display.dll");
+    const DRIVER_CAT: &[u8] = include_bytes!("../vendor/prebuilt/x64/quickdesk_display.cat");
+    const DRIVER_INF: &[u8] = include_bytes!("../vendor/prebuilt/x64/quickdesk_display.inf");
+
+    /// One entry of the driver's dynamic mode list (`MonitorMode` in
+    /// `vendor/control/IddController.h`).
+    #[repr(C)]
+    struct MonitorMode {
+        width: u32,
+        height: u32,
+        sync: u32,
+    }
+
+    // Functions exported by the compiled `IddController.c`. `BOOL` is a C `int`
+    // (`TRUE`/`FALSE`). These never take Rust-owned strings, so UNICODE vs ANSI
+    // of the C build does not affect the signatures.
+    unsafe extern "C" {
+        fn MonitorPlugIn(index: c_uint, edid: c_uint, retries: c_int) -> c_int;
+        fn MonitorPlugOut(index: c_uint) -> c_int;
+        fn MonitorModesUpdate(index: c_uint, mode_count: c_uint, modes: *const MonitorMode)
+        -> c_int;
+        fn IsDeviceCreated(created: *mut c_int) -> c_int;
+        fn GetLastMsg() -> *const c_char;
+    }
+
+    /// Returns the controller's last error message.
+    fn last_msg() -> String {
+        // SAFETY: `GetLastMsg` returns a pointer to a static NUL-terminated
+        // buffer owned by the C controller; it is never null per its contract.
+        let ptr = unsafe { GetLastMsg() };
+        if ptr.is_null() {
+            return String::new();
+        }
+        // SAFETY: `ptr` is non-null and points to a NUL-terminated C string.
+        let text = unsafe { CStr::from_ptr(ptr) };
+        text.to_string_lossy().into_owned()
+    }
+
+    /// Whether the current process is running elevated (administrator).
+    fn is_elevated() -> Result<bool> {
+        let mut token = HANDLE::default();
+        // SAFETY: returns the current-process pseudo-handle; no cleanup needed.
+        let process = unsafe { GetCurrentProcess() };
+        // SAFETY: `process` is valid; `token` receives an owned handle closed below.
+        unsafe { OpenProcessToken(process, TOKEN_QUERY, &raw mut token) }
+            .map_err(|error| Error::Driver(format!("OpenProcessToken failed: {error}")))?;
+
+        let mut elevation = TOKEN_ELEVATION::default();
+        let mut returned = 0u32;
+        let size = u32::try_from(mem::size_of::<TOKEN_ELEVATION>()).unwrap_or(0);
+        // SAFETY: `elevation` is a `TOKEN_ELEVATION` of `size` bytes, the buffer
+        // the `TokenElevation` information class requires.
+        let info = unsafe {
+            GetTokenInformation(
+                token,
+                TokenElevation,
+                Some((&raw mut elevation).cast()),
+                size,
+                &raw mut returned,
+            )
+        };
+        // SAFETY: `token` is the open handle returned by `OpenProcessToken`.
+        let _ = unsafe { CloseHandle(token) };
+        info.map_err(|error| Error::Driver(format!("GetTokenInformation failed: {error}")))?;
+        Ok(elevation.TokenIsElevated != 0)
+    }
+
+    pub(crate) fn is_installed() -> Result<bool> {
+        let mut created: c_int = 0;
+        // SAFETY: `IsDeviceCreated` writes a `BOOL` into `created`.
+        let ok = unsafe { IsDeviceCreated(&raw mut created) };
+        if ok == 0 {
+            return Err(Error::Driver(last_msg()));
+        }
+        Ok(created != 0)
+    }
+
+    pub(crate) fn plug_in(index: u32, mode: DisplayMode) -> Result<()> {
+        // `edid = 0` selects a built-in base EDID; the mode update below sets the
+        // real resolution. `retries = 25` matches the reference controller: the
+        // device interface can take a moment to appear after creation.
+        // SAFETY: all arguments are plain scalars.
+        let ok = unsafe { MonitorPlugIn(index, 0, 25) };
+        if ok == 0 {
+            return Err(Error::Driver(last_msg()));
+        }
+        update_modes(index, mode)
+    }
+
+    pub(crate) fn update_modes(index: u32, mode: DisplayMode) -> Result<()> {
+        let modes = [MonitorMode {
+            width: mode.width,
+            height: mode.height,
+            sync: mode.refresh_hz,
+        }];
+        // SAFETY: `modes` points to one valid `MonitorMode` that outlives the call.
+        let ok = unsafe { MonitorModesUpdate(index, 1, modes.as_ptr()) };
+        if ok == 0 {
+            return Err(Error::Driver(last_msg()));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn plug_out(index: u32) -> Result<()> {
+        // SAFETY: `index` is a plain scalar.
+        let ok = unsafe { MonitorPlugOut(index) };
+        if ok == 0 {
+            return Err(Error::Driver(last_msg()));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn install_driver() -> Result<()> {
+        if !is_elevated()? {
+            return Err(Error::NotElevated);
+        }
+        let payload = Payload::extract()?;
+        // Idempotent: `--no-duplicates` keeps a single device node, and
+        // `--install-driver` updates the package in place.
+        run_nefconw(
+            &payload.nefconw,
+            &[
+                "--create-device-node",
+                "--class-name",
+                "Display",
+                "--class-guid",
+                CLASS_GUID,
+                "--hardware-id",
+                HARDWARE_ID,
+                "--no-duplicates",
+            ],
+        )?;
+        let inf = payload.inf.to_string_lossy().into_owned();
+        run_nefconw(&payload.nefconw, &["--install-driver", "--inf-path", &inf])?;
+        debug!("virtual display driver installed");
+        Ok(())
+    }
+
+    pub(crate) fn uninstall_driver() -> Result<()> {
+        if !is_elevated()? {
+            return Err(Error::NotElevated);
+        }
+        let payload = Payload::extract()?;
+        run_nefconw(
+            &payload.nefconw,
+            &[
+                "--remove-device-node",
+                "--hardware-id",
+                HARDWARE_ID,
+                "--class-guid",
+                CLASS_GUID,
+            ],
+        )?;
+        debug!("virtual display driver removed");
+        Ok(())
+    }
+
+    /// The bundled installer payload unpacked into a temporary directory.
+    struct Payload {
+        dir: PathBuf,
+        nefconw: PathBuf,
+        inf: PathBuf,
+    }
+
+    impl Payload {
+        fn extract() -> Result<Self> {
+            let dir = std::env::temp_dir().join(format!("omegadesk-idd-{}", std::process::id()));
+            fs::create_dir_all(&dir)
+                .map_err(|error| Error::Installer(format!("create temp dir: {error}")))?;
+            let nefconw = write_file(&dir, "nefconw.exe", NEFCONW_EXE)?;
+            let inf = write_file(&dir, "quickdesk_display.inf", DRIVER_INF)?;
+            write_file(&dir, "quickdesk_display.dll", DRIVER_DLL)?;
+            write_file(&dir, "quickdesk_display.cat", DRIVER_CAT)?;
+            Ok(Self { dir, nefconw, inf })
+        }
+    }
+
+    impl Drop for Payload {
+        fn drop(&mut self) {
+            // The driver store keeps its own copy after install; the temp copy
+            // is disposable.
+            let _ = fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn write_file(dir: &Path, name: &str, bytes: &[u8]) -> Result<PathBuf> {
+        let path = dir.join(name);
+        fs::write(&path, bytes)
+            .map_err(|error| Error::Installer(format!("write {name}: {error}")))?;
+        Ok(path)
+    }
+
+    fn run_nefconw(exe: &Path, args: &[&str]) -> Result<()> {
+        let output = Command::new(exe)
+            .args(args)
+            .output()
+            .map_err(|error| Error::Installer(format!("launch nefconw.exe: {error}")))?;
+        if output.status.success() {
+            return Ok(());
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let action = args.first().copied().unwrap_or("nefconw");
+        Err(Error::Installer(format!(
+            "nefconw {action} exited with {}: {}{}",
+            output.status,
+            stdout.trim(),
+            stderr.trim()
+        )))
+    }
+}
+
+#[cfg(not(windows))]
+mod imp {
+    //! Non-Windows stub: every operation reports [`Error::Unsupported`].
+
+    use crate::{DisplayMode, Error, Result};
+
+    pub(crate) fn is_installed() -> Result<bool> {
+        Err(Error::Unsupported)
+    }
+
+    pub(crate) fn install_driver() -> Result<()> {
+        Err(Error::Unsupported)
+    }
+
+    pub(crate) fn uninstall_driver() -> Result<()> {
+        Err(Error::Unsupported)
+    }
+
+    pub(crate) fn plug_in(_index: u32, _mode: DisplayMode) -> Result<()> {
+        Err(Error::Unsupported)
+    }
+
+    pub(crate) fn update_modes(_index: u32, _mode: DisplayMode) -> Result<()> {
+        Err(Error::Unsupported)
+    }
+
+    pub(crate) fn plug_out(_index: u32) -> Result<()> {
+        Err(Error::Unsupported)
+    }
 }
 
 #[cfg(test)]
@@ -199,20 +641,130 @@ mod tests {
     use super::*;
 
     #[test]
-    fn synthesizes_valid_edid_with_zero_modulo_256_checksum() {
-        let req = IddPlugInRequest::new(0, [0x42u8; 16], 2560, 1440, 120, 0x1234_5678).unwrap();
-        assert_eq!(
-            &req.edid[0..8],
-            &[0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00]
-        );
-        let checksum: u8 = req.edid.iter().fold(0u8, |acc, &b| acc.wrapping_add(b));
-        assert_eq!(checksum, 0);
+    fn display_mode_accepts_common_resolutions() {
+        for (w, h, hz) in [(1920, 1080, 60), (2560, 1440, 120), (3840, 2160, 60), (640, 480, 1)] {
+            let mode = DisplayMode::new(w, h, hz).unwrap_or_else(|_| unreachable!());
+            assert_eq!((mode.width(), mode.height(), mode.refresh_hz()), (w, h, hz));
+        }
+    }
 
-        // Decode width and height from Detailed Timing Descriptor #1 (bytes 54..72).
-        let dtd = &req.edid[54..72];
-        let decoded_w = u16::from(dtd[2]) | (u16::from(dtd[4] >> 4) << 8);
-        let decoded_h = u16::from(dtd[5]) | (u16::from(dtd[7] >> 4) << 8);
-        assert_eq!(decoded_w, 2560);
-        assert_eq!(decoded_h, 1440);
+    #[test]
+    fn display_mode_rejects_out_of_range() {
+        assert!(matches!(
+            DisplayMode::new(320, 240, 60),
+            Err(Error::InvalidMode { .. })
+        ));
+        assert!(matches!(
+            DisplayMode::new(1920, 1080, 0),
+            Err(Error::InvalidMode { .. })
+        ));
+        assert!(matches!(
+            DisplayMode::new(1920, 1080, 300),
+            Err(Error::InvalidMode { .. })
+        ));
+        assert!(matches!(
+            DisplayMode::new(20_000, 1080, 60),
+            Err(Error::InvalidMode { .. })
+        ));
+    }
+
+    #[test]
+    fn connector_allocator_claims_and_releases_every_slot() {
+        let mut allocator = ConnectorAllocator::new();
+        let mut claimed = Vec::new();
+        for _ in 0..MAX_MONITORS {
+            let index = allocator.allocate().unwrap_or_else(|| unreachable!());
+            assert!(allocator.in_use(index));
+            claimed.push(index);
+        }
+        // Distinct indices, all slots taken.
+        claimed.sort_unstable();
+        assert_eq!(claimed, (0..MAX_MONITORS).collect::<Vec<_>>());
+        assert_eq!(allocator.count(), MAX_MONITORS);
+
+        // Exhausted: no slot until one is released.
+        assert_eq!(allocator.allocate(), None);
+
+        assert!(allocator.release(2));
+        assert!(!allocator.in_use(2));
+        assert!(!allocator.release(2)); // double release is a no-op
+        assert_eq!(allocator.allocate(), Some(2)); // freed slot comes back
+        assert_eq!(allocator.count(), MAX_MONITORS);
+    }
+
+    #[test]
+    fn connector_allocator_ignores_out_of_range_release() {
+        let mut allocator = ConnectorAllocator::new();
+        assert!(!allocator.release(MAX_MONITORS));
+        assert!(!allocator.in_use(MAX_MONITORS));
+        assert_eq!(allocator.count(), 0);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn operations_are_windows_only_off_windows() {
+        assert!(matches!(VirtualDisplay::is_installed(), Err(Error::Unsupported)));
+        assert!(matches!(VirtualDisplay::install(), Err(Error::Unsupported)));
+        assert!(matches!(VirtualDisplay::open(), Err(Error::Unsupported)));
+        assert!(matches!(VirtualDisplay::uninstall(), Err(Error::Unsupported)));
+    }
+
+    /// Windows integration test: installs the signed driver, plugs a
+    /// 1920x1080@60 monitor, asserts Windows enumerates a new display device,
+    /// then unplugs and uninstalls. Ignored by default: it needs administrator
+    /// privileges and changes system display devices.
+    ///
+    /// Run with: `cargo test -p omegadesk-idd -- --ignored --nocapture`
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "needs administrator privileges and modifies system display devices"]
+    fn windows_install_plug_enumerate_unplug_uninstall()
+    -> core::result::Result<(), Box<dyn std::error::Error>> {
+        use std::{thread::sleep, time::Duration};
+
+        use windows::Win32::Graphics::Gdi::{
+            DISPLAY_DEVICEW, EnumDisplayDevicesW, EDD_GET_DEVICE_INTERFACE_NAME,
+        };
+        use windows::core::PCWSTR;
+
+        fn attached_display_count() -> u32 {
+            let mut count = 0u32;
+            let mut index = 0u32;
+            loop {
+                let mut device = DISPLAY_DEVICEW {
+                    cb: u32::try_from(size_of::<DISPLAY_DEVICEW>()).unwrap_or(0),
+                    ..Default::default()
+                };
+                // SAFETY: `device.cb` is initialized; `EnumDisplayDevicesW`
+                // fills `device` for adapter `index` and returns 0 at the end.
+                let ok = unsafe {
+                    EnumDisplayDevicesW(
+                        PCWSTR::null(),
+                        index,
+                        &raw mut device,
+                        EDD_GET_DEVICE_INTERFACE_NAME,
+                    )
+                };
+                if !ok.as_bool() {
+                    break;
+                }
+                count += 1;
+                index += 1;
+            }
+            count
+        }
+
+        let before = attached_display_count();
+        let display = VirtualDisplay::install()?;
+        assert!(VirtualDisplay::is_installed()?);
+
+        let monitor = display.plug_monitor(DisplayMode::new(1920, 1080, 60)?)?;
+        sleep(Duration::from_secs(3)); // let Windows attach the monitor
+        let after = attached_display_count();
+        assert!(after > before, "expected a new display device after plug-in");
+
+        monitor.unplug()?;
+        VirtualDisplay::uninstall()?;
+        Ok(())
     }
 }
