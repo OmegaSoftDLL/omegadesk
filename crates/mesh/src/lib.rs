@@ -927,59 +927,7 @@ impl MeshNode {
                 }
             }
             DiscoMessage::Pong { tx_id, src, .. } => {
-                let Some(remote_addr) = from_udp else {
-                    return Ok(());
-                };
-                let Some(peer) = self.peers_by_id.get_mut(&peer_id) else {
-                    return Ok(());
-                };
-                let Some((_, sent_at)) = peer.inflight_pings.remove(&tx_id) else {
-                    return Ok(());
-                };
-                let rtt = now.saturating_duration_since(sent_at);
-
-                // The peer saw our packet from `src`: a reflexive endpoint
-                // (built-in STUN, Tailscale `addCandidateEndpoint`).
-                let endpoints_changed = !self.local_candidates.contains(&src)
-                    && self.reflexive.insert(remote_addr, src) != Some(src);
-
-                let was_relayed = matches!(peer.path, ConnectionPath::Relayed { .. });
-                let better = match (peer.path, peer.best_rtt) {
-                    (ConnectionPath::Direct { remote }, Some(best)) if remote != remote_addr => {
-                        best.saturating_sub(rtt) > GOOD_ENOUGH_LATENCY
-                    }
-                    _ => true,
-                };
-                if better {
-                    peer.path = ConnectionPath::Direct {
-                        remote: remote_addr,
-                    };
-                    peer.best_rtt = Some(rtt);
-                }
-                if matches!(peer.path, ConnectionPath::Direct { remote } if remote == remote_addr) {
-                    peer.trust_until = Some(now + TRUST_UDP_ADDR_DURATION);
-                    peer.next_heartbeat_at = now + HEARTBEAT_INTERVAL;
-                    peer.last_direct_rx = Some(now);
-                    peer.liveness_probe_sent = false;
-                }
-                peer.fallback_deadline = None;
-                if !peer.connected_emitted {
-                    peer.connected_emitted = true;
-                    self.events.push_back(MeshEvent::Connected {
-                        peer: peer_id,
-                        path: peer.path,
-                    });
-                }
-                if was_relayed && better {
-                    self.events.push_back(MeshEvent::PathUpgraded {
-                        peer: peer_id,
-                        remote: remote_addr,
-                        rtt,
-                    });
-                }
-                if endpoints_changed {
-                    self.endpoints_changed(now);
-                }
+                self.handle_pong(peer_id, from_udp, tx_id, src, now);
             }
             DiscoMessage::CallMeMaybe { my_numbers, .. } => {
                 if let Some(peer) = self.peers_by_id.get_mut(&peer_id) {
@@ -1004,6 +952,72 @@ impl MeshNode {
             }
         }
         Ok(())
+    }
+
+    /// A `Pong` validates the candidate it came back from: the peer is
+    /// reachable there, the RTT is known, and a better or first direct path
+    /// replaces the relay (Tailscale `handlePongConnLocked`).
+    fn handle_pong(
+        &mut self,
+        peer_id: DeviceId,
+        from_udp: Option<SocketAddr>,
+        tx_id: TxId,
+        src: SocketAddr,
+        now: Instant,
+    ) {
+        let Some(remote_addr) = from_udp else {
+            return;
+        };
+        let Some(peer) = self.peers_by_id.get_mut(&peer_id) else {
+            return;
+        };
+        let Some((_, sent_at)) = peer.inflight_pings.remove(&tx_id) else {
+            return;
+        };
+        let rtt = now.saturating_duration_since(sent_at);
+
+        // The peer saw our packet from `src`: a reflexive endpoint
+        // (built-in STUN, Tailscale `addCandidateEndpoint`).
+        let endpoints_changed = !self.local_candidates.contains(&src)
+            && self.reflexive.insert(remote_addr, src) != Some(src);
+
+        let was_relayed = matches!(peer.path, ConnectionPath::Relayed { .. });
+        let better = match (peer.path, peer.best_rtt) {
+            (ConnectionPath::Direct { remote }, Some(best)) if remote != remote_addr => {
+                best.saturating_sub(rtt) > GOOD_ENOUGH_LATENCY
+            }
+            _ => true,
+        };
+        if better {
+            peer.path = ConnectionPath::Direct {
+                remote: remote_addr,
+            };
+            peer.best_rtt = Some(rtt);
+        }
+        if matches!(peer.path, ConnectionPath::Direct { remote } if remote == remote_addr) {
+            peer.trust_until = Some(now + TRUST_UDP_ADDR_DURATION);
+            peer.next_heartbeat_at = now + HEARTBEAT_INTERVAL;
+            peer.last_direct_rx = Some(now);
+            peer.liveness_probe_sent = false;
+        }
+        peer.fallback_deadline = None;
+        if !peer.connected_emitted {
+            peer.connected_emitted = true;
+            self.events.push_back(MeshEvent::Connected {
+                peer: peer_id,
+                path: peer.path,
+            });
+        }
+        if was_relayed && better {
+            self.events.push_back(MeshEvent::PathUpgraded {
+                peer: peer_id,
+                remote: remote_addr,
+                rtt,
+            });
+        }
+        if endpoints_changed {
+            self.endpoints_changed(now);
+        }
     }
 }
 
