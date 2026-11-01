@@ -1,0 +1,16 @@
+[package]
+name = "omegadesk-mcp"
+description = "Model Context Protocol (MCP) server for AI agents with per-machine trust control, risk assessment, and emergency kill-switch"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+omegadesk-identity.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

@@ -13,6 +13,7 @@
 //!   to [`ConnectionPath::Direct`] as soon as a direct `Pong` arrives.
 
 pub mod disco;
+pub mod peer_routing;
 
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
@@ -25,6 +26,9 @@ use sha2::{Digest, Sha256};
 use x25519_dalek::PublicKey as X25519Public;
 
 pub use disco::{DiscoError, DiscoMessage, MAGIC as DISCO_MAGIC, TxId, random_tx_id};
+pub use peer_routing::{
+    LinkNeighbor, LinkStateAdvertisement, LinkStateRouter, PeerRelayCertificate, RoutePath,
+};
 
 /// Maximum time to wait for a direct `Pong` before falling back to the relay
 /// (1.5 seconds, satisfying the `< 2 s` Phase 2 requirement).
