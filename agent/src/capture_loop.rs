@@ -66,12 +66,22 @@ fn open_encoder(
     width: u32,
     height: u32,
     settings: EncoderSettings,
+    capturer: &dyn Capturer,
 ) -> Result<Box<dyn VideoEncoder>, CodecError> {
     #[cfg(windows)]
     if choice != EncoderChoice::Software {
-        match omegadesk_codec::MediaFoundationEncoder::new(width, height, settings) {
+        match omegadesk_codec::MediaFoundationEncoder::new_with_device(
+            width,
+            height,
+            settings,
+            capturer.d3d11_device(),
+        ) {
             Ok(encoder) => {
-                info!("hardware encoder: {}", encoder.name());
+                info!(
+                    "hardware encoder: {} (zero-copy GPU: {})",
+                    encoder.name(),
+                    encoder.is_zero_copy()
+                );
                 return Ok(Box::new(encoder));
             }
             Err(error) if choice == EncoderChoice::Hardware => return Err(error),
@@ -80,8 +90,11 @@ fn open_encoder(
     }
     #[cfg(not(windows))]
     if choice == EncoderChoice::Hardware {
+        let _ = capturer;
         return Err(CodecError::HardwareUnavailable);
     }
+    #[cfg(not(windows))]
+    let _ = capturer;
     let _ = (width, height);
     info!("software encoder: OpenH264");
     Ok(Box::new(OpenH264Encoder::new(settings)?))
@@ -161,7 +174,10 @@ pub(crate) fn run(
 
         // Recreate the encoder whenever the display resolution changes.
         if encoder.as_ref().map(|e| e.size) != Some((frame.width, frame.height)) {
-            match open_encoder(choice, frame.width, frame.height, settings) {
+            let Some(active) = capturer.as_deref() else {
+                continue;
+            };
+            match open_encoder(choice, frame.width, frame.height, settings, active) {
                 Ok(new_encoder) => {
                     encoder = Some(ActiveEncoder {
                         encoder: new_encoder,
@@ -188,6 +204,15 @@ pub(crate) fn run(
             width: frame.width,
             height: frame.height,
             bgra: &frame.bgra,
+            #[cfg(windows)]
+            d3d11_texture: frame
+                .gpu_texture
+                .as_ref()
+                .map(|gpu| omegadesk_codec::D3d11Texture {
+                    device: &gpu.device,
+                    context: &gpu.context,
+                    texture: &gpu.texture,
+                }),
         });
         let encoded = match encoded {
             Ok(encoded) => encoded,

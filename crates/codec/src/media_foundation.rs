@@ -5,37 +5,57 @@
 //! input frame (`METransformNeedInput`) and when encoded output is ready
 //! (`METransformHaveOutput`).
 //!
+//! When a Direct3D 11 device and texture are supplied ([`crate::D3d11Texture`]),
+//! the encoder binds an `IMFDXGIDeviceManager` to the MFT (`MFT_MESSAGE_SET_D3D_MANAGER`),
+//! converts the captured `BGRA` texture into an `NV12` texture on the GPU via
+//! `ID3D11VideoProcessor::VideoProcessorBlt`, and wraps the `NV12` surface in an
+//! `IMFMediaBuffer` via `MFCreateDXGISurfaceBuffer` for zero-copy GPU encoding.
+//!
 //! References:
 //! - `IronRDP` (`ironrdp-rdpecam-native` and `ironrdp-egfx-native`, MIT/Apache-2.0):
 //!   media types, `ProcessOutput`, SPS/PPS sequence header, `STREAM_CHANGE`;
-//! - Sunshine (`src/nvenc/nvenc_base.cpp`): single-frame VBV buffer CBR, zero
-//!   B-frames, color space signaled in the VUI.
+//! - Sunshine (`src/nvenc/nvenc_base.cpp`, `src/platform/windows/display_vram.cpp`):
+//!   single-frame VBV buffer CBR, zero B-frames, color space signaled in the VUI;
+//! - `RustDesk` (`libs/scrap/src/dxgi/mod.rs`): `ID3D11VideoProcessor` setup.
 
-#![allow(unsafe_code, reason = "Media Foundation COM APIs")]
+#![allow(unsafe_code, reason = "Media Foundation and Direct3D 11 COM APIs")]
 
 use std::collections::VecDeque;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
+use windows::Win32::Foundation::RECT;
+use windows::Win32::Graphics::Direct3D11::{
+    D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE, D3D11_TEX2D_VPIV, D3D11_TEX2D_VPOV,
+    D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE,
+    D3D11_VIDEO_PROCESSOR_CONTENT_DESC, D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC,
+    D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC, D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC_0,
+    D3D11_VIDEO_PROCESSOR_STREAM, D3D11_VIDEO_USAGE_OPTIMAL_SPEED, D3D11_VPIV_DIMENSION_TEXTURE2D,
+    D3D11_VPOV_DIMENSION_TEXTURE2D, ID3D11Device, ID3D11Texture2D, ID3D11VideoContext,
+    ID3D11VideoDevice, ID3D11VideoProcessor, ID3D11VideoProcessorEnumerator,
+    ID3D11VideoProcessorInputView, ID3D11VideoProcessorOutputView,
+};
+use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_NV12, DXGI_RATIONAL, DXGI_SAMPLE_DESC};
 use windows::Win32::Media::MediaFoundation::{
     CODECAPI_AVEncCommonBufferSize, CODECAPI_AVEncCommonRateControlMode,
     CODECAPI_AVEncMPVDefaultBPictureCount, CODECAPI_AVEncMPVGOPSize,
-    CODECAPI_AVEncVideoForceKeyFrame, CODECAPI_AVLowLatencyMode, ICodecAPI, IMFActivate,
-    IMFMediaEventGenerator, IMFMediaType, IMFSample, IMFTransform, MEError, METransformHaveOutput,
-    METransformNeedInput, MF_E_NO_EVENTS_AVAILABLE, MF_E_TRANSFORM_NEED_MORE_INPUT,
-    MF_E_TRANSFORM_STREAM_CHANGE, MF_EVENT_FLAG_NO_WAIT, MF_LOW_LATENCY, MF_MT_AVG_BITRATE,
-    MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE,
-    MF_MT_MPEG_SEQUENCE_HEADER, MF_MT_MPEG2_PROFILE, MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE,
-    MF_MT_VIDEO_NOMINAL_RANGE, MF_MT_YUV_MATRIX, MF_TRANSFORM_ASYNC_UNLOCK, MF_VERSION,
+    CODECAPI_AVEncVideoForceKeyFrame, CODECAPI_AVLowLatencyMode, ICodecAPI, IMF2DBuffer,
+    IMFActivate, IMFDXGIDeviceManager, IMFMediaBuffer, IMFMediaEventGenerator, IMFMediaType,
+    IMFSample, IMFTransform, MEError, METransformHaveOutput, METransformNeedInput,
+    MF_E_NO_EVENTS_AVAILABLE, MF_E_TRANSFORM_NEED_MORE_INPUT, MF_E_TRANSFORM_STREAM_CHANGE,
+    MF_EVENT_FLAG_NO_WAIT, MF_LOW_LATENCY, MF_MT_AVG_BITRATE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE,
+    MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_MPEG_SEQUENCE_HEADER, MF_MT_MPEG2_PROFILE,
+    MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE, MF_MT_VIDEO_NOMINAL_RANGE, MF_MT_YUV_MATRIX,
+    MF_TRANSFORM_ASYNC_UNLOCK, MF_VERSION, MFCreateDXGIDeviceManager, MFCreateDXGISurfaceBuffer,
     MFCreateMediaType, MFCreateMemoryBuffer, MFCreateSample, MFMediaType_Video,
     MFNominalRange_16_235, MFSTARTUP_FULL, MFSampleExtension_CleanPoint, MFStartup,
     MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_FLAG_HARDWARE, MFT_ENUM_FLAG_SORTANDFILTER,
     MFT_FRIENDLY_NAME_Attribute, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,
     MFT_MESSAGE_NOTIFY_END_OF_STREAM, MFT_MESSAGE_NOTIFY_END_STREAMING,
-    MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_OUTPUT_DATA_BUFFER, MFT_OUTPUT_STREAM_PROVIDES_SAMPLES,
-    MFT_REGISTER_TYPE_INFO, MFTEnumEx, MFVideoFormat_H264, MFVideoFormat_NV12,
-    MFVideoInterlace_Progressive, MFVideoTransferMatrix_BT601, eAVEncCommonRateControlMode_CBR,
-    eAVEncH264VProfile_Base,
+    MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_MESSAGE_SET_D3D_MANAGER, MFT_OUTPUT_DATA_BUFFER,
+    MFT_OUTPUT_STREAM_PROVIDES_SAMPLES, MFT_REGISTER_TYPE_INFO, MFTEnumEx, MFVideoFormat_H264,
+    MFVideoFormat_NV12, MFVideoInterlace_Progressive, MFVideoTransferMatrix_BT601,
+    eAVEncCommonRateControlMode_CBR, eAVEncH264VProfile_Base,
 };
 use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoTaskMemFree};
 use windows::Win32::System::Variant::VARIANT;
@@ -174,12 +194,258 @@ fn set_video_attributes(
     Ok(())
 }
 
+/// GPU-side `BGRA` → `NV12` converter and `IMFDXGIDeviceManager` binding for
+/// zero-copy hardware encoding.
+struct D3d11Pipeline {
+    _manager: IMFDXGIDeviceManager,
+    video_device: ID3D11VideoDevice,
+    video_context: ID3D11VideoContext,
+    enumerator: ID3D11VideoProcessorEnumerator,
+    processor: ID3D11VideoProcessor,
+    surfaces: [(ID3D11Texture2D, ID3D11VideoProcessorOutputView); 2],
+    next_slot: usize,
+}
+
+impl D3d11Pipeline {
+    fn new(
+        device: &ID3D11Device,
+        transform: &IMFTransform,
+        width: u32,
+        height: u32,
+        fps: u32,
+    ) -> windows::core::Result<Self> {
+        let video_device: ID3D11VideoDevice = device.cast()?;
+        // SAFETY: `device` is a valid `ID3D11Device` and returns its immediate context.
+        let immediate_context = unsafe { device.GetImmediateContext() }?;
+        let video_context: ID3D11VideoContext = immediate_context.cast()?;
+
+        let mut reset_token = 0u32;
+        let mut manager = None;
+        // SAFETY: `reset_token` and `manager` are local out-parameters.
+        unsafe { MFCreateDXGIDeviceManager(&raw mut reset_token, &raw mut manager) }?;
+        let manager: IMFDXGIDeviceManager = manager.ok_or_else(windows::core::Error::empty)?;
+        // SAFETY: `manager` and `device` are valid COM interfaces and `reset_token`
+        // is the token returned by `MFCreateDXGIDeviceManager`.
+        unsafe { manager.ResetDevice(device, reset_token) }?;
+
+        let content_desc = D3D11_VIDEO_PROCESSOR_CONTENT_DESC {
+            InputFrameFormat: D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE,
+            InputFrameRate: DXGI_RATIONAL {
+                Numerator: fps,
+                Denominator: 1,
+            },
+            InputWidth: width,
+            InputHeight: height,
+            OutputFrameRate: DXGI_RATIONAL {
+                Numerator: fps,
+                Denominator: 1,
+            },
+            OutputWidth: width,
+            OutputHeight: height,
+            Usage: D3D11_VIDEO_USAGE_OPTIMAL_SPEED,
+        };
+        // SAFETY: `video_device` is valid and `content_desc` is a local struct.
+        let enumerator =
+            unsafe { video_device.CreateVideoProcessorEnumerator(&raw const content_desc) }?;
+        // SAFETY: `video_device` and `enumerator` are valid; rate conversion index 0.
+        let processor = unsafe { video_device.CreateVideoProcessor(&enumerator, 0) }?;
+
+        let rect = RECT {
+            left: 0,
+            top: 0,
+            right: i32::try_from(width).unwrap_or(i32::MAX),
+            bottom: i32::try_from(height).unwrap_or(i32::MAX),
+        };
+        // SAFETY: `video_context` and `processor` are valid; disables driver auto-postprocessing.
+        unsafe { video_context.VideoProcessorSetStreamAutoProcessingMode(&processor, 0, false) };
+        // SAFETY: `video_context` and `processor` are valid; progressive frames.
+        unsafe {
+            video_context.VideoProcessorSetStreamFrameFormat(
+                &processor,
+                0,
+                D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE,
+            );
+        };
+        // SAFETY: `video_context`, `processor`, and `rect` are valid.
+        unsafe {
+            video_context.VideoProcessorSetStreamSourceRect(
+                &processor,
+                0,
+                true,
+                Some(&raw const rect),
+            );
+        };
+        // SAFETY: `video_context`, `processor`, and `rect` are valid.
+        unsafe {
+            video_context.VideoProcessorSetStreamDestRect(
+                &processor,
+                0,
+                true,
+                Some(&raw const rect),
+            );
+        };
+
+        let surface0 =
+            Self::create_nv12_surface(device, &video_device, &enumerator, width, height)?;
+        let surface1 =
+            Self::create_nv12_surface(device, &video_device, &enumerator, width, height)?;
+
+        // Bind the DXGI device manager to the MFT so it accepts DXGI surface samples directly.
+        let raw_manager = manager.as_raw() as usize;
+        // SAFETY: `transform` is valid and `raw_manager` is the `IUnknown` pointer
+        // of `manager`, which outlives streaming on `transform`.
+        unsafe { transform.ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, raw_manager) }?;
+
+        Ok(Self {
+            _manager: manager,
+            video_device,
+            video_context,
+            enumerator,
+            processor,
+            surfaces: [surface0, surface1],
+            next_slot: 0,
+        })
+    }
+
+    fn create_nv12_surface(
+        device: &ID3D11Device,
+        video_device: &ID3D11VideoDevice,
+        enumerator: &ID3D11VideoProcessorEnumerator,
+        width: u32,
+        height: u32,
+    ) -> windows::core::Result<(ID3D11Texture2D, ID3D11VideoProcessorOutputView)> {
+        let desc = D3D11_TEXTURE2D_DESC {
+            Width: width,
+            Height: height,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: DXGI_FORMAT_NV12,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0).cast_unsigned(),
+            CPUAccessFlags: 0,
+            MiscFlags: 0,
+        };
+        let mut texture = None;
+        // SAFETY: `desc` is a valid `NV12` texture description and `texture` is a local out-parameter.
+        unsafe { device.CreateTexture2D(&raw const desc, None, Some(&raw mut texture)) }?;
+        let texture = texture.ok_or_else(windows::core::Error::empty)?;
+
+        let view_desc = D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC {
+            ViewDimension: D3D11_VPOV_DIMENSION_TEXTURE2D,
+            Anonymous: D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC_0 {
+                Texture2D: D3D11_TEX2D_VPOV { MipSlice: 0 },
+            },
+        };
+        let mut output_view = None;
+        // SAFETY: `texture` and `enumerator` are valid and `view_desc` selects mip 0.
+        unsafe {
+            video_device.CreateVideoProcessorOutputView(
+                &texture,
+                enumerator,
+                &raw const view_desc,
+                Some(&raw mut output_view),
+            )
+        }?;
+        let output_view = output_view.ok_or_else(windows::core::Error::empty)?;
+        Ok((texture, output_view))
+    }
+
+    /// Converts `bgra_texture` into the next `NV12` GPU surface and wraps it in
+    /// an [`IMFSample`] via `MFCreateDXGISurfaceBuffer`.
+    fn convert_to_sample(
+        &mut self,
+        bgra_texture: &ID3D11Texture2D,
+        sample_time: i64,
+        sample_duration: i64,
+    ) -> windows::core::Result<IMFSample> {
+        let input_desc = D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC {
+            FourCC: 0,
+            ViewDimension: D3D11_VPIV_DIMENSION_TEXTURE2D,
+            Anonymous:
+                windows::Win32::Graphics::Direct3D11::D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC_0 {
+                    Texture2D: D3D11_TEX2D_VPIV {
+                        MipSlice: 0,
+                        ArraySlice: 0,
+                    },
+                },
+        };
+        let mut input_view: Option<ID3D11VideoProcessorInputView> = None;
+        // SAFETY: `bgra_texture` and `self.enumerator` belong to the same
+        // `ID3D11Device` and `input_view` is a local out-parameter.
+        unsafe {
+            self.video_device.CreateVideoProcessorInputView(
+                bgra_texture,
+                &self.enumerator,
+                &raw const input_desc,
+                Some(&raw mut input_view),
+            )
+        }?;
+        let input_view = input_view.ok_or_else(windows::core::Error::empty)?;
+
+        let slot = self.next_slot;
+        self.next_slot ^= 1;
+        let (nv12_texture, output_view) = &self.surfaces[slot];
+
+        let streams = [D3D11_VIDEO_PROCESSOR_STREAM {
+            Enable: true.into(),
+            OutputIndex: 0,
+            InputFrameOrField: 0,
+            PastFrames: 0,
+            FutureFrames: 0,
+            ppPastSurfaces: std::ptr::null_mut(),
+            pInputSurface: std::mem::ManuallyDrop::new(Some(input_view)),
+            ppFutureSurfaces: std::ptr::null_mut(),
+            ppPastSurfacesRight: std::ptr::null_mut(),
+            pInputSurfaceRight: std::mem::ManuallyDrop::new(None),
+            ppFutureSurfacesRight: std::ptr::null_mut(),
+        }];
+        // SAFETY: `self.processor`, `output_view`, and `streams[0].pInputSurface`
+        // are valid interfaces on the same `ID3D11Device`.
+        let blt_result = unsafe {
+            self.video_context
+                .VideoProcessorBlt(&self.processor, output_view, 0, &streams)
+        };
+        let [stream] = streams;
+        drop(std::mem::ManuallyDrop::into_inner(stream.pInputSurface));
+        drop(std::mem::ManuallyDrop::into_inner(
+            stream.pInputSurfaceRight,
+        ));
+        blt_result?;
+
+        // SAFETY: `nv12_texture` is a valid `ID3D11Texture2D` subresource 0.
+        let buffer: IMFMediaBuffer =
+            unsafe { MFCreateDXGISurfaceBuffer(&ID3D11Texture2D::IID, nv12_texture, 0, false) }?;
+        if let Ok(buffer_2d) = buffer.cast::<IMF2DBuffer>() {
+            // SAFETY: `buffer_2d` is a valid 2D surface buffer; returns byte length by value.
+            if let Ok(len) = unsafe { buffer_2d.GetContiguousLength() } {
+                // SAFETY: `buffer` is valid and `len` is its contiguous 2D byte length.
+                let _ = unsafe { buffer.SetCurrentLength(len) };
+            }
+        }
+
+        // SAFETY: takes no arguments and returns an owned empty sample.
+        let sample = unsafe { MFCreateSample() }?;
+        // SAFETY: `sample` and `buffer` are valid COM objects.
+        unsafe { sample.AddBuffer(&buffer) }?;
+        // SAFETY: `sample` is valid; timestamp passed by value.
+        unsafe { sample.SetSampleTime(sample_time) }?;
+        // SAFETY: `sample` is valid; duration passed by value.
+        unsafe { sample.SetSampleDuration(sample_duration) }?;
+        Ok(sample)
+    }
+}
+
 /// Hardware H.264 encoder backed by Windows Media Foundation.
 pub struct MediaFoundationEncoder {
     activate: IMFActivate,
     transform: IMFTransform,
     events: IMFMediaEventGenerator,
     codec_api: Option<ICodecAPI>,
+    d3d11: Option<D3d11Pipeline>,
     name: String,
     width: u32,
     height: u32,
@@ -204,6 +470,7 @@ impl std::fmt::Debug for MediaFoundationEncoder {
             .field("name", &self.name)
             .field("width", &self.width)
             .field("height", &self.height)
+            .field("zero_copy_gpu", &self.d3d11.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -219,6 +486,23 @@ impl MediaFoundationEncoder {
     /// Returns [`CodecError::HardwareUnavailable`] if no hardware encoder is
     /// present, or another [`CodecError`] if configuration fails.
     pub fn new(width: u32, height: u32, settings: EncoderSettings) -> Result<Self, CodecError> {
+        Self::new_with_device(width, height, settings, None)
+    }
+
+    /// Opens the first available hardware H.264 encoder for `width`x`height`
+    /// frames, optionally binding `d3d11_device` via `IMFDXGIDeviceManager` for
+    /// zero-copy GPU texture encoding.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CodecError::HardwareUnavailable`] if no hardware encoder is
+    /// present, or another [`CodecError`] if configuration fails.
+    pub fn new_with_device(
+        width: u32,
+        height: u32,
+        settings: EncoderSettings,
+        d3d11_device: Option<&ID3D11Device>,
+    ) -> Result<Self, CodecError> {
         let (even_width, even_height) = (width & !1, height & !1);
         if even_width < 2 || even_height < 2 {
             return Err(CodecError::InvalidDimensions { width, height });
@@ -233,7 +517,14 @@ impl MediaFoundationEncoder {
         let mut last_error = CodecError::HardwareUnavailable;
         for activate in hardware_encoders()? {
             let name = friendly_name(&activate);
-            match Self::open(activate, name.clone(), even_width, even_height, settings) {
+            match Self::open(
+                activate,
+                name.clone(),
+                even_width,
+                even_height,
+                settings,
+                d3d11_device,
+            ) {
                 Ok(encoder) => return Ok(encoder),
                 Err(error) => last_error = CodecError::Platform(format!("{name}: {error}")),
             }
@@ -247,12 +538,19 @@ impl MediaFoundationEncoder {
         &self.name
     }
 
+    /// Whether the encoder is bound to a Direct3D 11 device for zero-copy GPU encoding.
+    #[must_use]
+    pub const fn is_zero_copy(&self) -> bool {
+        self.d3d11.is_some()
+    }
+
     fn open(
         activate: IMFActivate,
         name: String,
         width: u32,
         height: u32,
         settings: EncoderSettings,
+        d3d11_device: Option<&ID3D11Device>,
     ) -> Result<Self, CodecError> {
         #[allow(
             clippy::cast_possible_truncation,
@@ -278,6 +576,9 @@ impl MediaFoundationEncoder {
         let events: IMFMediaEventGenerator = transform
             .cast()
             .map_err(|e| mf_error("IMFMediaEventGenerator", &e))?;
+
+        let d3d11 = d3d11_device
+            .and_then(|device| D3d11Pipeline::new(device, &transform, width, height, fps).ok());
 
         let codec_api: Option<ICodecAPI> = transform.cast().ok();
         if let Some(api) = &codec_api {
@@ -362,6 +663,7 @@ impl MediaFoundationEncoder {
             transform,
             events,
             codec_api,
+            d3d11,
             name,
             width,
             height,
@@ -543,8 +845,31 @@ impl MediaFoundationEncoder {
         })
     }
 
-    /// Creates an NV12 input sample, converting BGRA directly into the Media Foundation buffer.
-    fn input_sample(&self, frame: RawFrame<'_>) -> Result<IMFSample, CodecError> {
+    /// Creates an NV12 input sample, using the zero-copy GPU `ID3D11VideoProcessor`
+    /// path when `frame.d3d11_texture` is available and falling back to CPU conversion.
+    fn input_sample(&mut self, frame: RawFrame<'_>) -> Result<IMFSample, CodecError> {
+        let time = i64::try_from(self.started.elapsed().as_nanos() / 100).unwrap_or(i64::MAX);
+        if frame.width == self.width
+            && frame.height == self.height
+            && let (Some(d3d11), Some(gpu)) = (&mut self.d3d11, frame.d3d11_texture)
+        {
+            if let Ok(sample) =
+                d3d11.convert_to_sample(gpu.texture, time, self.frame_duration_100ns)
+            {
+                return Ok(sample);
+            }
+            // Unbind D3D manager and fall back to CPU buffers if GPU conversion fails.
+            // SAFETY: `transform` is valid; passing `0` detaches the D3D manager.
+            let _ = unsafe {
+                self.transform
+                    .ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, 0)
+            };
+            self.d3d11 = None;
+        }
+        self.cpu_input_sample(frame, time)
+    }
+
+    fn cpu_input_sample(&self, frame: RawFrame<'_>, time: i64) -> Result<IMFSample, CodecError> {
         let (width, height) = (self.width as usize, self.height as usize);
         let nv12_len = width * height * 3 / 2;
         let length = u32::try_from(nv12_len).map_err(|_| CodecError::InvalidDimensions {
@@ -573,7 +898,6 @@ impl MediaFoundationEncoder {
         let sample = unsafe { MFCreateSample() }.map_err(|e| mf_error("MFCreateSample", &e))?;
         // SAFETY: `sample` and `buffer` are valid; the sample retains its own reference to `buffer`.
         unsafe { sample.AddBuffer(&buffer) }.map_err(|e| mf_error("AddBuffer", &e))?;
-        let time = i64::try_from(self.started.elapsed().as_nanos() / 100).unwrap_or(i64::MAX);
         // SAFETY: `sample` is valid; timestamp passed by value.
         unsafe { sample.SetSampleTime(time) }.map_err(|e| mf_error("sample time", &e))?;
         // SAFETY: `sample` is valid; duration passed by value.
@@ -706,11 +1030,7 @@ mod tests {
                 pixel.copy_from_slice(&[value, value, value, 255]);
             }
             let frames = encoder
-                .encode(RawFrame {
-                    width,
-                    height,
-                    bgra: &bgra,
-                })
+                .encode(RawFrame::from_bgra(width, height, &bgra))
                 .unwrap();
             sent += 1;
             for frame in frames {
@@ -729,5 +1049,116 @@ mod tests {
         // Pixel inside a bright or dark stripe: verify it did not wash out to gray.
         let [_, red, _, _] = image.xrgb[(180 * 640 + 10) as usize].to_be_bytes();
         assert!(!(60..200).contains(&red), "degraded image: {red}");
+    }
+
+    /// Exercises the zero-copy D3D11 texture -> `ID3D11VideoProcessor` (BGRA->NV12)
+    /// -> `MFCreateDXGISurfaceBuffer` hardware encoding path when a hardware GPU is
+    /// available.
+    #[test]
+    #[allow(unsafe_code)]
+    fn hardware_zero_copy_d3d11_round_trip() {
+        use windows::Win32::Foundation::HMODULE;
+        use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
+        use windows::Win32::Graphics::Direct3D11::{
+            D3D11_BIND_SHADER_RESOURCE, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+            D3D11_CREATE_DEVICE_VIDEO_SUPPORT, D3D11_SDK_VERSION, D3D11_SUBRESOURCE_DATA,
+            D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, D3D11CreateDevice,
+        };
+        use windows::Win32::Graphics::Dxgi::Common::{
+            DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC,
+        };
+
+        let (width, height) = (640_u32, 360_u32);
+        let (mut device, mut context) = (None, None);
+        let flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT;
+        // SAFETY: standard D3D11 hardware device creation with video support.
+        let hr = unsafe {
+            D3D11CreateDevice(
+                None,
+                D3D_DRIVER_TYPE_HARDWARE,
+                HMODULE::default(),
+                flags,
+                None,
+                D3D11_SDK_VERSION,
+                Some(&raw mut device),
+                None,
+                Some(&raw mut context),
+            )
+        };
+        let (Some(device), Some(context)) = (hr.ok().and(device), context) else {
+            return;
+        };
+
+        let settings = EncoderSettings::default();
+        let mut encoder = match super::MediaFoundationEncoder::new_with_device(
+            width,
+            height,
+            settings,
+            Some(&device),
+        ) {
+            Ok(encoder) => encoder,
+            Err(CodecError::HardwareUnavailable) => return,
+            Err(error) => panic!("hardware zero-copy encoder failed: {error}"),
+        };
+
+        let bgra = vec![200u8; (width * height * 4) as usize];
+        let desc = D3D11_TEXTURE2D_DESC {
+            Width: width,
+            Height: height,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: D3D11_BIND_SHADER_RESOURCE.0.cast_unsigned(),
+            CPUAccessFlags: 0,
+            MiscFlags: 0,
+        };
+        let init = D3D11_SUBRESOURCE_DATA {
+            pSysMem: bgra.as_ptr().cast(),
+            SysMemPitch: width * 4,
+            SysMemSlicePitch: 0,
+        };
+        let mut texture = None;
+        // SAFETY: `desc` and `init` are valid and backed by `bgra`.
+        unsafe {
+            device.CreateTexture2D(
+                &raw const desc,
+                Some(&raw const init),
+                Some(&raw mut texture),
+            )
+        }
+        .unwrap();
+        let texture = texture.unwrap();
+
+        let mut decoder = OpenH264Decoder::new().unwrap();
+        let mut decoded = 0;
+        for _ in 0..20 {
+            let gpu = crate::D3d11Texture {
+                device: &device,
+                context: &context,
+                texture: &texture,
+            };
+            let frames = encoder
+                .encode(RawFrame {
+                    width,
+                    height,
+                    bgra: &bgra,
+                    d3d11_texture: Some(gpu),
+                })
+                .unwrap();
+            for frame in frames {
+                if decoder.decode(&frame.data).unwrap().is_some() {
+                    decoded += 1;
+                }
+            }
+        }
+        assert!(
+            decoded >= 15,
+            "only {decoded} frames decoded in zero-copy path"
+        );
     }
 }

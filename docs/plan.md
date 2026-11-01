@@ -255,14 +255,14 @@ Each phase ends with something that runs and can be demoed. ✅ marks what is do
 - ✅ `protocol` with the first messages; `identity` with keys and secure storage.
 - ✅ **Done when:** CI is green on all three platforms and `cargo deny` blocks incompatible licenses.
 
-### Phase 1: First image on screen (3–4 weeks), in progress
-- ✅ First image on screen: the agent captures the Windows screen (DXGI) and the image shows up on the other side.
-- ✅ Hardware encoder (Media Foundation: Quick Sync/NVENC/AMF).
-- Software encoder fallback and sending over direct QUIC.
-- Native client decodes and displays; mouse and keyboard working.
-- Latency overlay (host, network, decode and render).
-- **Done when:** controlling another machine on the same local network, with latency **≤ 30 ms** on the LAN at 1080p60.
-- **Measured so far:** 60 fps and 24.5 ms total latency at 1080p (Intel Core Ultra 5 135U), below the 30 ms target.
+### Phase 1: First image on screen (3–4 weeks) ✅
+- ✅ First image on screen: the agent captures the Windows screen (DXGI) and the image shows up on the other side, including hardware cursor compositing (`MONOCHROME`, `COLOR`, `MASKED_COLOR`) and rotated monitors (`90°`, `180°`, `270°`).
+- ✅ Hardware encoder (Media Foundation: Quick Sync/NVENC/AMF) with zero-copy GPU texture pipeline (`ID3D11VideoProcessor` BGRA→NV12 + `MFCreateDXGISurfaceBuffer` + `IMFDXGIDeviceManager`).
+- ✅ Software encoder fallback (`OpenH264`) and sending over direct QUIC.
+- ✅ Native client decodes and displays; mouse (including horizontal and vertical wheel) and keyboard working.
+- ✅ Latency overlay (host, network, decode and render).
+- ✅ **Done when:** controlling another machine on the same local network, with latency **≤ 30 ms** on the LAN at 1080p60.
+- ✅ **Measured so far:** 60 fps and 24.5 ms total latency at 1080p (Intel Core Ultra 5 135U), below the 30 ms target.
 
 ### Phase 2: Mesh network and server (4–6 weeks)
 - Coordinator: machine enrollment with a pre-authorized key, netmap stream, OIDC.

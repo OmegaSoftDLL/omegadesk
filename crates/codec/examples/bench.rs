@@ -28,11 +28,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for round in 0..5 {
         bgra[round * 4096] ^= 0xFF;
         let start = Instant::now();
-        let frame = encoder.encode(RawFrame {
-            width,
-            height,
-            bgra: &bgra,
-        })?;
+        let frame = encoder.encode(RawFrame::from_bgra(width, height, &bgra))?;
         tracing_line(
             &format!(
                 "software encode #{round} ({} bytes)",
@@ -55,11 +51,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         for round in 0..10 {
             bgra[round * 4096] ^= 0xFF;
             let start = Instant::now();
-            let frames = hardware.encode(RawFrame {
-                width,
-                height,
-                bgra: &bgra,
-            })?;
+            let frames = hardware.encode(RawFrame::from_bgra(width, height, &bgra))?;
             tracing_line(
                 &format!(
                     "hardware #{round} ({} frames, {} bytes)",

@@ -222,6 +222,29 @@ fn button_bit(button: MouseButton) -> u32 {
     }
 }
 
+/// Converts a `winit` scroll delta into protocol `1/120`-notch units (`WHEEL_STEP`).
+///
+/// `winit` reports positive horizontal deltas when scrolling left (matching
+/// vertical deltas where positive is up, i.e. the direction content moves),
+/// whereas [`PointerEvent`] and Win32 `MOUSEEVENTF_HWHEEL` use positive values
+/// for scrolling right and up, so horizontal `x` is negated.
+fn scroll_deltas(delta: MouseScrollDelta) -> (i32, i32) {
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_precision_loss,
+        reason = "scroll deltas are small"
+    )]
+    match delta {
+        MouseScrollDelta::LineDelta(x, y) => (
+            (-x * WHEEL_STEP as f32).round() as i32,
+            (y * WHEEL_STEP as f32).round() as i32,
+        ),
+        MouseScrollDelta::PixelDelta(position) => {
+            ((-position.x).round() as i32, position.y.round() as i32)
+        }
+    }
+}
+
 impl ApplicationHandler<UserEvent> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.graphics.is_some() {
@@ -297,20 +320,7 @@ impl ApplicationHandler<UserEvent> for App {
                 self.send_pointer(0, 0);
             }
             WindowEvent::MouseWheel { delta, .. } => {
-                #[allow(
-                    clippy::cast_possible_truncation,
-                    clippy::cast_precision_loss,
-                    reason = "scroll deltas are small"
-                )]
-                let (x, y) = match delta {
-                    MouseScrollDelta::LineDelta(x, y) => (
-                        (x * WHEEL_STEP as f32) as i32,
-                        (y * WHEEL_STEP as f32) as i32,
-                    ),
-                    MouseScrollDelta::PixelDelta(position) => {
-                        (position.x as i32, position.y as i32)
-                    }
-                };
+                let (x, y) = scroll_deltas(delta);
                 self.send_pointer(x, y);
             }
             WindowEvent::KeyboardInput { event, .. } => {
@@ -343,5 +353,34 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::Focused(false) => self.release_all(),
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use omegadesk_input::WHEEL_STEP;
+    use winit::dpi::PhysicalPosition;
+    use winit::event::MouseScrollDelta;
+
+    use super::scroll_deltas;
+
+    #[test]
+    fn horizontal_scroll_sign_is_inverted_for_win32_hwheel() {
+        // winit reports -1.0 horizontal line delta when scrolling right on Windows;
+        // PointerEvent/MOUSEEVENTF_HWHEEL expects +WHEEL_STEP for scrolling right.
+        assert_eq!(
+            scroll_deltas(MouseScrollDelta::LineDelta(-1.0, 1.0)),
+            (WHEEL_STEP, WHEEL_STEP)
+        );
+        assert_eq!(
+            scroll_deltas(MouseScrollDelta::LineDelta(1.0, -1.0)),
+            (-WHEEL_STEP, -WHEEL_STEP)
+        );
+        assert_eq!(
+            scroll_deltas(MouseScrollDelta::PixelDelta(PhysicalPosition::new(
+                -45.0, 60.0
+            ))),
+            (45, 60)
+        );
     }
 }
