@@ -318,12 +318,25 @@ impl Default for ScriptRunner {
     }
 }
 
-fn truncate_output(bytes: &[u8], limit: usize) -> (String, bool) {
-    if bytes.len() <= limit {
-        (String::from_utf8_lossy(bytes).into_owned(), false)
-    } else {
-        (String::from_utf8_lossy(&bytes[..limit]).into_owned(), true)
+async fn read_bounded<R>(mut reader: R, limit: usize) -> std::io::Result<(String, bool)>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt as _;
+
+    let mut output = Vec::new();
+    let mut truncated = false;
+    let mut buffer = [0u8; 8192];
+    loop {
+        let read = reader.read(&mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+        let remaining = limit.saturating_sub(output.len());
+        truncated |= read > remaining;
+        output.extend_from_slice(&buffer[..read.min(remaining)]);
     }
+    Ok((String::from_utf8_lossy(&output).into_owned(), truncated))
 }
 
 impl ScriptRunner {
@@ -342,7 +355,7 @@ impl ScriptRunner {
     ///
     /// # Errors
     ///
-    /// Returns the I/O error when the shell cannot be spawned.
+    /// Returns the I/O error when the shell cannot be spawned or its output cannot be read.
     pub async fn run(
         &self,
         command: &str,
@@ -352,7 +365,7 @@ impl ScriptRunner {
             .unwrap_or(self.default_timeout)
             .min(self.max_timeout);
         let (shell, shell_args) = Self::shell();
-        let child = Command::new(shell)
+        let mut child = Command::new(shell)
             .args(shell_args)
             .arg(command)
             .stdin(Stdio::null())
@@ -360,19 +373,34 @@ impl ScriptRunner {
             .stderr(Stdio::piped())
             .kill_on_drop(true)
             .spawn()?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| std::io::Error::other("shell stdout pipe was not created"))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| std::io::Error::other("shell stderr pipe was not created"))?;
+        let stdout_task = tokio::spawn(read_bounded(stdout, self.max_output_bytes));
+        let stderr_task = tokio::spawn(read_bounded(stderr, self.max_output_bytes));
         let started = Instant::now();
-        // Dropping the future on timeout kills the child (`kill_on_drop`).
-        let output = tokio::time::timeout(timeout, child.wait_with_output()).await;
+        let output = tokio::time::timeout(timeout, async {
+            let status = child.wait().await?;
+            let stdout = stdout_task
+                .await
+                .map_err(|error| std::io::Error::other(format!("stdout reader: {error}")))??;
+            let stderr = stderr_task
+                .await
+                .map_err(|error| std::io::Error::other(format!("stderr reader: {error}")))??;
+            Ok::<_, std::io::Error>((status, stdout, stderr))
+        })
+        .await;
         let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
         match output {
             Ok(output) => {
-                let output = output?;
-                let (stdout, stdout_truncated) =
-                    truncate_output(&output.stdout, self.max_output_bytes);
-                let (stderr, stderr_truncated) =
-                    truncate_output(&output.stderr, self.max_output_bytes);
+                let (status, (stdout, stdout_truncated), (stderr, stderr_truncated)) = output?;
                 Ok(ScriptOutcome {
-                    exit_code: output.status.code(),
+                    exit_code: status.code(),
                     timed_out: false,
                     duration_ms,
                     stdout,
@@ -442,7 +470,7 @@ mod tests {
             Err(SessionError::NoMesh(_))
         ));
         assert!(matches!(offline.stop(7), Err(SessionError::NotFound(7))));
-        assert!(offline.status().is_empty());
+        assert_eq!(offline.status(), Vec::new());
     }
 
     #[tokio::test]

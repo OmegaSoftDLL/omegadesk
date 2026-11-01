@@ -248,6 +248,12 @@ impl McpTrustEngine {
         self.emergency_stop_reason.is_some()
     }
 
+    /// Reason supplied when the emergency stop was activated.
+    #[must_use]
+    pub fn emergency_stop_reason(&self) -> Option<&str> {
+        self.emergency_stop_reason.as_deref()
+    }
+
     /// Evaluates the risk of invoking `tool_name` with `arguments` on `device_id`, ported from
     /// `TrustEngine::assess_risk` and `base_risk` (`trust.rs` lines 272–354).
     #[must_use]

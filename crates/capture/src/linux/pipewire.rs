@@ -206,7 +206,7 @@ async fn negotiate_portal(index: u32) -> Result<PortalStream, CaptureError> {
             &session,
             SelectSourcesOptions::default()
                 .set_cursor_mode(CursorMode::Hidden)
-                .set_sources(SourceType::Monitor | SourceType::Window)
+                .set_sources(Some(SourceType::Monitor.into()))
                 .set_multiple(true)
                 .set_persist_mode(PersistMode::DoNot),
         )
@@ -503,5 +503,27 @@ fn run_capture(
         slot.close(error.to_string());
     } else {
         slot.close("PipeWire loop ended".to_owned());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn negotiated_formats_map_to_their_in_memory_layout() {
+        for format in [VideoFormat::BGRx, VideoFormat::BGRA] {
+            assert_eq!(layout_of(format), Some(PixelLayout::Bgrx));
+        }
+        for format in [VideoFormat::RGBx, VideoFormat::RGBA] {
+            assert_eq!(layout_of(format), Some(PixelLayout::Rgbx));
+        }
+        for format in [VideoFormat::xRGB, VideoFormat::ARGB] {
+            assert_eq!(layout_of(format), Some(PixelLayout::Xrgb));
+        }
+        for format in [VideoFormat::xBGR, VideoFormat::ABGR] {
+            assert_eq!(layout_of(format), Some(PixelLayout::Xbgr));
+        }
+        assert_eq!(layout_of(VideoFormat::I420), None);
     }
 }

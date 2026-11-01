@@ -121,6 +121,7 @@ async fn main() -> anyhow::Result<()> {
                 preauth_key: preauth_key.clone(),
                 hostname: args.name.clone(),
                 endpoints: Vec::new(),
+                quicksupport_id: None,
             });
             node_config.bind = args.listen;
             node_config.relay_only = args.relay_only;

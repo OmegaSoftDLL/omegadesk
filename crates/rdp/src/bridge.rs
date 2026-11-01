@@ -81,7 +81,7 @@ pub enum CertificatePolicy {
 }
 
 /// Connection parameters of an [`RdpBridge`].
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct RdpBridgeConfig {
     /// `host:port` of the RDP server (port `3389` for Windows Remote Desktop).
     pub destination: String,
@@ -103,6 +103,22 @@ pub struct RdpBridgeConfig {
     /// Client name sent in the Client Core Data (`[MS-RDPBCGR]` 2.2.1.3.2), at most 15
     /// characters.
     pub client_name: String,
+}
+
+impl fmt::Debug for RdpBridgeConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RdpBridgeConfig")
+            .field("destination", &self.destination)
+            .field("server_name", &self.server_name)
+            .field("username", &self.username)
+            .field("password", &"<redacted>")
+            .field("domain", &self.domain)
+            .field("desktop_size", &self.desktop_size)
+            .field("certificate", &self.certificate)
+            .field("connect_timeout", &self.connect_timeout)
+            .field("client_name", &self.client_name)
+            .finish()
+    }
 }
 
 impl RdpBridgeConfig {
@@ -235,7 +251,7 @@ pub enum RdpBridgeError {
     /// The session task is gone.
     #[error("RDP session ended: {0}")]
     Disconnected(String),
-    /// More than [`INPUT_QUEUE`] input batches are waiting for the session task.
+    /// More than `INPUT_QUEUE` input batches are waiting for the session task.
     #[error("too many pending RDP input events")]
     InputQueueFull,
     /// Desktop size outside `200..=8192` on either axis.
@@ -643,7 +659,13 @@ async fn run_session(
         for output in outputs {
             match output {
                 ActiveStageOutput::ResponseFrame(frame) => framed.write_all(&frame).await?,
-                ActiveStageOutput::GraphicsUpdate(_) => dirty = true,
+                // Software pointer rendering changes `image` even when there is no bitmap
+                // update, so cursor-only movement must also wake the capture pipeline.
+                ActiveStageOutput::GraphicsUpdate(_)
+                | ActiveStageOutput::PointerDefault
+                | ActiveStageOutput::PointerHidden
+                | ActiveStageOutput::PointerPosition { .. }
+                | ActiveStageOutput::PointerBitmap(_) => dirty = true,
                 ActiveStageOutput::Terminate(reason) => terminate = Some(reason),
                 ActiveStageOutput::DeactivateAll => {
                     reactivate(
@@ -657,11 +679,6 @@ async fn run_session(
                     .await?;
                     dirty = true;
                 }
-                // The pointer is drawn into the framebuffer (`pointer_software_rendering`).
-                ActiveStageOutput::PointerDefault
-                | ActiveStageOutput::PointerHidden
-                | ActiveStageOutput::PointerPosition { .. }
-                | ActiveStageOutput::PointerBitmap(_) => {}
                 // Not negotiated by the bridge (no multitransport flags, no autodetect
                 // response): the server continues over the main TCP connection.
                 ActiveStageOutput::MultitransportRequest(_) => {
@@ -756,6 +773,9 @@ mod tests {
             "10.0.0.5"
         );
         assert!(config.validate().is_ok());
+        let debug = format!("{config:?}");
+        assert!(!debug.contains("pw"));
+        assert!(debug.contains("<redacted>"));
     }
 
     #[test]

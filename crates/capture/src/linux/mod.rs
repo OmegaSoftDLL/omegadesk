@@ -93,9 +93,15 @@ pub fn open_display_with(
         Err(x11_error) => {
             warn!("X11 capture unavailable: {x11_error}");
             Err(match portal_error {
-                Some(portal_error) => {
-                    crate::resolve_fallback_error(index, &portal_error, &x11_error)
+                Some(portal_error)
+                    if matches!(portal_error, CaptureError::DisplayNotFound(_))
+                        && matches!(x11_error, CaptureError::DisplayNotFound(_)) =>
+                {
+                    CaptureError::DisplayNotFound(index)
                 }
+                Some(portal_error) => CaptureError::Os(format!(
+                    "display {index}: PipeWire failed ({portal_error}); X11 failed ({x11_error})"
+                )),
                 None => x11_error,
             })
         }

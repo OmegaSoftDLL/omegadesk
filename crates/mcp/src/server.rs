@@ -1,6 +1,6 @@
 //! The OmegaDesk MCP server: tools, trust gating and operator confirmation.
 //!
-//! Every guarded tool goes through [`OmegaDeskMcpServer::gate`], the equivalent of
+//! Every guarded tool goes through `OmegaDeskMcpServer::gate`, the equivalent of
 //! QuickDesk's `check_trust_and_confirm` (`quickdesk-mcp/src/server.rs`):
 //!
 //! 1. the emergency stop refuses everything;
@@ -314,13 +314,7 @@ impl OmegaDeskMcpServer {
     }
 
     fn emergency_reason(&self) -> Option<String> {
-        let trust = self.lock_trust();
-        trust.is_emergency_active().then(|| {
-            trust.audit_log().last().map_or_else(
-                || "emergency stop".to_owned(),
-                |entry| entry.tool_name.clone(),
-            )
-        })
+        self.lock_trust().emergency_stop_reason().map(str::to_owned)
     }
 
     /// Read-only tools still honor the kill switch and leave an audit entry.
@@ -564,7 +558,10 @@ impl OmegaDeskMcpServer {
         self.gate_read_only("session_status")?;
         let (emergency_stop, audit_entries) = {
             let trust = self.lock_trust();
-            (self.emergency_reason(), trust.audit_log().len())
+            (
+                trust.emergency_stop_reason().map(str::to_owned),
+                trust.audit_log().len(),
+            )
         };
         Ok(Json(SessionStatus {
             uptime_secs: self.started_at.elapsed().as_secs(),
@@ -741,6 +738,10 @@ impl OmegaDeskMcpServer {
     }
 }
 
+#[allow(
+    clippy::unused_async_trait_impl,
+    reason = "rmcp's tool_handler macro generates async trait methods; get_info is intentionally synchronous"
+)]
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for OmegaDeskMcpServer {
     fn get_info(&self) -> ServerConfig {

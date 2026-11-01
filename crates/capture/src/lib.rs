@@ -24,6 +24,7 @@ pub mod virtual_display;
 #[cfg(windows)]
 mod wgc;
 
+#[cfg(windows)]
 use service_desktop::CaptureBackendKind;
 
 /// Screen capture errors.
@@ -207,7 +208,23 @@ pub trait Capturer: Send {
 /// Returns an error if the monitor does not exist or if the operating system
 /// denies screen capture.
 pub fn open_display(index: u32) -> Result<Box<dyn Capturer>, CaptureError> {
-    open_display_tracked(index).map(|(capturer, _backend)| capturer)
+    #[cfg(windows)]
+    {
+        open_display_tracked(index).map(|(capturer, _backend)| capturer)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        linux::open_display(index)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        macos::MacOsCapturer::open(index).map(|capturer| Box::new(capturer) as Box<dyn Capturer>)
+    }
+    #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+    {
+        let _ = index;
+        Err(CaptureError::Unsupported)
+    }
 }
 
 /// Opens a capturer for monitor `index` and reports which backend of the
@@ -224,54 +241,39 @@ pub fn open_display(index: u32) -> Result<Box<dyn Capturer>, CaptureError> {
 /// # Errors
 ///
 /// Returns an error if the monitor does not exist or every backend fails.
+#[cfg(windows)]
 pub fn open_display_tracked(
     index: u32,
 ) -> Result<(Box<dyn Capturer>, CaptureBackendKind), CaptureError> {
-    #[cfg(windows)]
-    {
-        if !service_desktop::input_desktop_selected() {
-            let _ = service_desktop::select_input_desktop();
+    if !service_desktop::input_desktop_selected() {
+        let _ = service_desktop::select_input_desktop();
+    }
+    let dxgi_error = match dxgi::DxgiCapturer::open(index) {
+        Ok(capturer) => {
+            return Ok((
+                Box::new(capturer),
+                CaptureBackendKind::DxgiDesktopDuplication,
+            ));
         }
-        let dxgi_error = match dxgi::DxgiCapturer::open(index) {
-            Ok(capturer) => {
-                return Ok((
-                    Box::new(capturer),
-                    CaptureBackendKind::DxgiDesktopDuplication,
-                ));
-            }
-            Err(error) => error,
-        };
-        let wgc_error = match wgc::WgcCapturer::open(index) {
-            Ok(capturer) => {
-                return Ok((
-                    Box::new(capturer),
-                    CaptureBackendKind::WindowsGraphicsCapture,
-                ));
-            }
-            Err(error) => error,
-        };
-        match gdi::GdiCapturer::open(index) {
-            Ok(capturer) => Ok((Box::new(capturer), CaptureBackendKind::GdiBitBlt)),
-            Err(gdi_error) => Err(resolve_fallback_error(
-                index,
-                &dxgi_error,
-                &wgc_error,
-                &gdi_error,
-            )),
+        Err(error) => error,
+    };
+    let wgc_error = match wgc::WgcCapturer::open(index) {
+        Ok(capturer) => {
+            return Ok((
+                Box::new(capturer),
+                CaptureBackendKind::WindowsGraphicsCapture,
+            ));
         }
-    }
-    #[cfg(target_os = "linux")]
-    {
-        linux::open_display(index)
-    }
-    #[cfg(target_os = "macos")]
-    {
-        macos::MacOsCapturer::open(index).map(|capturer| Box::new(capturer) as Box<dyn Capturer>)
-    }
-    #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
-    {
-        let _ = index;
-        Err(CaptureError::Unsupported)
+        Err(error) => error,
+    };
+    match gdi::GdiCapturer::open(index) {
+        Ok(capturer) => Ok((Box::new(capturer), CaptureBackendKind::GdiBitBlt)),
+        Err(gdi_error) => Err(resolve_fallback_error(
+            index,
+            &dxgi_error,
+            &wgc_error,
+            &gdi_error,
+        )),
     }
 }
 

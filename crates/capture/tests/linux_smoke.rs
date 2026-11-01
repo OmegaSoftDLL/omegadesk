@@ -1,8 +1,8 @@
 //! Linux capture smoke test: open the X11 backend and grab one frame.
 //!
 //! Runs on Linux CI under `xvfb-run`, which provides a virtual X server on `$DISPLAY`.
-//! Without a display (no `$DISPLAY`, or the server rejects the connection) the test skips,
-//! so it never fails on a developer machine or a headless runner without Xvfb.
+//! Without `$DISPLAY` the test skips; with a display configured, connection and capture
+//! failures are real test failures rather than silent skips.
 
 #![cfg(target_os = "linux")]
 #![allow(
@@ -23,13 +23,7 @@ fn x11_backend_grabs_a_frame_under_xvfb() {
         eprintln!("skipping: no $DISPLAY (run under xvfb-run)");
         return;
     }
-    let mut capturer = match X11Capturer::open(0) {
-        Ok(capturer) => capturer,
-        Err(error) => {
-            eprintln!("skipping: X11 capture unavailable ({error})");
-            return;
-        }
-    };
+    let mut capturer = X11Capturer::open(0).expect("X11 capture opens with $DISPLAY");
     let (width, height) = capturer.size();
     assert!(
         width > 0 && height > 0,
@@ -59,11 +53,8 @@ fn open_display_auto_falls_back_to_x11_without_a_portal() {
         return;
     }
     // Under Xvfb there is no xdg-desktop-portal, so Auto must fall through to X11.
-    match open_display_with(0, BackendChoice::Auto) {
-        Ok(capturer) => {
-            let (width, height) = capturer.size();
-            assert!(width > 0 && height > 0);
-        }
-        Err(error) => eprintln!("skipping: no capture backend available ({error})"),
-    }
+    let capturer = open_display_with(0, BackendChoice::Auto)
+        .expect("automatic capture falls back to X11 with $DISPLAY");
+    let (width, height) = capturer.size();
+    assert!(width > 0 && height > 0);
 }

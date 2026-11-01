@@ -171,7 +171,7 @@ mod tests {
         assert_eq!(local.id, identity.id());
         assert_eq!(local.record.fqdn, "Build-Box.omega");
         assert!(local.record.ipv4.is_none());
-        assert!(directory.devices().is_empty());
+        assert_eq!(directory.devices(), Vec::new());
         assert!(directory.resolve("Build-Box").is_none());
         assert!(directory.source().contains("no coordinator"));
     }

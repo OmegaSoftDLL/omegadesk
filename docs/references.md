@@ -49,7 +49,7 @@ enforced by `cargo deny`):
 | `pipewire` + `libspa` | Linux PipeWire screen capture (`crates/capture`, Linux only) | MIT |
 | `ashpd` | `xdg-desktop-portal` ScreenCast negotiation (Linux only) | MIT |
 | `x11rb` | Pure-Rust X11 capture fallback (Linux only) | MIT OR Apache-2.0 |
-| `objc2-core-graphics`, `objc2-core-foundation` | macOS CoreGraphics screen capture (macOS only) | MIT OR Apache-2.0 OR Zlib |
+| `objc2-core-graphics`, `objc2-core-foundation`, `objc2-io-surface`, `block2`, `dispatch2` | macOS `CGDisplayStream` screen capture and frame delivery (macOS only) | MIT OR Apache-2.0 OR Zlib |
 
 ## Local copies
 

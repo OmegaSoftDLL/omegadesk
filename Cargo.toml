@@ -45,9 +45,11 @@ arboard = { version = "3.7", default-features = false }
 ashpd = { version = "0.13", default-features = false, features = ["tokio", "screencast"] }
 async-trait = "0.1"
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "ws"] }
+block2 = "0.6"
 bytes = "1"
 clap = { version = "4", features = ["derive", "env"] }
 data-encoding = "2"
+dispatch2 = "0.3"
 if-addrs = "0.13"
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 ed25519-dalek = { version = "2", features = ["rand_core", "zeroize", "pkcs8"] }
@@ -68,7 +70,8 @@ keyring = { version = "3", features = ["apple-native", "windows-native"] }
 libc = "0.2"
 # macOS screen capture: CoreGraphics display capture (MIT OR Apache-2.0 OR Zlib).
 objc2-core-foundation = "0.3"
-objc2-core-graphics = "0.3"
+objc2-core-graphics = { version = "0.3", features = ["objc2-io-surface"] }
+objc2-io-surface = "0.3"
 openh264 = "0.9"
 # Linux screen capture: PipeWire client library bindings (MIT).
 pipewire = "0.10"

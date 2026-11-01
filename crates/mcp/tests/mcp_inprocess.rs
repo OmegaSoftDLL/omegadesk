@@ -92,21 +92,21 @@ impl ClientHandler for TestHost {
         .with_protocol_version(self.protocol.clone())
     }
 
-    async fn create_elicitation(
+    fn create_elicitation(
         &self,
         request: ElicitRequestParams,
         _context: RequestContext<RoleClient>,
-    ) -> Result<ElicitResult, ErrorData> {
+    ) -> impl Future<Output = Result<ElicitResult, ErrorData>> {
         let ElicitRequestParams::FormElicitationParams { message, .. } = request else {
-            return Ok(ElicitResult::new(ElicitationAction::Decline));
+            return std::future::ready(Ok(ElicitResult::new(ElicitationAction::Decline)));
         };
         self.prompts.lock().unwrap().push(message);
-        if self.approve {
+        std::future::ready(if self.approve {
             Ok(ElicitResult::new(ElicitationAction::Accept)
                 .with_content(json!({ "approve": true })))
         } else {
             Ok(ElicitResult::new(ElicitationAction::Decline))
-        }
+        })
     }
 }
 
@@ -176,7 +176,9 @@ fn params(name: &'static str, arguments: Value) -> CallToolRequestParams {
     params.arguments = match arguments {
         Value::Object(object) => Some(object),
         Value::Null => None,
-        other => panic!("arguments must be an object: {other}"),
+        other @ (Value::Bool(_) | Value::Number(_) | Value::String(_) | Value::Array(_)) => {
+            panic!("arguments must be an object: {other}")
+        }
     };
     params
 }
@@ -323,12 +325,13 @@ async fn run_script_is_confirmed_through_input_required_on_the_latest_protocol()
     );
     assert!(prompts[0].contains("echo mcp-ok"), "{}", prompts[0]);
 
-    let trust = harness.trust.lock().unwrap();
-    let entry = trust.audit_log().last().unwrap();
-    assert_eq!(entry.tool_name, "run_script");
-    assert_eq!(entry.risk_level, RiskLevel::High);
-    assert_eq!(entry.recommendation, TrustRecommendation::Confirm);
-    drop(trust);
+    {
+        let trust = harness.trust.lock().unwrap();
+        let entry = trust.audit_log().last().unwrap();
+        assert_eq!(entry.tool_name, "run_script");
+        assert_eq!(entry.risk_level, RiskLevel::High);
+        assert_eq!(entry.recommendation, TrustRecommendation::Confirm);
+    }
     finish(harness).await;
 }
 
@@ -364,11 +367,12 @@ async fn declined_confirmation_refuses_the_action_and_is_audited() {
         let text = error_text(&result);
         assert!(text.contains("did not approve"), "{text}");
         assert_eq!(harness.prompts.lock().unwrap().len(), 1);
-        let trust = harness.trust.lock().unwrap();
-        let entry = trust.audit_log().last().unwrap();
-        assert_eq!(entry.tool_name, "run_script");
-        assert_eq!(entry.recommendation, TrustRecommendation::Confirm);
-        drop(trust);
+        {
+            let trust = harness.trust.lock().unwrap();
+            let entry = trust.audit_log().last().unwrap();
+            assert_eq!(entry.tool_name, "run_script");
+            assert_eq!(entry.recommendation, TrustRecommendation::Confirm);
+        }
         finish(harness).await;
     }
 }
