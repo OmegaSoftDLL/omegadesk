@@ -32,6 +32,8 @@ use tokio::sync::mpsc;
 pub mod control_server;
 pub mod rmm;
 pub mod web_gateway;
+pub mod web_server;
+pub mod web_session;
 pub mod webhooks_audit;
 
 /// Base internal DNS suffix for all machines on the OmegaDesk mesh (`*.omega`).

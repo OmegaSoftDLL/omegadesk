@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>OmegaDesk</title>
+    <link rel="icon" href="data:," />
+    <link rel="stylesheet" href="/style.css" />
+    <script type="module" src="/main.js"></script>
+  </head>
+  <body>
+    <main id="connect-panel">
+      <h1>OmegaDesk</h1>
+      <form id="login-form" autocomplete="off">
+        <label for="agent">Agent name</label>
+        <input id="agent" name="agent" type="text" placeholder="office-pc" required autofocus />
+        <label for="password">Access password</label>
+        <input id="password" name="password" type="password" autocomplete="current-password" required />
+        <button id="connect" type="submit">Connect</button>
+      </form>
+      <p id="status" data-error="false">loading…</p>
+    </main>
+    <section id="viewer-panel" hidden>
+      <header id="toolbar">
+        <span id="viewer-status"></span>
+        <span id="latency"></span>
+        <button id="fullscreen" type="button">Fullscreen</button>
+        <button id="disconnect" type="button">Disconnect</button>
+      </header>
+      <div id="screen-host"></div>
+    </section>
+  </body>
+</html>

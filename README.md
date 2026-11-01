@@ -23,7 +23,7 @@ OmegaDesk is a remote desktop you run on your own infrastructure, as an alternat
 ## Status
 
 > [!WARNING]
-> OmegaDesk is in early development. **Phases 0 and 1** of the [roadmap](docs/plan.md) are done: it works on a local network today, connecting by IP address, certificate fingerprint and password. **Phase 2** (coordinator, relay and mesh) is implemented end to end: agent and client enroll with a coordinator and connect by name through NAT traversal or the relay, verified in-process; the test across two real NATs is still pending. The web client, recording, RMM and compatibility layers (Phases 3–7) exist only as library crates that no binary uses yet; the plan lists their known defects. It is not ready for production use.
+> OmegaDesk is in early development. **Phases 0 and 1** of the [roadmap](docs/plan.md) are done: it works on a local network today, connecting by IP address, certificate fingerprint and password. **Phase 2** (coordinator, relay and mesh) is implemented end to end: agent and client enroll with a coordinator and connect by name through NAT traversal or the relay, verified in-process; the test across two real NATs is still pending. The **browser client** (Phase 4) connects through the coordinator's web gateway with keyboard, mouse and H.264 video, verified in-process; its latency against the native client is not measured yet. Recording, RMM and compatibility layers (Phases 3, 5–7) exist only as library crates that no binary uses yet; the plan lists their known defects. It is not ready for production use.
 
 What works today:
 
@@ -64,6 +64,7 @@ Useful flags:
 | `--view-only` | client | Watch only; do not send keyboard and mouse |
 | `--server`, `--server-key`, `--preauth-key` | agent, client | Join the mesh through a coordinator (see below) |
 | `--relay-only` | agent, client | Mesh mode: never attempt direct paths |
+| `--web-listen`, `--web-root`, `--web-allowed-host`, `--web-behind-tls` | server | Serve the browser client and proxy browsers to agents (see below) |
 
 ### Mesh mode (coordinator and relay)
 
@@ -83,6 +84,19 @@ Then enroll the agent and connect from the client by name:
 cargo run --release -p omegadesk-agent -- --name office-pc --server coord.example:8080 --server-key <128 hex> --preauth-key odk_...
 cargo run --release -p omegadesk-client -- office-pc.omega --server coord.example:8080 --server-key <128 hex> --preauth-key odk_... --password <password>
 ```
+
+### Browser (web gateway)
+
+The coordinator can also serve a browser client and proxy it to an agent over the mesh. Build the page once ([Node 22](https://nodejs.org) or newer), then start the server with `--web-listen`:
+
+```sh
+cd web && npm ci && npm run build && cd ..
+cargo run --release -p omegadesk-server -- --listen 0.0.0.0:8080 --ticket-secret-hex <64 hex> \
+    --relay "relay.example:8443=<relay key>;stun=relay.example:8443" \
+    --web-listen 127.0.0.1:18123
+```
+
+Open `http://localhost:18123`, type the agent name (`office-pc`) and its access password. The gateway joins the mesh as `web-gateway.omega`, sends the agent the same `Hello` the native client would, and streams H.264 to a `WebCodecs` decoder in the page; keyboard and mouse go back the same way. `WebCodecs` requires a secure context, so for anything other than `localhost` put the gateway behind a TLS-terminating reverse proxy (Caddy, nginx) and pass `--web-behind-tls --web-allowed-host desk.example`. The browser part is WebSocket-only for now.
 
 ## Architecture
 
@@ -123,7 +137,7 @@ The full design, from the WireGuard mesh to the web client, is in [docs/plan.md]
 | 1 | First image on screen: capture, hardware encoding, QUIC, input, ≤ 30 ms on LAN | ✅ Done |
 | 2 | Mesh network and coordination server: NAT traversal, relay, internal DNS | 🔶 Agent and client join the mesh (`--server`), connect by `name.omega`, traverse NAT with STUN + `disco` and fall back to the relay in 1.5 s; verified in-process, cross-NAT field test pending |
 | 3 | Remote access product: Windows service, login/UAC screens, clipboard, files, audio | 🧩 Library only: desktop switching, session channels, QoS/FEC, QuickSupport and LAN mode exist; nothing is wired into the agent; open findings: [#27](https://github.com/OmegaSoftDLL/omegadesk/issues/27) |
-| 4 | Web dashboard and browser client | 🧩 Library only: policy model, gateway and WebCodecs worker exist; the gateway never starts and the TypeScript is not built; open findings: [#28](https://github.com/OmegaSoftDLL/omegadesk/issues/28) |
+| 4 | Web dashboard and browser client | 🔶 Browser client works end to end through `omegadesk-server --web-listen` (WebSocket gateway on the mesh, WebCodecs H.264, keyboard and mouse, latency readout), verified in-process and in CI; the policy model and connection manager are still library only, no dashboard, no WebTransport, latency against the native client not measured; open findings: [#28](https://github.com/OmegaSoftDLL/omegadesk/issues/28) |
 | 5 | Security, session recording and privileged access | 🧩 Library only: recording, HuJSON policies, MFA, PAM, DLP and vault exist; no handshake consults them; open findings: [#29](https://github.com/OmegaSoftDLL/omegadesk/issues/29) |
 | 6 | Remote monitoring and management (RMM) | 🧩 Library only: in-memory RMM models; the agent reports nothing; open findings: [#30](https://github.com/OmegaSoftDLL/omegadesk/issues/30) |
 | 7 | RDP/VNC compatibility, virtual displays, MCP server, Linux/macOS/mobile | ⬜ Not started in substance: no IronRDP dependency, no driver, no MCP server, no Linux/macOS capture; open findings: [#31](https://github.com/OmegaSoftDLL/omegadesk/issues/31), [#33](https://github.com/OmegaSoftDLL/omegadesk/issues/33) |

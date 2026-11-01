@@ -1,13 +1,16 @@
 //! OmegaDesk mesh coordinator binary (`omegadesk-server`).
 
-use std::net::SocketAddr;
+use std::collections::HashSet;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use omegadesk_control::ControlConfig;
 use omegadesk_identity::{DeviceIdentity, FileStore, KeyStore, default_store};
-use omegadesk_server::{Coordinator, RelayNode, control_server};
+use omegadesk_magicsock::{Node, NodeConfig};
+use omegadesk_server::{Coordinator, RelayNode, control_server, web_server, web_session};
 use tokio::net::TcpListener;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
@@ -47,6 +50,146 @@ struct Args {
     /// the configuration, and exit immediately.
     #[arg(long)]
     check_only: bool,
+
+    /// Address to serve the browser client and its WebSocket gateway on. When
+    /// set, the server also joins the mesh as `web-gateway.omega` (with a
+    /// reusable pre-auth key it issues itself) to reach agents by name.
+    #[arg(long, env = "OMEGADESK_WEB_LISTEN")]
+    web_listen: Option<SocketAddr>,
+
+    /// Directory with the built browser client (`npm run build` in `web/`).
+    #[arg(long, env = "OMEGADESK_WEB_ROOT", default_value = "web/dist")]
+    web_root: PathBuf,
+
+    /// Host name browsers use to reach the gateway (the `Host` header); repeatable.
+    /// `localhost`, `127.0.0.1`, `::1` and the `--web-listen` address are always allowed.
+    #[arg(
+        long = "web-allowed-host",
+        env = "OMEGADESK_WEB_ALLOWED_HOSTS",
+        value_delimiter = ','
+    )]
+    web_allowed_hosts: Vec<String>,
+
+    /// The gateway sits behind a TLS-terminating reverse proxy: browsers present an
+    /// `https` Origin. (`X-Forwarded-Proto: https` from the proxy has the same effect.)
+    #[arg(long, env = "OMEGADESK_WEB_BEHIND_TLS")]
+    web_behind_tls: bool,
+
+    /// File holding the gateway node's identity. Defaults to the operating system
+    /// credential store (account `web-gateway`).
+    #[arg(long, env = "OMEGADESK_WEB_KEY_FILE")]
+    web_key_file: Option<PathBuf>,
+
+    /// UDP bind address of the gateway's mesh socket.
+    #[arg(long, env = "OMEGADESK_WEB_MESH_BIND", default_value = "0.0.0.0:0")]
+    web_mesh_bind: SocketAddr,
+
+    /// Gateway mesh node: never attempt direct paths, send everything via the relays.
+    #[arg(long)]
+    web_relay_only: bool,
+}
+
+/// Hosts accepted in the `Host` header: loopback names, the listen address when it
+/// is specific, and the operator's own names.
+fn web_allowed_hosts(listen: SocketAddr, extra: &[String]) -> HashSet<String> {
+    let mut hosts: HashSet<String> = ["localhost", "127.0.0.1", "::1"]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+    if !listen.ip().is_unspecified() {
+        hosts.insert(listen.ip().to_string());
+    }
+    for host in extra {
+        let host = host
+            .trim()
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .to_ascii_lowercase();
+        if !host.is_empty() {
+            hosts.insert(host);
+        }
+    }
+    hosts
+}
+
+/// Address the gateway node uses to reach the coordinator running in this
+/// process: loopback when the control listener is bound to every interface.
+fn control_loopback_addr(listen: SocketAddr) -> SocketAddr {
+    if listen.ip().is_unspecified() {
+        let ip: IpAddr = if listen.is_ipv6() {
+            Ipv6Addr::LOCALHOST.into()
+        } else {
+            Ipv4Addr::LOCALHOST.into()
+        };
+        SocketAddr::new(ip, listen.port())
+    } else {
+        listen
+    }
+}
+
+/// Joins the mesh as the gateway node and starts the HTTP front door.
+async fn start_web_gateway(
+    args: &Args,
+    web_listen: SocketAddr,
+    server_identity: &DeviceIdentity,
+    control_addr: SocketAddr,
+    coordinator: &Arc<Mutex<Coordinator>>,
+) -> Result<Arc<web_server::WebState>> {
+    if !args.web_root.join("index.html").is_file() {
+        anyhow::bail!(
+            "{} has no index.html: run `npm ci && npm run build` in web/ or pass --web-root",
+            args.web_root.display()
+        );
+    }
+    let preauth_key = coordinator
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .create_preauth_key(
+            &args.tenant,
+            true,
+            false,
+            vec!["tag:web-gateway".to_owned()],
+            None,
+        )?;
+    let store: Box<dyn KeyStore> = match &args.web_key_file {
+        Some(path) => Box::new(FileStore::new(path.clone())),
+        None => default_store("web-gateway").context("failed to open the gateway key store")?,
+    };
+    let identity = Arc::new(
+        DeviceIdentity::load_or_create(store.as_ref())
+            .context("failed to load the gateway identity")?,
+    );
+    let mut node_config = NodeConfig::new(ControlConfig {
+        server_addr: control_addr.to_string(),
+        server_public: server_identity.public(),
+        preauth_key,
+        hostname: "web-gateway".to_owned(),
+        endpoints: Vec::new(),
+    });
+    node_config.bind = args.web_mesh_bind;
+    node_config.relay_only = args.web_relay_only;
+    let node = Node::start(Arc::clone(&identity), node_config)
+        .await
+        .context("the web gateway failed to join the mesh")?;
+    info!(
+        fqdn = %node.self_info().fqdn,
+        ipv4 = %node.self_info().ipv4,
+        id = %identity.id(),
+        "web gateway enrolled in the mesh"
+    );
+    let mut config =
+        web_server::WebGatewayConfig::new(web_allowed_hosts(web_listen, &args.web_allowed_hosts));
+    config.web_root = Some(args.web_root.clone());
+    config.behind_tls = args.web_behind_tls;
+    let dialer = Arc::new(web_session::MeshDialer::new(Arc::new(node)));
+    Ok(web_server::WebState::new(
+        config,
+        dialer,
+        web_session::GatewayIdentity {
+            device_public_key: identity.public().signing_key_bytes(),
+            device_name: "omegadesk-web".to_owned(),
+        },
+    ))
 }
 
 fn decode_hex_32(hex: &str) -> Option<[u8; 32]> {
@@ -138,7 +281,31 @@ async fn main() -> Result<()> {
     let coordinator = Arc::new(Mutex::new(coord));
     let listener = TcpListener::bind(args.listen).await?;
     info!(listen = %args.listen, "omegadesk-server listening for Noise IK connections");
-    control_server::serve(listener, server_identity, coordinator).await
+    let control = tokio::spawn(control_server::serve(
+        listener,
+        Arc::clone(&server_identity),
+        Arc::clone(&coordinator),
+    ));
+
+    let Some(web_listen) = args.web_listen else {
+        return control.await?;
+    };
+    let web_listener = TcpListener::bind(web_listen)
+        .await
+        .with_context(|| format!("failed to bind the web gateway on {web_listen}"))?;
+    let state = start_web_gateway(
+        &args,
+        web_listen,
+        &server_identity,
+        control_loopback_addr(args.listen),
+        &coordinator,
+    )
+    .await?;
+    let web = tokio::spawn(web_server::serve(web_listener, state));
+    tokio::select! {
+        result = control => result?,
+        result = web => Ok(result??),
+    }
 }
 
 #[cfg(test)]
@@ -157,6 +324,40 @@ mod tests {
         assert_eq!(plain.stun_address, None);
         assert!(parse_relay("relay.example:443").is_err());
         assert!(parse_relay("relay.example:443=zz").is_err());
+    }
+
+    #[test]
+    fn web_allowed_hosts_include_loopback_listen_and_operator_names() {
+        let hosts = web_allowed_hosts(
+            "0.0.0.0:18123".parse().unwrap(),
+            &[
+                "Desk.Example".to_owned(),
+                " [fd00::1] ".to_owned(),
+                String::new(),
+            ],
+        );
+        for expected in ["localhost", "127.0.0.1", "::1", "desk.example", "fd00::1"] {
+            assert!(hosts.contains(expected), "{expected}");
+        }
+        assert!(!hosts.contains("0.0.0.0"));
+        let specific = web_allowed_hosts("192.168.1.5:18123".parse().unwrap(), &[]);
+        assert!(specific.contains("192.168.1.5"));
+    }
+
+    #[test]
+    fn gateway_reaches_the_coordinator_over_loopback_when_bound_to_any() {
+        assert_eq!(
+            control_loopback_addr("0.0.0.0:8080".parse().unwrap()),
+            "127.0.0.1:8080".parse().unwrap()
+        );
+        assert_eq!(
+            control_loopback_addr("[::]:8080".parse().unwrap()),
+            "[::1]:8080".parse().unwrap()
+        );
+        assert_eq!(
+            control_loopback_addr("10.0.0.2:8080".parse().unwrap()),
+            "10.0.0.2:8080".parse().unwrap()
+        );
     }
 
     #[test]

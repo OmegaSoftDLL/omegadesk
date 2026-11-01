@@ -19,13 +19,17 @@ export const ODREC_MAGIC = "ODREC001";
 export const ODREC_HEADER_LEN = 16;
 export const KEYFRAME_FLAG = 0x0002;
 
-export enum OdrecRecordType {
-  Metadata = 1,
-  FrameData = 2,
-  EndOfStream = 3,
-  InputEvent = 4,
-  ClipboardEvent = 5,
-}
+// A `const` object instead of an `enum`: the sources run unmodified under Node's
+// type stripping (`erasableSyntaxOnly`), which has no enums.
+export const OdrecRecordType = {
+  Metadata: 1,
+  FrameData: 2,
+  EndOfStream: 3,
+  InputEvent: 4,
+  ClipboardEvent: 5,
+} as const;
+
+export type OdrecRecordType = (typeof OdrecRecordType)[keyof typeof OdrecRecordType];
 
 export interface ParsedOdrecFrame {
   readonly index: number;

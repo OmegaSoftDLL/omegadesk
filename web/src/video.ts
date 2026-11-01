@@ -29,8 +29,9 @@
 import type {
   FrameWorkerMessage,
   InitWorkerMessage,
+  ReconfigureWorkerMessage,
   VideoWorkerOutbound,
-} from "./video-worker";
+} from "./video-worker.ts";
 
 /** Opcode `0x04`: encoded video frame (`BinaryFrameOpcode::VideoFrame`). */
 export const OPCODE_VIDEO_FRAME = 0x04;
@@ -85,6 +86,8 @@ export interface VideoPipelineOptions {
   sendControl: (message: SessionControlMessage) => void;
   /** Called when the worker gives up (unsupported codec configuration, repeated failures). */
   onFatal?: (reason: string) => void;
+  /** Called after each rendered frame with the arrival-to-render time (decode + draw). */
+  onFrameRendered?: (heldMs: number) => void;
 }
 
 export class VideoPipeline {
@@ -92,12 +95,14 @@ export class VideoPipeline {
   private readonly sendBinary: (frame: Uint8Array) => void;
   private readonly sendControl: (message: SessionControlMessage) => void;
   private readonly onFatal: ((reason: string) => void) | undefined;
+  private readonly onFrameRendered: ((heldMs: number) => void) | undefined;
 
   constructor(options: VideoPipelineOptions) {
     this.worker = options.worker;
     this.sendBinary = options.sendBinary;
     this.sendControl = options.sendControl;
     this.onFatal = options.onFatal;
+    this.onFrameRendered = options.onFrameRendered;
 
     const offscreen = options.canvas.transferControlToOffscreen();
     const initMsg: InitWorkerMessage = {
@@ -116,6 +121,9 @@ export class VideoPipeline {
           // Sent by the worker only after the frame was rendered (or deliberately
           // discarded), so the gateway's in-flight queue reflects real decode backlog.
           this.sendBinary(encodeFrameAck(msg.frameId, msg.heldMs));
+          if (!msg.discarded) {
+            this.onFrameRendered?.(msg.heldMs);
+          }
           break;
         case "request-keyframe":
           // Selkies `requestKeyframeInternal()`: the encoder only learns about a lost
@@ -146,6 +154,23 @@ export class VideoPipeline {
       payload: decoded.payload,
     };
     this.worker.postMessage(frameMsg, [decoded.payload]);
+  }
+
+  /** Rebuilds the decoder for a new codec or frame size (`video-config` from the gateway). */
+  public reconfigure(codec: string, width: number, height: number): void {
+    const msg: ReconfigureWorkerMessage = {
+      type: "reconfigure",
+      codec,
+      width,
+      height,
+    };
+    this.worker.postMessage(msg);
+  }
+
+  /** Stops the worker; the canvas it drew to is left as is. */
+  public close(): void {
+    this.worker.onmessage = null;
+    this.worker.terminate();
   }
 }
 

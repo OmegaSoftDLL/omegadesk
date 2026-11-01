@@ -8,3 +8,7 @@ ci/deny-fixture/Cargo.lock
 
 # Local Claude Code state and agent worktrees.
 .claude/
+
+# Browser client build output and dependencies.
+web/dist/
+web/node_modules/
