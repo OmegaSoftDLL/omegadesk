@@ -29,6 +29,7 @@ use tokio::sync::mpsc;
 
 pub mod rmm;
 pub mod web_gateway;
+pub mod webhooks_audit;
 
 /// Base internal DNS suffix for all machines on the OmegaDesk mesh (`*.omega`).
 pub const OMEGA_DNS_SUFFIX: &str = "omega";

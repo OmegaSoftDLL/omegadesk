@@ -1637,6 +1637,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "omegadesk-idd"
+version = "0.1.0"
+dependencies = [
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "omegadesk-identity"
 version = "0.1.0"
 dependencies = [

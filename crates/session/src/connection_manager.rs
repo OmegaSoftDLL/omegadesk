@@ -884,6 +884,124 @@ fn extract_xml_tag(block: &str, tag: &str) -> Option<String> {
     Some(block[start..close_idx].trim().to_owned())
 }
 
+/// Imports Active Directory computer and organizational-unit (`OU=`) entries from an
+/// LDIF export into a [`ConnectionTree`], ported from mRemoteNG's
+/// `ActiveDirectoryDeserializer.cs` (`mRemoteNG/Config/Serializers/MiscSerializers/ActiveDirectoryDeserializer.cs`
+/// lines 19–140, `docs/plan.md` §2.11 line 159).
+///
+/// Computer records receive `ConnectionProtocol::Rdp` and `InheritanceFlags::all()`
+/// (`newConnectionInfo.Inheritance.TurnOnInheritanceCompletely()` in
+/// `ActiveDirectoryDeserializer.cs` line 136).
+///
+/// # Errors
+///
+/// Returns [`ImportError::MissingField`] if the LDIF input contains no valid `dn:` records.
+pub fn import_active_directory_ldif(
+    ldif: &str,
+    import_sub_ou: bool,
+) -> Result<ConnectionTree, ImportError> {
+    let mut tree = ConnectionTree::new();
+    let mut any_dn = false;
+    let mut computer_counter = 0usize;
+
+    for stanza in ldif.split("\n\n") {
+        let mut dn: Option<String> = None;
+        let mut cn: Option<String> = None;
+        let mut dns_host_name: Option<String> = None;
+        let mut object_classes: Vec<String> = Vec::new();
+
+        for raw_line in stanza.lines() {
+            let line = raw_line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            if let Some((attr, val)) = line.split_once(':') {
+                let attr_lower = attr.trim().to_ascii_lowercase();
+                let val_trimmed = val.trim().to_owned();
+                match attr_lower.as_str() {
+                    "dn" => dn = Some(val_trimmed),
+                    "cn" | "ou" => cn = Some(val_trimmed),
+                    "dnshostname" => dns_host_name = Some(val_trimmed),
+                    "objectclass" => object_classes.push(val_trimmed.to_ascii_lowercase()),
+                    _ => {}
+                }
+            }
+        }
+
+        let Some(dn_str) = dn else {
+            continue;
+        };
+        any_dn = true;
+
+        let ous: Vec<String> = dn_str
+            .split(',')
+            .filter_map(|rdn| {
+                let (k, v) = rdn.trim().split_once('=')?;
+                if k.trim().eq_ignore_ascii_case("ou") {
+                    Some(v.trim().to_owned())
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        if !import_sub_ou && ous.len() > 1 {
+            continue;
+        }
+
+        if object_classes.iter().any(|c| c == "organizationalunit") {
+            if let Some(ou_name) = ous.first().or(cn.as_ref()) {
+                let folder_id = format!("ad-ou-{}", ou_name.to_ascii_lowercase());
+                let parent_id = ous
+                    .get(1)
+                    .map(|p| format!("ad-ou-{}", p.to_ascii_lowercase()));
+                tree.upsert_folder(ConnectionFolder {
+                    id: folder_id,
+                    name: ou_name.clone(),
+                    parent_id,
+                    properties: ConnectionProperties {
+                        protocol: ConnectionProtocol::Rdp,
+                        port: ConnectionProtocol::Rdp.default_port(),
+                        ..ConnectionProperties::default()
+                    },
+                    inheritance: if ous.len() > 1 {
+                        InheritanceFlags::all()
+                    } else {
+                        InheritanceFlags::none()
+                    },
+                });
+            }
+        } else if object_classes.iter().any(|c| c == "computer") {
+            computer_counter += 1;
+            let display_name = cn.unwrap_or_else(|| format!("Computer-{computer_counter}"));
+            let hostname = dns_host_name.unwrap_or_else(|| display_name.clone());
+            let parent_folder_id = ous
+                .first()
+                .map(|ou| format!("ad-ou-{}", ou.to_ascii_lowercase()));
+
+            tree.add_entry(ConnectionEntry {
+                id: format!("ad-comp-{computer_counter}"),
+                display_name,
+                hostname,
+                parent_folder_id,
+                tags: vec!["active-directory".to_owned(), "rdp".to_owned()],
+                properties: ConnectionProperties {
+                    protocol: ConnectionProtocol::Rdp,
+                    port: ConnectionProtocol::Rdp.default_port(),
+                    ..ConnectionProperties::default()
+                },
+                inheritance: InheritanceFlags::all(),
+            });
+        }
+    }
+
+    if !any_dn {
+        return Err(ImportError::MissingField("dn"));
+    }
+
+    Ok(tree)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1084,5 +1202,25 @@ audiomode:i:2
         assert_eq!(ssh_entry.properties.protocol, ConnectionProtocol::Ssh);
         assert_eq!(ssh_entry.properties.port, 2222);
         assert_eq!(ssh_entry.properties.username, "netops");
+
+        // 4. Active Directory LDIF import (`ActiveDirectoryDeserializer.cs`)
+        let ad_ldif = "\
+dn: OU=Servers,DC=omega,DC=local
+objectClass: organizationalUnit
+ou: Servers
+
+dn: CN=SQL01,OU=Servers,DC=omega,DC=local
+objectClass: computer
+cn: SQL01
+dNSHostName: sql01.omega.local
+";
+        let ad_tree = import_active_directory_ldif(ad_ldif, true).unwrap();
+        assert_eq!(ad_tree.entries().len(), 1);
+        assert_eq!(ad_tree.entries()[0].hostname, "sql01.omega.local");
+        assert_eq!(
+            ad_tree.entries()[0].parent_folder_id.as_deref(),
+            Some("ad-ou-servers")
+        );
+        assert_eq!(ad_tree.entries()[0].inheritance, InheritanceFlags::all());
     }
 }

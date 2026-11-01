@@ -34,6 +34,118 @@ pub enum MfaError {
     /// Provided 6-digit TOTP code did not match the expected step window.
     #[error("invalid MFA verification code")]
     InvalidCode,
+    /// Federated OIDC/SAML/LDAP claim or `WebAuthn` passkey assertion failed validation.
+    #[error("authentication assertion rejected: {0}")]
+    InvalidAssertion(&'static str),
+}
+
+/// Enterprise and passwordless authentication provider kinds (`docs/plan.md` §2.10 line 147,
+/// modeled after `apache_guacamole-client/extensions/` and `jumpserver_jumpserver/apps/authentication/`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdentityProviderKind {
+    /// `OpenID` Connect (`OIDC` ID token claims).
+    Oidc,
+    /// SAML 2.0 enterprise SSO assertion.
+    Saml2,
+    /// Active Directory / `OpenLDAP` bind & group mapping.
+    Ldap,
+    /// FIDO2 / `WebAuthn` hardware passkey.
+    WebAuthnPasskey,
+}
+
+/// Verified identity claim produced by an OIDC, SAML 2.0, or LDAP provider (`JumpServer` & `Guacamole`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FederatedIdentityClaim {
+    /// Originating enterprise identity provider.
+    pub provider: IdentityProviderKind,
+    /// Issuer URL or `EntityID` (`iss`).
+    pub issuer: String,
+    /// Intended audience / Relying Party ID (`aud`).
+    pub audience: String,
+    /// Unique subject identifier within the `IdP` (`sub` or LDAP `objectGUID`).
+    pub subject: String,
+    /// Verified email or UPN.
+    pub email: String,
+    /// `IdP` group names mapped into OmegaDesk `UserGroup`s.
+    pub groups: Vec<String>,
+    /// Expiration timestamp in milliseconds since the Unix epoch (`exp`).
+    pub expires_at_ms: u64,
+}
+
+impl FederatedIdentityClaim {
+    /// Validates `issuer`, `audience`, non-empty `subject`, and expiration timestamp at `now_ms`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MfaError::InvalidAssertion`] if issuer/audience mismatch or the claim has expired.
+    pub fn validate(
+        &self,
+        expected_issuer: &str,
+        expected_audience: &str,
+        now_ms: u64,
+    ) -> Result<(), MfaError> {
+        if self.issuer != expected_issuer {
+            return Err(MfaError::InvalidAssertion("issuer mismatch"));
+        }
+        if self.audience != expected_audience {
+            return Err(MfaError::InvalidAssertion("audience mismatch"));
+        }
+        if self.subject.trim().is_empty() {
+            return Err(MfaError::InvalidAssertion("empty subject claim"));
+        }
+        if now_ms >= self.expires_at_ms {
+            return Err(MfaError::InvalidAssertion("federated claim expired"));
+        }
+        Ok(())
+    }
+}
+
+/// Registered FIDO2 / `WebAuthn` passkey credential with monotonic signature counter
+/// clone detection (`docs/plan.md` §2.10 line 147).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WebAuthnPasskeyRecord {
+    /// Credential ID bytes.
+    pub credential_id: Vec<u8>,
+    /// Relying Party ID (`"omega.example.com"`).
+    pub rp_id: String,
+    /// Owner user identifier.
+    pub user_id: String,
+    /// Ed25519 CBOR Object Signing public key (`alg = -8 / EdDSA`).
+    pub public_key: omegadesk_identity::DevicePublic,
+    /// Last accepted authenticator `signCount` for cloned-authenticator detection.
+    pub last_sign_count: u32,
+}
+
+impl WebAuthnPasskeyRecord {
+    /// Verifies a `WebAuthn` assertion signature over `authenticator_data || client_data_hash`
+    /// and enforces strictly increasing `sign_count` to detect cloned authenticators.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MfaError::InvalidAssertion`] if `sign_count <= self.last_sign_count` or the
+    /// Ed25519 signature over the assertion payload is invalid.
+    pub fn verify_assertion(
+        &mut self,
+        authenticator_data: &[u8],
+        client_data_hash: &[u8; 32],
+        sign_count: u32,
+        signature: &[u8; 64],
+    ) -> Result<(), MfaError> {
+        if sign_count <= self.last_sign_count {
+            return Err(MfaError::InvalidAssertion(
+                "WebAuthn sign_count did not advance (possible cloned authenticator)",
+            ));
+        }
+        let mut signed_payload = Vec::with_capacity(authenticator_data.len() + 32);
+        signed_payload.extend_from_slice(authenticator_data);
+        signed_payload.extend_from_slice(client_data_hash);
+
+        self.public_key
+            .verify(&signed_payload, signature)
+            .map_err(|_| MfaError::InvalidAssertion("invalid WebAuthn passkey signature"))?;
+        self.last_sign_count = sign_count;
+        Ok(())
+    }
 }
 
 /// Computes a 6-digit RFC 6238 TOTP code using `HMAC-SHA256` over the 8-byte big-endian
@@ -225,5 +337,48 @@ mod tests {
         assert!(guard.record_failure("192.0.2.10", now_ms + 2_000).is_err());
         assert!(guard.check_allowed("192.0.2.10", now_ms + 5_000).is_err());
         assert!(guard.check_allowed("192.0.2.10", now_ms + 305_000).is_ok());
+
+        // Federated OIDC claim & WebAuthn Passkey verification with sign_count clone check
+        let claim = FederatedIdentityClaim {
+            provider: IdentityProviderKind::Oidc,
+            issuer: "https://idp.omega.example".to_owned(),
+            audience: "omegadesk-coordinator".to_owned(),
+            subject: "sub-alice-01".to_owned(),
+            email: "alice@omega.example".to_owned(),
+            groups: vec!["netops".to_owned()],
+            expires_at_ms: now_ms + 60_000,
+        };
+        assert!(
+            claim
+                .validate("https://idp.omega.example", "omegadesk-coordinator", now_ms)
+                .is_ok()
+        );
+
+        let passkey_id = DeviceIdentity::generate();
+        let mut passkey = WebAuthnPasskeyRecord {
+            credential_id: vec![1, 2, 3, 4],
+            rp_id: "omega.example".to_owned(),
+            user_id: "alice".to_owned(),
+            public_key: passkey_id.public(),
+            last_sign_count: 10,
+        };
+        let auth_data = b"rp-id-hash-and-flags";
+        let client_hash = [0x55u8; 32];
+        let mut msg = Vec::new();
+        msg.extend_from_slice(auth_data);
+        msg.extend_from_slice(&client_hash);
+        let sig = passkey_id.sign(&msg);
+
+        assert!(
+            passkey
+                .verify_assertion(auth_data, &client_hash, 11, &sig)
+                .is_ok()
+        );
+        // Replaying with sign_count <= 11 must be rejected as a cloned authenticator
+        assert!(
+            passkey
+                .verify_assertion(auth_data, &client_hash, 11, &sig)
+                .is_err()
+        );
     }
 }
