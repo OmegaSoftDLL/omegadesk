@@ -128,12 +128,20 @@ pub fn open_display(index: u32) -> Result<Box<dyn Capturer>, CaptureError> {
         if !service_desktop::input_desktop_selected() {
             let _ = service_desktop::select_input_desktop();
         }
+        // `DisplayNotFound` from DXGI only means that no DXGI output with that
+        // index is attached to the desktop; GDI-only displays (basic display
+        // adapter, nested RDP sessions, some virtual machines) still exist for
+        // `EnumDisplayDevicesW`, so the fallback is tried for every DXGI error
+        // (matching RustDesk `libs/scrap/src/dxgi/mod.rs` `CapturerGDI` fallback).
         match dxgi::DxgiCapturer::open(index) {
             Ok(capturer) => Ok(Box::new(capturer)),
-            Err(CaptureError::DisplayNotFound(missing)) => {
-                Err(CaptureError::DisplayNotFound(missing))
-            }
-            Err(_dxgi_err) => Ok(Box::new(gdi::GdiCapturer::open(index)?)),
+            Err(dxgi_error) => match gdi::GdiCapturer::open(index) {
+                Ok(capturer) => Ok(Box::new(capturer)),
+                Err(CaptureError::DisplayNotFound(missing)) => {
+                    Err(CaptureError::DisplayNotFound(missing))
+                }
+                Err(_gdi_error) => Err(dxgi_error),
+            },
         }
     }
     #[cfg(not(windows))]
@@ -190,10 +198,12 @@ pub fn tone_map_hdr_fp16_to_bgra8(rgba_fp16_le: &[u8], sdr_white_nits: f32) -> V
         let b_lin = f16_to_f32(u16::from_le_bytes([px[4], px[5]])).max(0.0) * white_scale;
         let a_lin = f16_to_f32(u16::from_le_bytes([px[6], px[7]])).clamp(0.0, 1.0);
 
-        // Reinhard luminance-preserving tone map + linear-to-sRGB transfer function (gamma ~1/2.2).
+        // Reinhard tone map followed by the exact sRGB transfer function
+        // (IEC 61966-2-1: linear segment below 0.0031308, offset 1/2.4 power
+        // curve above it), so dark pixels are not lifted by a plain gamma.
         let map_channel = |c: f32| -> u8 {
             let mapped = c / (1.0 + c);
-            let srgb = mapped.powf(1.0 / 2.2).clamp(0.0, 1.0);
+            let srgb = linear_to_srgb(mapped).clamp(0.0, 1.0);
             #[allow(
                 clippy::cast_possible_truncation,
                 clippy::cast_sign_loss,
@@ -220,9 +230,37 @@ pub fn tone_map_hdr_fp16_to_bgra8(rgba_fp16_le: &[u8], sdr_white_nits: f32) -> V
     bgra
 }
 
+/// Exact sRGB electro-optical transfer function inverse (IEC 61966-2-1):
+/// `12.92 * c` for `c <= 0.0031308`, otherwise `1.055 * c^(1/2.4) - 0.055`.
+#[must_use]
+pub fn linear_to_srgb(linear: f32) -> f32 {
+    let c = linear.max(0.0);
+    if c <= 0.003_130_8 {
+        12.92 * c
+    } else {
+        1.055 * c.powf(1.0 / 2.4) - 0.055
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn srgb_transfer_keeps_dark_pixels_dark() {
+        // FP16 0x1400 = 2^-10 (about 0.00098 linear): the sRGB linear segment
+        // encodes it as 3/255, where a 1/2.2 gamma would have produced 11/255.
+        let mut raw = Vec::new();
+        for _ in 0..3 {
+            raw.extend_from_slice(&0x1400u16.to_le_bytes());
+        }
+        raw.extend_from_slice(&0x3C00u16.to_le_bytes());
+        let bgra = tone_map_hdr_fp16_to_bgra8(&raw, 80.0);
+        assert_eq!(&bgra[..3], &[3, 3, 3]);
+        assert_eq!(linear_to_srgb(0.0), 0.0);
+        assert!((linear_to_srgb(1.0) - 1.0).abs() < 1e-6);
+        assert!((linear_to_srgb(0.5) - 0.735_357).abs() < 1e-5);
+    }
 
     #[test]
     fn hdr_fp16_scrgb_tone_maps_to_bgra8() {

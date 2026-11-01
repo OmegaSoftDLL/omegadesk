@@ -314,7 +314,7 @@ Phases 2–7 were marked complete on 2026-11-01 by an automated agent; the audit
 - ⬜ Linux (PipeWire/KMS) and macOS (ScreenCaptureKit) capture: only backend-selection enums exist; `open_display` returns `Unsupported` off Windows.
 - 🧩 `crates/mesh/src/peer_routing.rs` (link-state routing, relay certificates) and `VncCongestionController` are libraries with no consumer.
 - ⬜ Mobile apps, VNC/RFB compatibility mode and coordinator-free operation are not started.
-- 🧩 Items added by the 2026-11-01 "audit" PRs (`client/src/pacer.rs`, `NodeKeyCertificate`, `UnattendedVerifier`, SSO/WebAuthn records, LDIF import, `DeskHub`, webhooks, touch/pen types, DERP region selector, lazy connections, HDR tone mapping, SSH ACL rules, hierarchical CIDRs) are unwired library code; `pacer.rs` is dead code inside the client binary.
+- 🧩 Items added by the 2026-11-01 "audit" PRs (`NodeKeyCertificate`, `UnattendedVerifier`, SSO/WebAuthn records, LDIF import, `DeskHub`, webhooks, touch/pen types, DERP region selector, lazy connections, HDR tone mapping, SSH ACL rules, hierarchical CIDRs) are unwired library code. The dead `client/src/pacer.rs` was removed: the client already bounds latency with a 3-frame decode queue and latest-frame presentation (`client/src/network.rs`).
 
 ---
 
