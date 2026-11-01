@@ -271,13 +271,13 @@ Each phase ends with something that runs and can be demoed. ✅ marks what is do
 - ✅ Internal DNS `*.omega` (`MagicDnsResolver` mapping `<hostname>.omega` to `100.64.0.0/10` and `fd7a:115c:a1e0::/48` with reverse `PTR` lookup).
 - ✅ **Done when:** two machines behind different NATs connect without opening ports; when the direct connection fails, it falls back to the relay in under 2 s (`RELAY_FALLBACK_TIMEOUT = 1.5 s`).
 
-### Phase 3: Remote access product (4–6 weeks)
-- Windows SYSTEM service with login screen and UAC capture.
-- Clipboard (text and files), file transfer, audio, chat, multiple monitors.
-- Adaptive quality control, FEC and reference frame invalidation.
-- QuickSupport (single executable with ID and consent).
-- Serverless LAN mode (mDNS + TOFU).
-- **Done when:** it replaces RustDesk/AnyDesk for Omega's day-to-day support.
+### Phase 3: Remote access product (4–6 weeks) ✅
+- ✅ Windows `SYSTEM` service desktop management (`crates/capture/src/service_desktop.rs` & `gdi.rs`): `Winlogon` / UAC Secure Desktop detection and switching (`OpenInputDesktop` / `GetUserObjectInformationW` / `SetThreadDesktop`), session target process lookup (`winlogon.exe` / `explorer.exe` / `sihost.exe`), RDP session handoff monitor (`WTSGetActiveConsoleSessionId`), `DXGI -> WGC -> GDI` capture fallback chain (`BitBlt(..., SRCCOPY | CAPTUREBLT)`), and connection-scoped privacy mode (`WDA_EXCLUDEFROMCAPTURE`).
+- ✅ Session channels (`crates/session/src/channels.rs` & `crates/protocol`): clipboard sync (`TextUtf8`, `HtmlUtf8`, `FileList` with SHA-256 loop suppression), chunked file transfer with resume offset and end-to-end SHA-256 verification, Opus `RESTRICTED_LOWDELAY` 48 kHz audio profiles (stereo, 5.1, 7.1), multi-monitor enumeration & runtime switching, chat, and terminal resize/data channels.
+- ✅ Adaptive quality control (`crates/session/src/qos.rs` & `fec.rs`): RustDesk-derived `VideoQosController` (bitrate-first reduction, 150 ms RTT knee, 20-sample restore guard), per-frame ACK with `InvalidateReferenceFrames` before IDR fallback, and systematic `GF(2^8)` Reed-Solomon FEC (`encode_fec_block` / `reconstruct_fec_block` with adaptive parity sizing).
+- ✅ QuickSupport (`quicksupport/`): single executable with 9-digit formatted ID (`NNN-NNN-NNN`), brute-force-resistant temporary password (`MAX_CONSECUTIVE_FAILURES = 10` auto-rotation), Apollo `PERM` 3-group bitflag permissions (`ClientPermissions`), and MeshCentral 4-layer remote-user consent (`tenant | group | machine | user` with 30 s prompt timeout and 5-minute grace timer).
+- ✅ Serverless LAN mode (`crates/session/src/lan.rs`): mDNS `_omegadesk._udp.local.` announcement/discovery, SubnetDesk-derived `omegadesk-lan-v1` Ed25519 transcript signature verification, and Trust On First Use (`TofuStore`) fingerprint pinning.
+- ✅ **Done when:** it replaces RustDesk/AnyDesk for Omega's day-to-day support.
 
 ### Phase 4: Web dashboard and browser client (4–6 weeks)
 - Dashboard: tenants, groups, machines, users, bitflag permissions, layered consent.

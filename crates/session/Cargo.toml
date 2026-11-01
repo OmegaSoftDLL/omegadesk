@@ -1,0 +1,23 @@
+[package]
+name = "omegadesk-session"
+description = "Session channels (clipboard, file transfer, Opus audio, multi-monitor, chat, terminal), adaptive video QoS, Reed-Solomon FEC, and serverless LAN mode (mDNS + TOFU)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+bytes.workspace = true
+omegadesk-identity.workspace = true
+omegadesk-protocol.workspace = true
+rand_core.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true
