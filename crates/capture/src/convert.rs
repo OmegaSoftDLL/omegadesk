@@ -59,12 +59,14 @@ pub fn rows_to_bgra(
     if stride < row_bytes {
         return None;
     }
-    let needed = height
-        .checked_sub(1)
-        .map_or(0, |rows| rows.checked_mul(stride).unwrap_or(usize::MAX))
-        .checked_add(row_bytes)?;
-    if height > 0 && src.len() < needed {
-        return None;
+    if height > 0 {
+        let needed = height
+            .checked_sub(1)
+            .and_then(|rows| rows.checked_mul(stride))
+            .and_then(|full_rows| full_rows.checked_add(row_bytes))?;
+        if src.len() < needed {
+            return None;
+        }
     }
     let (b, g, r) = layout.bgr_offsets();
     let mut out = vec![0u8; row_bytes * height];

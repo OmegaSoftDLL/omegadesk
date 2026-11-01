@@ -18,3 +18,7 @@ extend-ignore-re = [
     # Git commit hashes in documentation and changelogs.
     "\\b[0-9a-f]{7,40}\\b",
 ]
+
+[default.extend-identifiers]
+# PipeWire buffer API (`spa_buffer::datas`): external method name, not a typo.
+datas_mut = "datas_mut"

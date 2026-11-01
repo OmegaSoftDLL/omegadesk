@@ -27,7 +27,9 @@ pub mod server;
 pub mod sessions;
 pub mod trust;
 
-pub use directory::{DeviceEntry, DeviceRecord, LocalOnlyDirectory, MeshDirectory, MeshNodeDirectory};
+pub use directory::{
+    DeviceEntry, DeviceRecord, LocalOnlyDirectory, MeshDirectory, MeshNodeDirectory,
+};
 pub use server::{OmegaDeskMcpServer, ServerOptions};
 pub use sessions::{
     MeshLaunchArgs, ScriptOutcome, ScriptRunner, SessionError, SessionInfo, SessionLauncher,

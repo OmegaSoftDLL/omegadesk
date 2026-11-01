@@ -26,7 +26,7 @@ use rmcp::handler::server::wrapper::{Json, Parameters};
 use rmcp::model::{
     CallToolResponse, CallToolResult, ContentBlock, ElicitRequest, ElicitRequestParams,
     ElicitResult, ElicitationAction, ElicitationSchema, ErrorData, Implementation, InputRequest,
-    InputRequiredResult, InputRequests, ProtocolVersion, ServerCapabilities, ServerConfig,
+    InputRequests, InputRequiredResult, ProtocolVersion, ServerCapabilities, ServerConfig,
 };
 use rmcp::service::{ElicitationError, ElicitationMode, RequestContext, RoleServer};
 use rmcp::{ServerHandler, elicit_safe, tool, tool_handler, tool_router};
@@ -36,7 +36,9 @@ use tracing::{info, warn};
 
 use crate::directory::{DeviceEntry, DeviceRecord, MeshDirectory};
 use crate::sessions::{ScriptOutcome, ScriptRunner, SessionInfo, SessionLauncher};
-use crate::trust::{McpAuditEntry, McpError, McpTrustEngine, RiskAssessment, RiskLevel, TrustRecommendation};
+use crate::trust::{
+    McpAuditEntry, McpError, McpTrustEngine, RiskAssessment, RiskLevel, TrustRecommendation,
+};
 
 /// Key of the confirmation request inside an `input_required` result.
 pub const CONFIRMATION_KEY: &str = "operator_confirmation";
@@ -222,7 +224,9 @@ fn recommendation_name(recommendation: TrustRecommendation) -> &'static str {
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map_or(0, |elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
+        .map_or(0, |elapsed| {
+            u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+        })
 }
 
 fn refused(message: impl Into<String>) -> CallToolResponse {
@@ -232,7 +236,9 @@ fn refused(message: impl Into<String>) -> CallToolResponse {
 fn complete<T: Serialize>(value: &T) -> Result<CallToolResponse, ErrorData> {
     let value = serde_json::to_value(value)
         .map_err(|error| ErrorData::internal_error(error.to_string(), None))?;
-    Ok(CallToolResponse::Complete(CallToolResult::structured(value)))
+    Ok(CallToolResponse::Complete(CallToolResult::structured(
+        value,
+    )))
 }
 
 /// Outcome of the trust gate.
@@ -279,10 +285,8 @@ impl OmegaDeskMcpServer {
         sessions: Arc<SessionLauncher>,
         options: ServerOptions,
     ) -> Result<Self, ring::error::Unspecified> {
-        let state_key = ring::hmac::Key::generate(
-            ring::hmac::HMAC_SHA256,
-            &ring::rand::SystemRandom::new(),
-        )?;
+        let state_key =
+            ring::hmac::Key::generate(ring::hmac::HMAC_SHA256, &ring::rand::SystemRandom::new())?;
         let local_device = directory
             .local()
             .map_or_else(|| DeviceId::from_signing_key(&[0; 32]), |entry| entry.id);
@@ -312,10 +316,10 @@ impl OmegaDeskMcpServer {
     fn emergency_reason(&self) -> Option<String> {
         let trust = self.lock_trust();
         trust.is_emergency_active().then(|| {
-            trust
-                .audit_log()
-                .last()
-                .map_or_else(|| "emergency stop".to_owned(), |entry| entry.tool_name.clone())
+            trust.audit_log().last().map_or_else(
+                || "emergency stop".to_owned(),
+                |entry| entry.tool_name.clone(),
+            )
         })
     }
 
@@ -341,7 +345,9 @@ impl OmegaDeskMcpServer {
 
     fn open_state(&self, sealed: &str) -> Option<ConfirmationState> {
         let (payload, tag) = sealed.split_once('.')?;
-        let payload = data_encoding::BASE64URL_NOPAD.decode(payload.as_bytes()).ok()?;
+        let payload = data_encoding::BASE64URL_NOPAD
+            .decode(payload.as_bytes())
+            .ok()?;
         let tag = data_encoding::BASE64URL_NOPAD.decode(tag.as_bytes()).ok()?;
         ring::hmac::verify(&self.state_key, &payload, &tag).ok()?;
         let state: ConfirmationState = serde_json::from_slice(&payload).ok()?;
@@ -363,7 +369,11 @@ impl OmegaDeskMcpServer {
             "OmegaDesk MCP: an AI agent wants to run `{tool}` on {device} (risk {}: {}). Arguments: {}. Approve?",
             risk_name(assessment.risk_level),
             assessment.reasons.join("; "),
-            if args.is_empty() { "none".to_owned() } else { args }
+            if args.is_empty() {
+                "none".to_owned()
+            } else {
+                args
+            }
         )
     }
 
@@ -395,7 +405,11 @@ impl OmegaDeskMcpServer {
                 .authorize_tool_call(device, tool, &args, confirmed, now_ms());
         match decision {
             Ok(assessment) => {
-                info!(tool, risk = risk_name(assessment.risk_level), "MCP action allowed");
+                info!(
+                    tool,
+                    risk = risk_name(assessment.risk_level),
+                    "MCP action allowed"
+                );
                 Gate::Allowed
             }
             Err(McpError::ConfirmationRequired { tool, risk }) => {
@@ -458,8 +472,7 @@ impl OmegaDeskMcpServer {
             return Ok(self.record(device.id, tool, arguments, approved));
         }
 
-        let message =
-            Self::confirmation_message(tool, &device.record.fqdn, &assessment, arguments);
+        let message = Self::confirmation_message(tool, &device.record.fqdn, &assessment, arguments);
         let mrtr = ctx
             .protocol_version()
             .is_none_or(|version| version >= ProtocolVersion::V_2026_07_28);
@@ -472,7 +485,10 @@ impl OmegaDeskMcpServer {
                 requested_schema: schema,
             });
             let mut requests = InputRequests::new();
-            requests.insert(CONFIRMATION_KEY.to_owned(), InputRequest::Elicitation(request));
+            requests.insert(
+                CONFIRMATION_KEY.to_owned(),
+                InputRequest::Elicitation(request),
+            );
             let state = self.seal_state(&ConfirmationState {
                 tool: tool.to_owned(),
                 device: device.record.id.clone(),
@@ -496,7 +512,10 @@ impl OmegaDeskMcpServer {
         }
         let answer = ctx
             .peer
-            .elicit_with_timeout::<OperatorDecision>(message, Some(self.options.confirmation_timeout))
+            .elicit_with_timeout::<OperatorDecision>(
+                message,
+                Some(self.options.confirmation_timeout),
+            )
             .await;
         let approved = match answer {
             Ok(decision) => decision.is_some_and(|decision| decision.approve),
@@ -686,7 +705,8 @@ impl OmegaDeskMcpServer {
         Parameters(params): Parameters<EmergencyStopParams>,
     ) -> Result<Json<EmergencyStatus>, ErrorData> {
         warn!(reason = %params.reason, "MCP emergency stop activated");
-        self.lock_trust().activate_emergency_stop(params.reason.clone());
+        self.lock_trust()
+            .activate_emergency_stop(params.reason.clone());
         Ok(Json(EmergencyStatus {
             active: true,
             reason: params.reason,
@@ -725,7 +745,10 @@ impl OmegaDeskMcpServer {
 impl ServerHandler for OmegaDeskMcpServer {
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
-            .with_server_info(Implementation::new("omegadesk-mcp", env!("CARGO_PKG_VERSION")))
+            .with_server_info(Implementation::new(
+                "omegadesk-mcp",
+                env!("CARGO_PKG_VERSION"),
+            ))
             .with_instructions(
                 "OmegaDesk MCP server. Call list_devices to see the machines of this tenant, \
                  then start_session to open an omegadesk-client session to one of them (the \

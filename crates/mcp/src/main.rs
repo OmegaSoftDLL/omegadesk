@@ -102,7 +102,9 @@ async fn main() -> anyhow::Result<()> {
         confirm_medium: !args.no_confirm_medium,
         ..TrustPolicy::default()
     };
-    policy.blocked_tools.extend(args.blocked_tools.iter().cloned());
+    policy
+        .blocked_tools
+        .extend(args.blocked_tools.iter().cloned());
     let mut trust = McpTrustEngine::new();
     trust.set_device_policy(identity.id(), policy);
 
@@ -172,7 +174,10 @@ async fn main() -> anyhow::Result<()> {
         .serve(rmcp::transport::stdio())
         .await
         .context("MCP handshake failed")?;
-    running.waiting().await.context("MCP session ended with an error")?;
+    running
+        .waiting()
+        .await
+        .context("MCP session ended with an error")?;
     drop(mesh_node);
     Ok(())
 }

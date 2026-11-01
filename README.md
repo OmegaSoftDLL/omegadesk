@@ -211,7 +211,7 @@ omegadesk-agent --server coord.example:8080 --server-key <128 hex> --deployment-
 |---|---|
 | [`omegadesk-protocol`](crates/protocol) | Session messages (protobuf), framing, codec negotiation |
 | [`omegadesk-identity`](crates/identity) | Device keys (ed25519/x25519), device ID, OS keychain storage |
-| [`omegadesk-capture`](crates/capture) | Screen capture (`DXGI -> WGC -> GDI` fallback chain) |
+| [`omegadesk-capture`](crates/capture) | Screen capture: DXGI/WGC/GDI (Windows), PipeWire + X11 (Linux), CoreGraphics (macOS) |
 | [`omegadesk-codec`](crates/codec) | H.264 encoders (Media Foundation, OpenH264) and decoder |
 | [`omegadesk-input`](crates/input) | Keyboard and mouse injection (USB HID → scancodes) |
 | [`omegadesk-transport`](crates/transport) | QUIC transport with certificate pinning or identity-bound TLS |
@@ -226,6 +226,8 @@ omegadesk-agent --server coord.example:8080 --server-key <128 hex> --deployment-
 | [`omegadesk-service`](crates/service) | Windows `LocalSystem` service and per-session worker (unattended access across the login screen and UAC) |
 | [`omegadesk-quicksupport`](quicksupport) | Single-executable quick support: nine-digit ID, temporary password, consent prompt |
 | [`omegadesk-client`](client) | The app you use to connect |
+| [`omegadesk-rdp`](crates/rdp) | RDP bridge on IronRDP: terminates an existing RDP server into the video pipeline |
+| [`omegadesk-mcp`](crates/mcp) | MCP server (`rmcp`, stdio) so AI agents can list devices and act under trust control |
 
 The full design, from the WireGuard mesh to the web client, is in [docs/plan.md](docs/plan.md). [docs/language.md](docs/language.md) explains why we chose Rust.
 
@@ -240,7 +242,7 @@ The full design, from the WireGuard mesh to the web client, is in [docs/plan.md]
 | 4 | Web dashboard and browser client | 🔶 Browser client works end to end through `omegadesk-server --web-listen` (WebSocket gateway on the mesh, WebCodecs H.264, keyboard and mouse, latency readout), verified in-process and in CI; the policy model and connection manager are still library only, no dashboard, no WebTransport, latency against the native client not measured; open findings: [#28](https://github.com/OmegaSoftDLL/omegadesk/issues/28) |
 | 5 | Security, session recording and privileged access | 🔶 `HuJSON` policies filter every node's netmap at the coordinator and the agent enforces the compiled session grant: per-connection TOTP step-up with lockout, posture, clipboard limits, watermark, `.odrec` recording and JSON Lines audit on both ends, all verified in-process; approval tickets, live session sharing and the search UI remain library-only |
 | 6 | Remote monitoring and management (RMM) | 🔶 Agents report inventory and heartbeats, the coordinator evaluates checks, raises alerts, dispatches scripts and schedules, issues deployment links and persists to a state file; operated with `omegadesk-server admin`. No web dashboard, no agent self-update, Windows Update counts not scanned |
-| 7 | RDP/VNC compatibility, virtual displays, MCP server, Linux/macOS/mobile | 🔶 A real IddCx virtual display driver (`drivers/idd`, vendored signed QuickDesk driver) is wired into the agent (`--virtual-display <WxH@hz>`, `--privacy`); still no IronRDP dependency, no MCP server, no Linux/macOS capture; open findings: [#31](https://github.com/OmegaSoftDLL/omegadesk/issues/31), [#33](https://github.com/OmegaSoftDLL/omegadesk/issues/33) |
+| 7 | RDP/VNC compatibility, virtual displays, MCP server, Linux/macOS/mobile | 🔶 A real IddCx virtual display driver is wired into the agent (`--virtual-display <WxH@hz>`, `--privacy`); RDP bridge on IronRDP, real MCP server over stdio (`rmcp`, trust-gated), and Linux (PipeWire + X11) and macOS (CoreGraphics) capture are implemented and tested; mobile apps and VNC mode are not started |
 
 ## Contributing
 

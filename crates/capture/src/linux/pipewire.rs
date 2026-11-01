@@ -189,12 +189,16 @@ struct PortalStream {
 }
 
 /// Runs the ScreenCast portal negotiation on a current-thread Tokio runtime.
+#[allow(
+    clippy::default_trait_access,
+    reason = "ashpd's per-call option structs are private; only `Default::default()` can name them"
+)]
 async fn negotiate_portal(index: u32) -> Result<PortalStream, CaptureError> {
     let proxy = Screencast::new()
         .await
         .map_err(|error| CaptureError::Os(format!("ScreenCast portal unavailable: {error}")))?;
     let session = proxy
-        .create_session(ashpd::desktop::screencast::CreateSessionOptions::default())
+        .create_session(Default::default())
         .await
         .map_err(|error| CaptureError::Os(format!("portal CreateSession: {error}")))?;
     proxy
@@ -202,14 +206,14 @@ async fn negotiate_portal(index: u32) -> Result<PortalStream, CaptureError> {
             &session,
             SelectSourcesOptions::default()
                 .set_cursor_mode(CursorMode::Hidden)
-                .set_sources(SourceType::Monitor.into())
+                .set_sources(SourceType::Monitor | SourceType::Window)
                 .set_multiple(true)
                 .set_persist_mode(PersistMode::DoNot),
         )
         .await
         .map_err(|error| CaptureError::Os(format!("portal SelectSources: {error}")))?;
     let response = proxy
-        .start(&session, None, ashpd::desktop::screencast::StartCastOptions::default())
+        .start(&session, None, Default::default())
         .await
         .map_err(|error| CaptureError::Os(format!("portal Start: {error}")))?
         .response()
@@ -222,10 +226,7 @@ async fn negotiate_portal(index: u32) -> Result<PortalStream, CaptureError> {
     let size = stream.size();
     let position = stream.position();
     let fd = proxy
-        .open_pipe_wire_remote(
-            &session,
-            ashpd::desktop::screencast::OpenPipeWireRemoteOptions::default(),
-        )
+        .open_pipe_wire_remote(&session, Default::default())
         .await
         .map_err(|error| CaptureError::Os(format!("portal OpenPipeWireRemote: {error}")))?;
     Ok(PortalStream {
@@ -332,7 +333,8 @@ fn run_capture(
                 if let pw::stream::StreamState::Error(message) = new {
                     data.slot.close(format!("stream error: {message}"));
                     if let Some(ready) = data.ready.take() {
-                        let _ = ready.send(Err(CaptureError::Os(format!("stream error: {message}"))));
+                        let _ =
+                            ready.send(Err(CaptureError::Os(format!("stream error: {message}"))));
                     }
                 }
             })
@@ -355,11 +357,15 @@ fn run_capture(
                     return;
                 }
                 let Some(layout) = layout_of(data.format.format()) else {
-                    warn!("unsupported PipeWire video format {:?}", data.format.format());
+                    warn!(
+                        "unsupported PipeWire video format {:?}",
+                        data.format.format()
+                    );
                     data.slot
                         .close(format!("unsupported format {:?}", data.format.format()));
                     if let Some(ready) = data.ready.take() {
-                        let _ = ready.send(Err(CaptureError::Os("unsupported PipeWire format".into())));
+                        let _ =
+                            ready.send(Err(CaptureError::Os("unsupported PipeWire format".into())));
                     }
                     return;
                 };
@@ -380,21 +386,20 @@ fn run_capture(
                 let Some(mut buffer) = stream.dequeue_buffer() else {
                     return;
                 };
-                let datas = buffer.datas_mut();
-                let Some(plane) = datas.first_mut() else {
+                let planes = buffer.datas_mut();
+                let Some(plane) = planes.first_mut() else {
                     return;
                 };
                 let chunk = plane.chunk();
                 let width = data.format.size().width as usize;
                 let height = data.format.size().height as usize;
-                let stride = usize::try_from(chunk.stride()).unwrap_or(width * 4).max(width * 4);
+                let stride = usize::try_from(chunk.stride())
+                    .unwrap_or(width * 4)
+                    .max(width * 4);
                 let Some(pixels) = plane.data() else { return };
                 if let Some(bgra) = rows_to_bgra(pixels, width, height, stride, layout) {
-                    data.slot.publish(
-                        data.format.size().width,
-                        data.format.size().height,
-                        bgra,
-                    );
+                    data.slot
+                        .publish(data.format.size().width, data.format.size().height, bgra);
                 }
             })
             .register()
@@ -442,7 +447,7 @@ fn run_capture(
                 spa::utils::Rectangle {
                     width: 8192,
                     height: 8192,
-                },
+                }
             ),
             pw::spa::pod::property!(
                 pw::spa::param::format::FormatProperties::VideoFramerate,
@@ -451,7 +456,7 @@ fn run_capture(
                 Fraction,
                 spa::utils::Fraction { num: 60, denom: 1 },
                 spa::utils::Fraction { num: 0, denom: 1 },
-                spa::utils::Fraction { num: 120, denom: 1 },
+                spa::utils::Fraction { num: 120, denom: 1 }
             ),
         );
         let values = pw::spa::pod::serialize::PodSerializer::serialize(

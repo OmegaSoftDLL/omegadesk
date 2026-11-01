@@ -26,7 +26,7 @@ Licenses verified against each repository's files on 2026-10-24.
 | [novnc/noVNC](https://github.com/novnc/noVNC) | VNC client in JavaScript | MPL-2.0 | ✅ |
 | [selkies-project/selkies](https://github.com/selkies-project/selkies) | GPU-accelerated WebRTC streaming, containers | MPL-2.0 | ✅ |
 | [FreeRDP/FreeRDP](https://github.com/FreeRDP/FreeRDP) | Complete RDP protocol | Apache-2.0 | ✅ |
-| [Devolutions/IronRDP](https://github.com/Devolutions/IronRDP) | RDP in Rust; can be used as a dependency | MIT/Apache-2.0 | ✅ |
+| [Devolutions/IronRDP](https://github.com/Devolutions/IronRDP) | RDP in Rust; **used as a dependency** by `omegadesk-rdp` (`ironrdp-connector`, `-session`, `-tokio`, `-pdu`, `-core`, `-graphics`, `-bulk`, `-rdcleanpath`, `-displaycontrol`, and `ironrdp-server` as a dev-dependency for the loopback test) | MIT/Apache-2.0 | ✅ |
 | [neutrinolabs/xrdp](https://github.com/neutrinolabs/xrdp) | RDP server for Linux | Apache-2.0 | ✅ |
 | [TigerVNC/tigervnc](https://github.com/TigerVNC/tigervnc) | VNC/RFB protocol | GPL-2.0-or-later | ✅ |
 | [ultravnc/UltraVNC](https://github.com/ultravnc/UltraVNC) | VNC features on Windows | GPL-3.0 | ✅ |
@@ -36,6 +36,20 @@ Licenses verified against each repository's files on 2026-10-24.
 | [LizardByte/Sunshine](https://github.com/LizardByte/Sunshine) | Low-latency hardware encoding | GPL-3.0 | ✅ |
 | [moonlight-stream/moonlight-qt](https://github.com/moonlight-stream/moonlight-qt) | Low-latency decoding and display | GPL-3.0 | ✅ |
 | [ClassicOldSong/Apollo](https://github.com/ClassicOldSong/Apollo) | Virtual display at the client's resolution | GPL-3.0 | ✅ |
+
+## Crate dependencies added for Phase 7
+
+These crates.io dependencies were added to make Phase 7 real (all MIT or Apache-2.0,
+enforced by `cargo deny`):
+
+| Crate | Role | License |
+|---|---|---|
+| `ironrdp-*` | RDP bridge on IronRDP (`crates/rdp`); versions pinned exactly (the API is 0.x) | MIT OR Apache-2.0 |
+| `rmcp` | Model Context Protocol server over stdio (`crates/mcp`) | Apache-2.0 |
+| `pipewire` + `libspa` | Linux PipeWire screen capture (`crates/capture`, Linux only) | MIT |
+| `ashpd` | `xdg-desktop-portal` ScreenCast negotiation (Linux only) | MIT |
+| `x11rb` | Pure-Rust X11 capture fallback (Linux only) | MIT OR Apache-2.0 |
+| `objc2-core-graphics`, `objc2-core-foundation` | macOS CoreGraphics screen capture (macOS only) | MIT OR Apache-2.0 OR Zlib |
 
 ## Local copies
 

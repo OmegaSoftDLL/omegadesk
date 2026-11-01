@@ -213,10 +213,13 @@ impl SessionLauncher {
             started_at_unix_secs: unix_secs(),
             state: SessionState::Running,
         };
-        self.lock().insert(id, LaunchedSession {
-            info: info.clone(),
-            child,
-        });
+        self.lock().insert(
+            id,
+            LaunchedSession {
+                info: info.clone(),
+                child,
+            },
+        );
         Ok(info)
     }
 
@@ -231,7 +234,11 @@ impl SessionLauncher {
         let session = sessions.get_mut(&id).ok_or(SessionError::NotFound(id))?;
         if matches!(session.info.state, SessionState::Running) {
             match session.child.try_wait() {
-                Ok(Some(status)) => session.info.state = SessionState::Exited { code: status.code() },
+                Ok(Some(status)) => {
+                    session.info.state = SessionState::Exited {
+                        code: status.code(),
+                    }
+                }
                 Ok(None) => {
                     session
                         .child
@@ -253,10 +260,15 @@ impl SessionLauncher {
             if matches!(session.info.state, SessionState::Running)
                 && let Ok(Some(status)) = session.child.try_wait()
             {
-                session.info.state = SessionState::Exited { code: status.code() };
+                session.info.state = SessionState::Exited {
+                    code: status.code(),
+                };
             }
         }
-        sessions.values().map(|session| session.info.clone()).collect()
+        sessions
+            .values()
+            .map(|session| session.info.clone())
+            .collect()
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, BTreeMap<u64, LaunchedSession>> {
@@ -336,7 +348,9 @@ impl ScriptRunner {
         command: &str,
         timeout: Option<Duration>,
     ) -> Result<ScriptOutcome, std::io::Error> {
-        let timeout = timeout.unwrap_or(self.default_timeout).min(self.max_timeout);
+        let timeout = timeout
+            .unwrap_or(self.default_timeout)
+            .min(self.max_timeout);
         let (shell, shell_args) = Self::shell();
         let child = Command::new(shell)
             .args(shell_args)
@@ -413,7 +427,9 @@ mod tests {
                 relay_only: true,
             }),
         );
-        let line = launcher.command_line(&device("office-pc.omega"), true).unwrap();
+        let line = launcher
+            .command_line(&device("office-pc.omega"), true)
+            .unwrap();
         assert_eq!(line[0], "omegadesk-client");
         assert_eq!(line[1], "office-pc.omega");
         assert!(line.contains(&"--relay-only".to_owned()));

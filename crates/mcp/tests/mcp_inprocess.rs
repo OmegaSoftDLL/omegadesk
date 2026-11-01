@@ -102,7 +102,8 @@ impl ClientHandler for TestHost {
         };
         self.prompts.lock().unwrap().push(message);
         if self.approve {
-            Ok(ElicitResult::new(ElicitationAction::Accept).with_content(json!({ "approve": true })))
+            Ok(ElicitResult::new(ElicitationAction::Accept)
+                .with_content(json!({ "approve": true })))
         } else {
             Ok(ElicitResult::new(ElicitationAction::Decline))
         }
@@ -126,7 +127,10 @@ async fn harness(protocol: ProtocolVersion, approve: bool) -> Harness {
         .try_init();
 
     let directory = Arc::new(FixtureDirectory::new());
-    let sessions = Arc::new(SessionLauncher::new(PathBuf::from("omegadesk-client"), None));
+    let sessions = Arc::new(SessionLauncher::new(
+        PathBuf::from("omegadesk-client"),
+        None,
+    ));
     let server = OmegaDeskMcpServer::new(
         McpTrustEngine::new(),
         directory,
@@ -145,7 +149,9 @@ async fn harness(protocol: ProtocolVersion, approve: bool) -> Harness {
 
     let (server_io, client_io) = tokio::io::duplex(64 * 1024);
     let server_task = tokio::spawn(async move {
-        let running = serve_server(server, server_io).await.expect("server handshake");
+        let running = serve_server(server, server_io)
+            .await
+            .expect("server handshake");
         let _ = running.waiting().await;
     });
     let prompts = Arc::new(Mutex::new(Vec::new()));
@@ -154,7 +160,9 @@ async fn harness(protocol: ProtocolVersion, approve: bool) -> Harness {
         approve,
         prompts: prompts.clone(),
     };
-    let client = serve_client(host, client_io).await.expect("client handshake");
+    let client = serve_client(host, client_io)
+        .await
+        .expect("client handshake");
     Harness {
         client,
         server_task,
@@ -174,7 +182,11 @@ fn params(name: &'static str, arguments: Value) -> CallToolRequestParams {
 }
 
 fn structured(result: &CallToolResult) -> Value {
-    assert_ne!(result.is_error, Some(true), "tool reported an error: {result:?}");
+    assert_ne!(
+        result.is_error,
+        Some(true),
+        "tool reported an error: {result:?}"
+    );
     result
         .structured_content
         .clone()
@@ -182,7 +194,11 @@ fn structured(result: &CallToolResult) -> Value {
 }
 
 fn error_text(result: &CallToolResult) -> String {
-    assert_eq!(result.is_error, Some(true), "expected a tool error: {result:?}");
+    assert_eq!(
+        result.is_error,
+        Some(true),
+        "expected a tool error: {result:?}"
+    );
     result
         .content
         .iter()
@@ -292,12 +308,19 @@ async fn run_script_is_confirmed_through_input_required_on_the_latest_protocol()
     let outcome = structured(&result);
     assert_eq!(outcome["exit_code"], 0);
     assert_eq!(outcome["timed_out"], false);
-    assert!(outcome["stdout"].as_str().unwrap().contains("mcp-ok"), "{outcome}");
+    assert!(
+        outcome["stdout"].as_str().unwrap().contains("mcp-ok"),
+        "{outcome}"
+    );
 
     let prompts = harness.prompts.lock().unwrap().clone();
     assert_eq!(prompts.len(), 1, "exactly one operator prompt: {prompts:?}");
     assert!(prompts[0].contains("run_script"), "{}", prompts[0]);
-    assert!(prompts[0].contains("operator-laptop.omega"), "{}", prompts[0]);
+    assert!(
+        prompts[0].contains("operator-laptop.omega"),
+        "{}",
+        prompts[0]
+    );
     assert!(prompts[0].contains("echo mcp-ok"), "{}", prompts[0]);
 
     let trust = harness.trust.lock().unwrap();
@@ -319,7 +342,10 @@ async fn run_script_is_confirmed_through_elicitation_on_protocol_2025_11_25() {
         .unwrap();
     let outcome = structured(&result);
     assert_eq!(outcome["exit_code"], 0);
-    assert!(outcome["stdout"].as_str().unwrap().contains("legacy-ok"), "{outcome}");
+    assert!(
+        outcome["stdout"].as_str().unwrap().contains("legacy-ok"),
+        "{outcome}"
+    );
     let prompts = harness.prompts.lock().unwrap().clone();
     assert_eq!(prompts.len(), 1, "{prompts:?}");
     assert!(prompts[0].contains("echo legacy-ok"));
@@ -381,7 +407,10 @@ async fn emergency_stop_halts_every_tool() {
     let harness = harness(ProtocolVersion::LATEST, true).await;
     let stop = harness
         .client
-        .call_tool(params("emergency_stop", json!({ "reason": "operator panic button" })))
+        .call_tool(params(
+            "emergency_stop",
+            json!({ "reason": "operator panic button" }),
+        ))
         .await
         .unwrap();
     assert_eq!(structured(&stop)["active"], true);

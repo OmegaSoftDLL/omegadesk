@@ -112,7 +112,10 @@ mod tests {
         assert_eq!(BackendChoice::parse(Some("auto")), BackendChoice::Auto);
         assert_eq!(BackendChoice::parse(Some(" X11 ")), BackendChoice::X11);
         assert_eq!(BackendChoice::parse(Some("Portal")), BackendChoice::Portal);
-        assert_eq!(BackendChoice::parse(Some("pipewire")), BackendChoice::Portal);
+        assert_eq!(
+            BackendChoice::parse(Some("pipewire")),
+            BackendChoice::Portal
+        );
         assert_eq!(BackendChoice::parse(Some("kms")), BackendChoice::Auto);
     }
 }

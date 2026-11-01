@@ -76,7 +76,9 @@ pub trait MeshDirectory: Send + Sync {
     fn devices(&self) -> Vec<DeviceEntry>;
     /// Finds a device by id, hostname, `fqdn` or mesh IPv4.
     fn resolve(&self, query: &str) -> Option<DeviceEntry> {
-        self.devices().into_iter().find(|entry| entry.matches(query))
+        self.devices()
+            .into_iter()
+            .find(|entry| entry.matches(query))
     }
 }
 

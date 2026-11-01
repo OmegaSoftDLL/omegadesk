@@ -8,11 +8,16 @@
 
 use std::time::{Duration, Instant};
 
+pub mod convert;
 pub mod cursor;
 #[cfg(windows)]
 mod dxgi;
 #[cfg(windows)]
 pub mod gdi;
+#[cfg(target_os = "linux")]
+pub mod linux;
+#[cfg(target_os = "macos")]
+pub mod macos;
 pub mod rotate;
 pub mod service_desktop;
 pub mod virtual_display;
@@ -22,7 +27,7 @@ mod wgc;
 use service_desktop::CaptureBackendKind;
 
 /// Screen capture errors.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum CaptureError {
     /// No capture backend is implemented for this operating system yet.
     #[error("screen capture is not yet supported on this operating system")]
@@ -255,7 +260,15 @@ pub fn open_display_tracked(
             )),
         }
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "linux")]
+    {
+        linux::open_display(index)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        macos::MacOsCapturer::open(index).map(|capturer| Box::new(capturer) as Box<dyn Capturer>)
+    }
+    #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
     {
         let _ = index;
         Err(CaptureError::Unsupported)
