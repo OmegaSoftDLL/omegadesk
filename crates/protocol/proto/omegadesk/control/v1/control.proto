@@ -93,7 +93,8 @@ message RelayTicketResponse {
   repeated RelayInfo relays = 1;
 }
 
-// Liveness probe in both directions; the receiver echoes `sequence`.
+// Liveness probe. The node initiates a Keepalive every 30 s and the coordinator
+// echoes it unchanged; the node never answers an echo, so there is no loop.
 message Keepalive {
   uint64 sequence = 1;
 }

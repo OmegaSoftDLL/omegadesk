@@ -18,6 +18,8 @@
 //! cannot be replayed on another, and client registrations carry a generation
 //! so a late disconnect of an old connection never evicts its replacement.
 
+pub mod service;
+
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
@@ -56,6 +58,11 @@ pub const TICKET_WIRE_LEN: usize = 16 + 32 + 32 + 8 + 32;
 
 /// Nonce length of the sealed login box.
 pub const LOGIN_NONCE_LEN: usize = 12;
+
+/// Length of the random challenge the relay puts in its greeting; the login
+/// box binds to it, so a sealed login captured on one connection cannot be
+/// replayed on another.
+pub const LOGIN_CHALLENGE_LEN: usize = 16;
 const TAG_LEN: usize = 16;
 /// Sealed login body: `32B client key + 12B nonce + (120B ticket + 1B version + 16B tag)`.
 pub const CLIENT_INFO_WIRE_LEN: usize = 32 + LOGIN_NONCE_LEN + TICKET_WIRE_LEN + 1 + TAG_LEN;
@@ -95,10 +102,13 @@ impl PeerGoneReason {
 /// modeled after `tailscale/derp/derp.go`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RelayFrame {
-    /// `0x01`: Server greeting carrying [`MAGIC`] and the relay's 32-byte X25519 key.
+    /// `0x01`: Server greeting carrying [`MAGIC`], the relay's 32-byte X25519 key
+    /// and a fresh per-connection challenge the login must be bound to.
     ServerKey {
         /// Relay node's 32-byte X25519 public key.
         server_public_key: [u8; 32],
+        /// Random per-connection challenge (see [`seal_client_login`]).
+        challenge: [u8; LOGIN_CHALLENGE_LEN],
     },
     /// `0x02`: Client login: the client's 32-byte X25519 key followed by a box
     /// sealed from the client's private key to the relay's public key, holding
@@ -203,10 +213,14 @@ impl RelayFrame {
     /// Returns [`RelayError::PacketTooLarge`] if a packet payload exceeds [`MAX_PACKET_SIZE`].
     pub fn encode(&self) -> Result<Vec<u8>, RelayError> {
         let (frame_type, body) = match self {
-            Self::ServerKey { server_public_key } => {
-                let mut b = Vec::with_capacity(MAGIC.len() + 32);
+            Self::ServerKey {
+                server_public_key,
+                challenge,
+            } => {
+                let mut b = Vec::with_capacity(MAGIC.len() + 32 + LOGIN_CHALLENGE_LEN);
                 b.extend_from_slice(&MAGIC);
                 b.extend_from_slice(server_public_key);
+                b.extend_from_slice(challenge);
                 (FRAME_SERVER_KEY, b)
             }
             Self::ClientInfo {
@@ -303,7 +317,7 @@ impl RelayFrame {
     pub fn decode_body(frame_type: u8, body: &[u8]) -> Result<Self, RelayError> {
         match frame_type {
             FRAME_SERVER_KEY => {
-                if body.len() < MAGIC.len() + 32 {
+                if body.len() < MAGIC.len() + 32 + LOGIN_CHALLENGE_LEN {
                     return Err(RelayError::MalformedFrame);
                 }
                 if body[..MAGIC.len()] != MAGIC {
@@ -311,7 +325,14 @@ impl RelayFrame {
                 }
                 let mut server_public_key = [0u8; 32];
                 server_public_key.copy_from_slice(&body[MAGIC.len()..MAGIC.len() + 32]);
-                Ok(Self::ServerKey { server_public_key })
+                let mut challenge = [0u8; LOGIN_CHALLENGE_LEN];
+                challenge.copy_from_slice(
+                    &body[MAGIC.len() + 32..MAGIC.len() + 32 + LOGIN_CHALLENGE_LEN],
+                );
+                Ok(Self::ServerKey {
+                    server_public_key,
+                    challenge,
+                })
             }
             FRAME_CLIENT_INFO => {
                 if body.len() != CLIENT_INFO_WIRE_LEN {
@@ -584,8 +605,9 @@ fn login_key(secret: &StaticSecret, peer_public: &[u8; 32]) -> Result<LessSafeKe
 
 /// Seals the login body for [`RelayFrame::ClientInfo`]: `12B nonce ||
 /// ChaCha20-Poly1305_{DH(client, relay)}(ticket || PROTOCOL_VERSION)`, with the
-/// client and relay public keys as associated data. Only the holder of the
-/// client's private key can produce it (DERP `sendClientKey` model).
+/// client key, the relay key **and the relay's per-connection challenge** as
+/// associated data. Only the holder of the client's private key can produce
+/// it (DERP `sendClientKey` model), and it is valid on this connection only.
 ///
 /// # Errors
 ///
@@ -593,15 +615,17 @@ fn login_key(secret: &StaticSecret, peer_public: &[u8; 32]) -> Result<LessSafeKe
 pub fn seal_client_login(
     client: &DeviceIdentity,
     relay_public_key: &[u8; 32],
+    challenge: &[u8; LOGIN_CHALLENGE_LEN],
     ticket: &RelayTicket,
 ) -> Result<Vec<u8>, RelayError> {
     let client_public = client.public().exchange_key_bytes();
     let key = login_key(client.exchange_secret(), relay_public_key)?;
     let mut nonce = [0u8; LOGIN_NONCE_LEN];
     OsRng.fill_bytes(&mut nonce);
-    let mut aad = Vec::with_capacity(64);
+    let mut aad = Vec::with_capacity(64 + LOGIN_CHALLENGE_LEN);
     aad.extend_from_slice(&client_public);
     aad.extend_from_slice(relay_public_key);
+    aad.extend_from_slice(challenge);
     let mut body = Vec::with_capacity(TICKET_WIRE_LEN + 1 + TAG_LEN);
     body.extend_from_slice(&ticket.to_bytes());
     body.push(PROTOCOL_VERSION);
@@ -618,7 +642,8 @@ pub fn seal_client_login(
 }
 
 /// Opens a [`RelayFrame::ClientInfo`] login on the relay, proving that the
-/// presenter holds the private key of `client_public_key`.
+/// presenter holds the private key of `client_public_key` and answered this
+/// connection's `challenge`.
 ///
 /// # Errors
 ///
@@ -627,6 +652,7 @@ pub fn seal_client_login(
 pub fn open_client_login(
     relay: &DeviceIdentity,
     client_public_key: &[u8; 32],
+    challenge: &[u8; LOGIN_CHALLENGE_LEN],
     sealed: &[u8],
 ) -> Result<RelayTicket, RelayError> {
     if sealed.len() != CLIENT_INFO_WIRE_LEN - 32 {
@@ -635,9 +661,10 @@ pub fn open_client_login(
     let key = login_key(relay.exchange_secret(), client_public_key)?;
     let mut nonce = [0u8; LOGIN_NONCE_LEN];
     nonce.copy_from_slice(&sealed[..LOGIN_NONCE_LEN]);
-    let mut aad = Vec::with_capacity(64);
+    let mut aad = Vec::with_capacity(64 + LOGIN_CHALLENGE_LEN);
     aad.extend_from_slice(client_public_key);
     aad.extend_from_slice(&relay.public().exchange_key_bytes());
+    aad.extend_from_slice(challenge);
     let mut buf = sealed[LOGIN_NONCE_LEN..].to_vec();
     let plain = key
         .open_in_place(
@@ -705,17 +732,25 @@ impl RelayRouter {
         self.identity.public()
     }
 
-    /// Returns the `FrameServerKey` greeting frame for newly connected clients.
+    /// Returns a `FrameServerKey` greeting with a fresh challenge for a new
+    /// connection; keep the challenge to verify that connection's login.
     #[must_use]
-    pub fn server_key_frame(&self) -> RelayFrame {
-        RelayFrame::ServerKey {
-            server_public_key: self.identity.public().exchange_key_bytes(),
-        }
+    pub fn server_key_frame(&self) -> (RelayFrame, [u8; LOGIN_CHALLENGE_LEN]) {
+        let mut challenge = [0u8; LOGIN_CHALLENGE_LEN];
+        OsRng.fill_bytes(&mut challenge);
+        (
+            RelayFrame::ServerKey {
+                server_public_key: self.identity.public().exchange_key_bytes(),
+                challenge,
+            },
+            challenge,
+        )
     }
 
-    /// Authenticates a client login (`ClientInfo` body) and registers its
-    /// outbound channel. A second live registration for the same key replaces
-    /// the previous one; the old connection's later `unregister_client` call is
+    /// Authenticates a client login (`ClientInfo` body) against the challenge
+    /// sent in this connection's greeting and registers the client's outbound
+    /// channel. A second live registration for the same key replaces the
+    /// previous one; the old connection's later `unregister_client` call is
     /// ignored because its generation no longer matches.
     ///
     /// # Errors
@@ -724,10 +759,11 @@ impl RelayRouter {
     pub fn register_client(
         &mut self,
         client_public_key: [u8; 32],
+        challenge: &[u8; LOGIN_CHALLENGE_LEN],
         sealed: &[u8],
         now_unix_secs: u64,
     ) -> Result<RegisteredClient, RelayError> {
-        let ticket = open_client_login(&self.identity, &client_public_key, sealed)?;
+        let ticket = open_client_login(&self.identity, &client_public_key, challenge, sealed)?;
         self.validator
             .redeem(&ticket, &client_public_key, now_unix_secs)?;
         let generation = self.next_generation;
@@ -914,6 +950,8 @@ mod tests {
         (relay_id, issuer, router)
     }
 
+    const CHALLENGE: [u8; LOGIN_CHALLENGE_LEN] = [0xC7; LOGIN_CHALLENGE_LEN];
+
     fn login(
         client: &DeviceIdentity,
         relay: &DeviceIdentity,
@@ -930,7 +968,7 @@ mod tests {
         );
         (
             client.public().exchange_key_bytes(),
-            seal_client_login(client, &relay_key, &ticket).unwrap(),
+            seal_client_login(client, &relay_key, &CHALLENGE, &ticket).unwrap(),
         )
     }
 
@@ -986,23 +1024,48 @@ mod tests {
 
         // An eavesdropper who copied Alice's public key and ticket cannot log in.
         let mallory = DeviceIdentity::generate();
-        let forged = seal_client_login(&mallory, &relay_key, &ticket).unwrap();
+        let forged = seal_client_login(&mallory, &relay_key, &CHALLENGE, &ticket).unwrap();
         assert_eq!(
             router
-                .register_client(alice.public().exchange_key_bytes(), &forged, 1000)
+                .register_client(
+                    alice.public().exchange_key_bytes(),
+                    &CHALLENGE,
+                    &forged,
+                    1000
+                )
                 .err(),
             Some(RelayError::LoginProofFailed)
         );
-        // Alice herself can.
-        let sealed = seal_client_login(&alice, &relay_key, &ticket).unwrap();
+        // Alice herself can, but only on the connection whose challenge she answered:
+        // the same sealed login replayed on another connection (other challenge) fails.
+        let sealed = seal_client_login(&alice, &relay_key, &CHALLENGE, &ticket).unwrap();
+        let other_challenge = [0x11u8; LOGIN_CHALLENGE_LEN];
+        assert_eq!(
+            router
+                .register_client(
+                    alice.public().exchange_key_bytes(),
+                    &other_challenge,
+                    &sealed,
+                    1000
+                )
+                .err(),
+            Some(RelayError::LoginProofFailed)
+        );
         let frame = RelayFrame::ClientInfo {
             client_public_key: alice.public().exchange_key_bytes(),
             sealed: sealed.clone(),
         };
         let wire = frame.encode().unwrap();
         assert_eq!(RelayFrame::decode(&wire).unwrap(), frame);
+        let (greeting, challenge) = router.server_key_frame();
+        assert!(matches!(greeting, RelayFrame::ServerKey { challenge: c, .. } if c == challenge));
         let registered = router
-            .register_client(alice.public().exchange_key_bytes(), &sealed, 1000)
+            .register_client(
+                alice.public().exchange_key_bytes(),
+                &CHALLENGE,
+                &sealed,
+                1000,
+            )
             .unwrap();
         assert_eq!(
             registered.server_info,
@@ -1013,7 +1076,12 @@ mod tests {
         // Replaying the same login (same ticket) fails.
         assert_eq!(
             router
-                .register_client(alice.public().exchange_key_bytes(), &sealed, 1001)
+                .register_client(
+                    alice.public().exchange_key_bytes(),
+                    &CHALLENGE,
+                    &sealed,
+                    1001
+                )
                 .err(),
             Some(RelayError::TicketReplayed)
         );
@@ -1045,9 +1113,11 @@ mod tests {
         let (alice_key, alice_login) = login(&alice, &relay_id, &issuer, [1u8; 16], 2000);
         let (bob_key, bob_login) = login(&bob, &relay_id, &issuer, [2u8; 16], 2000);
         let mut alice_reg = router
-            .register_client(alice_key, &alice_login, 1000)
+            .register_client(alice_key, &CHALLENGE, &alice_login, 1000)
             .unwrap();
-        let mut bob_reg = router.register_client(bob_key, &bob_login, 1000).unwrap();
+        let mut bob_reg = router
+            .register_client(bob_key, &CHALLENGE, &bob_login, 1000)
+            .unwrap();
         assert_eq!(router.connected_clients(), 2);
 
         router
@@ -1074,7 +1144,7 @@ mod tests {
         // Alice reconnects (new ticket) before her old connection cleans up.
         let (_, alice_login2) = login(&alice, &relay_id, &issuer, [9u8; 16], 2000);
         let alice_reg2 = router
-            .register_client(alice_key, &alice_login2, 1001)
+            .register_client(alice_key, &CHALLENGE, &alice_login2, 1001)
             .unwrap();
         assert_ne!(alice_reg2.generation, alice_reg.generation);
         router.unregister_client(&alice_key, alice_reg.generation);
@@ -1147,6 +1217,7 @@ mod tests {
         let frames = vec![
             RelayFrame::ServerKey {
                 server_public_key: [3u8; 32],
+                challenge: [0x5a; LOGIN_CHALLENGE_LEN],
             },
             RelayFrame::ServerInfo {
                 protocol_version: PROTOCOL_VERSION,

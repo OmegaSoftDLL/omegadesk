@@ -29,6 +29,7 @@ use rand_core::{OsRng, RngCore};
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 
+pub mod control_server;
 pub mod rmm;
 pub mod web_gateway;
 pub mod webhooks_audit;
@@ -547,6 +548,10 @@ impl RelayGrant {
 /// Response returned to a machine when it enrolls with the coordinator.
 #[derive(Debug)]
 pub struct EnrollmentBundle {
+    /// Session generation of this enrollment; pass it to
+    /// [`Coordinator::handle_disconnect`] so a stale connection never tears
+    /// down its replacement.
+    pub generation: u64,
     /// The enrolled node's assigned record (including mesh IPv4/IPv6 and `*.omega` FQDN).
     pub node: NodeRecord,
     /// Peers of the same tenant visible at enrollment time.
@@ -596,6 +601,9 @@ pub fn mesh_addresses(index: u32) -> Option<(Ipv4Addr, Ipv6Addr)> {
 pub struct Coordinator {
     preauth_keys: HashMap<String, PreAuthKey>,
     nodes: HashMap<DeviceId, NodeRecord>,
+    /// Current session generation per node (incremented on every enrollment).
+    sessions: HashMap<DeviceId, u64>,
+    next_generation: u64,
     next_ip_index: u32,
     dns: MagicDnsResolver,
     batcher: NetmapBatcher,
@@ -610,6 +618,8 @@ impl Coordinator {
         Self {
             preauth_keys: HashMap::new(),
             nodes: HashMap::new(),
+            sessions: HashMap::new(),
+            next_generation: 1,
             next_ip_index: 1,
             dns: MagicDnsResolver::new(),
             batcher: NetmapBatcher::new(),
@@ -755,10 +765,26 @@ impl Coordinator {
         let tags = key.tags.clone();
         let ephemeral = key.ephemeral;
 
-        // Re-enrollment with a new hostname must not leave the old name resolving.
+        // Re-enrollment with a new hostname must not leave the old name resolving,
+        // and moving to another tenant must remove the node from the old tenant's
+        // netmaps.
         if let Some(previous) = self.nodes.get(&node_id) {
             self.dns.unregister(&previous.fqdn);
+            if previous.tenant != tenant {
+                let old_tenant = previous.tenant.clone();
+                let signing_key = previous.public.signing_key_bytes();
+                self.batcher.enqueue(
+                    &old_tenant,
+                    NetmapDelta::PeerRemoved {
+                        peer: node_id,
+                        signing_key,
+                    },
+                );
+            }
         }
+        let generation = self.next_generation;
+        self.next_generation += 1;
+        self.sessions.insert(node_id, generation);
         let (sanitized_label, fqdn) = self.dns.register(node_id, hostname, ipv4, ipv6);
         let record = NodeRecord {
             public,
@@ -794,6 +820,7 @@ impl Coordinator {
         let relays = self.issue_relay_grants(node_id, now_unix_secs)?;
 
         Ok(EnrollmentBundle {
+            generation,
             node: record,
             peers,
             relays,
@@ -830,10 +857,16 @@ impl Coordinator {
         Ok(())
     }
 
-    /// Handles node disconnection; if the node was enrolled with an `ephemeral`
-    /// pre-auth key, removes it from the netmap and `MagicDNS` immediately (matching
-    /// Headscale's ephemeral node cleanup).
-    pub fn handle_disconnect(&mut self, node_id: DeviceId) {
+    /// Handles node disconnection of the session with `generation`; a stale
+    /// generation (the node already re-enrolled on another connection) is a
+    /// no-op. If the node was enrolled with an `ephemeral` pre-auth key, removes
+    /// it from the netmap and `MagicDNS` immediately (matching Headscale's
+    /// ephemeral node cleanup).
+    pub fn handle_disconnect(&mut self, node_id: DeviceId, generation: u64) {
+        if self.sessions.get(&node_id) != Some(&generation) {
+            return;
+        }
+        self.sessions.remove(&node_id);
         self.batcher.unsubscribe(node_id);
         if let Some(node) = self.nodes.get(&node_id)
             && node.ephemeral
@@ -1040,7 +1073,7 @@ mod tests {
             CoordinatorError::PreAuthKeyAlreadyUsed
         );
 
-        coord.handle_disconnect(dev1.id());
+        coord.handle_disconnect(dev1.id(), bundle.generation);
         assert_eq!(coord.node_count(), 0);
         assert_eq!(coord.dns().lookup("runner-01.omega"), None);
     }
@@ -1087,7 +1120,7 @@ mod tests {
             .unwrap();
         coord.flush_netmap();
         assert!(a1_bundle.netmap_rx.try_recv().is_err());
-        coord.handle_disconnect(g1.id());
+        coord.handle_disconnect(g1.id(), g1_bundle.generation);
         assert!(a1_bundle.netmap_rx.try_recv().is_err());
         coord
             .update_endpoints(a2.id(), vec!["203.0.113.2:2".parse().unwrap()])
@@ -1160,6 +1193,37 @@ mod tests {
         assert_eq!(first.node.ipv4, second.node.ipv4, "addresses are stable");
         assert_eq!(coord.dns().lookup("old-name.omega"), None);
         assert!(coord.dns().lookup("new-name.omega").is_some());
+        // The stale first session cannot tear down the second enrollment.
+        assert_ne!(first.generation, second.generation);
+        coord.handle_disconnect(dev.id(), first.generation);
+        assert!(coord.node(dev.id()).is_some());
+    }
+
+    #[test]
+    fn moving_to_another_tenant_removes_the_node_from_the_old_tenant() {
+        let mut coord = Coordinator::new([4u8; 32]);
+        let acme = coord
+            .create_preauth_key("acme", true, false, vec![], None)
+            .unwrap();
+        let globex = coord
+            .create_preauth_key("globex", true, false, vec![], None)
+            .unwrap();
+        let watcher = DeviceIdentity::generate();
+        let mover = DeviceIdentity::generate();
+        let mut watcher_bundle = coord
+            .enroll_machine(&acme, watcher.public(), "watcher", vec![], 1)
+            .unwrap();
+        let _ = coord
+            .enroll_machine(&acme, mover.public(), "mover", vec![], 2)
+            .unwrap();
+        let _ = watcher_bundle.netmap_rx.try_recv().unwrap(); // snapshot
+        let _ = watcher_bundle.netmap_rx.try_recv().unwrap(); // PeerUpserted(mover)
+        let moved = coord
+            .enroll_machine(&globex, mover.public(), "mover", vec![], 3)
+            .unwrap();
+        assert_eq!(moved.node.tenant, "globex");
+        let delta = watcher_bundle.netmap_rx.try_recv().unwrap();
+        assert!(matches!(&delta[0], NetmapDelta::PeerRemoved { peer, .. } if *peer == mover.id()));
     }
 
     #[test]
@@ -1278,16 +1342,38 @@ mod tests {
 
         // 3. Both nodes authenticate to the stateless relay using their single-use
         //    tickets, sealed with their private keys (proof of key possession).
-        let alice_login =
-            seal_client_login(&alice_id, &relay_key, &alice_bundle.relays[0].ticket).unwrap();
+        let (_, alice_challenge) = relay.server_key_frame();
+        let alice_login = seal_client_login(
+            &alice_id,
+            &relay_key,
+            &alice_challenge,
+            &alice_bundle.relays[0].ticket,
+        )
+        .unwrap();
         let mut alice_relay_rx = relay
-            .register_client(alice_id.public().exchange_key_bytes(), &alice_login, 1000)
+            .register_client(
+                alice_id.public().exchange_key_bytes(),
+                &alice_challenge,
+                &alice_login,
+                1000,
+            )
             .unwrap()
             .outbound;
-        let bob_login =
-            seal_client_login(&bob_id, &relay_key, &bob_bundle.relays[0].ticket).unwrap();
+        let (_, bob_challenge) = relay.server_key_frame();
+        let bob_login = seal_client_login(
+            &bob_id,
+            &relay_key,
+            &bob_challenge,
+            &bob_bundle.relays[0].ticket,
+        )
+        .unwrap();
         let mut bob_relay_rx = relay
-            .register_client(bob_id.public().exchange_key_bytes(), &bob_login, 1000)
+            .register_client(
+                bob_id.public().exchange_key_bytes(),
+                &bob_challenge,
+                &bob_login,
+                1000,
+            )
             .unwrap()
             .outbound;
 
@@ -1309,8 +1395,46 @@ mod tests {
             b"relayed-frame",
         )
         .unwrap();
+        // Epochs travel in the CallMeMaybe/Ping messages exchanged over the relay.
+        while let Some(tx) = alice_mesh.poll_transmit() {
+            if let TransmitTarget::Relay(dst_key) = tx.target {
+                relay
+                    .forward_packet(
+                        alice_bundle.node.public.exchange_key_bytes(),
+                        dst_key,
+                        tx.payload,
+                    )
+                    .unwrap();
+            }
+        }
+        while let Ok(RelayFrame::RecvPacket { packet, .. }) = bob_relay_rx.try_recv() {
+            bob_mesh
+                .handle_receive(None, &packet, t0 + RELAY_FALLBACK_TIMEOUT)
+                .unwrap();
+        }
+        bob_mesh.handle_timeout(t0 + RELAY_FALLBACK_TIMEOUT);
+        while let Some(tx) = bob_mesh.poll_transmit() {
+            if let TransmitTarget::Relay(dst_key) = tx.target {
+                relay
+                    .forward_packet(
+                        bob_bundle.node.public.exchange_key_bytes(),
+                        dst_key,
+                        tx.payload,
+                    )
+                    .unwrap();
+            }
+        }
+        while let Ok(RelayFrame::RecvPacket { packet, .. }) = alice_relay_rx.try_recv() {
+            alice_mesh
+                .handle_receive(None, &packet, t0 + RELAY_FALLBACK_TIMEOUT)
+                .unwrap();
+        }
         alice_mesh
-            .encapsulate(bob_bundle.node.public.id(), &pkt)
+            .encapsulate(
+                bob_bundle.node.public.id(),
+                &pkt,
+                t0 + RELAY_FALLBACK_TIMEOUT,
+            )
             .unwrap();
         while let Some(tx) = alice_mesh.poll_transmit() {
             if let TransmitTarget::Relay(dst_key) = tx.target {
@@ -1357,8 +1481,6 @@ mod tests {
                 )
                 .unwrap();
         }
-        let _ = &mut alice_relay_rx;
-
         while let Some(tx) = bob_mesh.poll_transmit() {
             if let TransmitTarget::DirectUdp(dst) = tx.target {
                 assert_eq!(dst, alice_lan);
