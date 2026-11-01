@@ -23,7 +23,7 @@ OmegaDesk is a remote desktop you run on your own infrastructure, as an alternat
 ## Status
 
 > [!WARNING]
-> OmegaDesk is in early development. **Phases 0 and 1** of the [roadmap](docs/plan.md) are done: it works on a local network today, connecting by IP address, certificate fingerprint and password. **Phase 2** (coordinator, relay and mesh) is implemented end to end: agent and client enroll with a coordinator and connect by name through NAT traversal or the relay, verified in-process and in a two-machine test over Tailscale (a clean test across two distinct public NATs is still pending). From **Phase 3**, QuickSupport works end to end (nine-digit ID, temporary password, console consent prompt), and the native agent and client synchronize text clipboards, transfer files, switch monitors and adapt video quality. The **browser client** (Phase 4) connects through the coordinator's web gateway with keyboard, mouse and H.264 video, verified in-process; its latency against the native client is not measured yet. Audio, chat, terminal and LAN mode remain unwired, and the recording, RMM and compatibility layers (Phases 5–7) exist only as library crates that no binary uses yet; the plan lists their known defects. It is not ready for production use.
+> OmegaDesk is in early development. **Phases 0 and 1** of the [roadmap](docs/plan.md) are done: it works on a local network today, connecting by IP address, certificate fingerprint and password. **Phase 2** (coordinator, relay and mesh) is implemented end to end: agent and client enroll with a coordinator and connect by name through NAT traversal or the relay, verified in-process and in a two-machine test over Tailscale (a clean test across two distinct public NATs is still pending). From **Phase 3**, QuickSupport works end to end (nine-digit ID, temporary password, console consent prompt), and the native agent and client synchronize text clipboards, transfer files, switch monitors and adapt video quality. The **browser client** (Phase 4) connects through the coordinator's web gateway with keyboard, mouse and H.264 video, verified in-process; its latency against the native client is not measured yet. **Phase 5** (policies, per-connection MFA, recording, DLP and audit) is wired into the coordinator, the agent and the client and verified in-process; approval workflows and session sharing are still library code. Audio, chat, terminal and LAN mode remain unwired, and the RMM and compatibility layers (Phases 6 and 7) exist only as library crates that no binary uses yet; the plan lists their known defects. It is not ready for production use.
 
 What works today:
 
@@ -73,6 +73,11 @@ Useful flags:
 | `--server`, `--server-key`, `--preauth-key` | agent, client | Join the mesh through a coordinator (see below) |
 | `--relay-only` | agent, client | Mesh mode: never attempt direct paths |
 | `--web-listen`, `--web-root`, `--web-allowed-host`, `--web-behind-tls` | server | Serve the browser client and proxy browsers to agents (see below) |
+| `--totp-secret` / `--generate-totp-secret` | agent | TOTP secret for sessions the policy marks `"action": "check"` (see policies below) |
+| `--recordings-dir` | agent | Where `.odrec` recordings of sessions marked `"record": true` are written |
+| `--audit-log` | agent, server | Append security events as JSON Lines |
+| `--totp` | client | One-time code for an MFA-gated agent (otherwise asked on the terminal) |
+| `--policy` | server | `HuJSON` policy file, re-read when it changes |
 
 Keyboard shortcuts in the client window: `Ctrl+Alt+End` or `Ctrl+Alt+Delete` sends the Secure Attention Sequence to the remote machine; `Ctrl+Alt+Shift` + `1`..`9` streams the n-th remote monitor, `Ctrl+Alt+Shift+N` / `P` the next or previous one (the title bar shows `display 2/3`). Letters rather than arrows, because GPU vendor hotkeys (`Ctrl+Alt+Arrow` on Intel) intercept the arrow combinations before any window sees them.
 
@@ -147,6 +152,30 @@ cargo run --release -p omegadesk-client -- 123 456 789 --server coord.example:80
 
 Closing QuickSupport ends the session and frees the ID. `--view-only` lets the technician watch without controlling the mouse and keyboard.
 
+### Policies, MFA, recording and audit
+
+Without a policy every machine of a tenant sees every other one and the access password is the only check. With `omegadesk-server --policy policy.hujson` each node receives only the peers it may reach (Headscale's model: a peer you may not reach is not in your netmap, so there is no identity to connect to), and every visible peer carries the decision for a remote session towards you, which the agent enforces. The file uses the Tailscale/Headscale `policy/v2` format (`groups`, `tagOwners`, `hosts`, `acls`, `ssh`) plus a `sessions` block, and is re-read when it changes on disk:
+
+```hujson
+{
+  "groups": { "group:helpdesk": ["alice@example.com"] },
+  "tagOwners": { "tag:servers": ["group:helpdesk"] },
+  "sessions": [
+    {
+      "action": "check",            // "accept", or "check" = TOTP step-up on every connection
+      "src": ["group:helpdesk", "tag:helpdesk"],
+      "dst": ["tag:servers"],
+      "record": true,               // the agent writes an .odrec recording
+      "clipboard": { "copy": 65536, "paste": 0 },   // bytes per transfer; 0 blocks; omit = unlimited
+      "watermark": true,            // "user | client IP | session | time" composed into the video
+      "posture": { "minOs": { "windows": "10.0.19045" }, "networks": ["100.64.0.0/10"] }
+    }
+  ]
+}
+```
+
+Machines get their tags from the pre-auth key they enroll with and their owner from `--bootstrap-user` (or `create_preauth_key_for_user`). An agent whose sessions require MFA needs `--totp-secret` (`--generate-totp-secret` prints one with its `otpauth://` URI for the authenticator app; codes are HMAC-SHA256, 6 digits, 30 s); the client passes `--totp <code>` or types it when asked. Sessions marked `record` need `--recordings-dir`; the agent refuses them otherwise. `--audit-log` on both binaries appends one JSON object per event (enrollments, denials, MFA, DLP, recordings).
+
 ## Architecture
 
 ```
@@ -189,7 +218,7 @@ The full design, from the WireGuard mesh to the web client, is in [docs/plan.md]
 | 2 | Mesh network and coordination server: NAT traversal, relay, internal DNS | 🔶 Agent and client join the mesh (`--server`), connect by `name.omega`, traverse NAT with STUN + `disco` and fall back to the relay in 1.5 s; verified in-process and in a two-machine test, clean two-public-NAT test pending |
 | 3 | Remote access product: Windows service, login/UAC screens, clipboard, files, audio | 🔶 QuickSupport, text clipboard, resumable file transfer, multi-monitor switching and adaptive video QoS are wired end to end; Windows service and privacy mode exist but the service worker does not yet route the QUIC session; audio, chat, terminal, FEC and LAN mode remain unwired; open findings: [#27](https://github.com/OmegaSoftDLL/omegadesk/issues/27) |
 | 4 | Web dashboard and browser client | 🔶 Browser client works end to end through `omegadesk-server --web-listen` (WebSocket gateway on the mesh, WebCodecs H.264, keyboard and mouse, latency readout), verified in-process and in CI; the policy model and connection manager are still library only, no dashboard, no WebTransport, latency against the native client not measured; open findings: [#28](https://github.com/OmegaSoftDLL/omegadesk/issues/28) |
-| 5 | Security, session recording and privileged access | 🧩 Library only: recording, HuJSON policies, MFA, PAM, DLP and vault exist; no handshake consults them; open findings: [#29](https://github.com/OmegaSoftDLL/omegadesk/issues/29) |
+| 5 | Security, session recording and privileged access | 🔶 `HuJSON` policies filter every node's netmap at the coordinator and the agent enforces the compiled session grant: per-connection TOTP step-up with lockout, posture, clipboard limits, watermark, `.odrec` recording and JSON Lines audit on both ends, all verified in-process; approval tickets, live session sharing and the search UI remain library-only |
 | 6 | Remote monitoring and management (RMM) | 🧩 Library only: in-memory RMM models; the agent reports nothing; open findings: [#30](https://github.com/OmegaSoftDLL/omegadesk/issues/30) |
 | 7 | RDP/VNC compatibility, virtual displays, MCP server, Linux/macOS/mobile | 🔶 A real IddCx virtual display driver (`drivers/idd`, vendored signed QuickDesk driver) is wired into the agent (`--virtual-display <WxH@hz>`, `--privacy`); still no IronRDP dependency, no MCP server, no Linux/macOS capture; open findings: [#31](https://github.com/OmegaSoftDLL/omegadesk/issues/31), [#33](https://github.com/OmegaSoftDLL/omegadesk/issues/33) |
 

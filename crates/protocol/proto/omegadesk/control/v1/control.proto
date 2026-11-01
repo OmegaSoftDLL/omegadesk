@@ -54,6 +54,44 @@ message NodeInfo {
   // Nine-digit QuickSupport ID assigned by the coordinator; empty for nodes
   // that are not QuickSupport hosts.
   string quicksupport_id = 11;
+  // Owner of the node (user selector in the HuJSON policy); empty for
+  // tagged or ownerless machines.
+  string user = 12;
+  // What this peer may do when it connects to the recipient of the netmap,
+  // compiled by the coordinator from the tenant's HuJSON policy (Headscale
+  // model: every node receives its own filtered view). Absent when the
+  // coordinator runs without a policy file (every peer of the tenant is
+  // visible and the agent enforces only the access password).
+  SessionGrant session = 13;
+}
+
+// Per-(recipient, peer) remote-session decision compiled from the `sessions`
+// block of the tenant policy.
+message SessionGrant {
+  // False: the peer is reachable under the packet-filter ACLs but may not open
+  // a remote desktop session; the agent rejects its Hello.
+  bool allowed = 1;
+  // The agent must run a TOTP step-up before HelloAck (`"action": "check"`).
+  bool require_mfa = 2;
+  // The agent records the session to `.odrec` (`"record": true`).
+  bool record = 3;
+  // Clipboard byte limits per direction; unset means unlimited, 0 blocks.
+  optional uint64 max_clipboard_copy_bytes = 4;
+  optional uint64 max_clipboard_paste_bytes = 5;
+  // Compose the forensic watermark into every encoded frame.
+  bool watermark = 6;
+  // Minimum OS versions the connecting device must report, per family.
+  repeated OsRequirement min_os = 7;
+  // IPv4 CIDRs the connecting address must belong to (empty: unrestricted).
+  repeated string networks = 8;
+}
+
+message OsRequirement {
+  // `windows`, `linux` or `macos`.
+  string family = 1;
+  uint32 major = 2;
+  uint32 minor = 3;
+  uint32 patch = 4;
 }
 
 // A relay node the coordinator issued tickets for.

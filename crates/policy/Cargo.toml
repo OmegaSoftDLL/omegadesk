@@ -1,6 +1,6 @@
 [package]
 name = "omegadesk-policy"
-description = "Multi-tenant hierarchy (Tenant > DeviceGroup > Device, UserGroups), MeshCentral MESHRIGHT/SITERIGHT bitflag permissions, HuJSON policy/v2 compiler, posture checks, per-connection MFA, and PAM approval/sharing workflows"
+description = "Multi-tenant hierarchy (Tenant > DeviceGroup > Device, UserGroups), MeshCentral MESHRIGHT/SITERIGHT bitflag permissions, HuJSON policy/v2 parser and compiler with remote-session rules, posture checks, per-connection MFA, PAM approval/sharing workflows, and the JSON Lines audit log"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,8 +10,10 @@ publish.workspace = true
 
 [dependencies]
 omegadesk-identity.workspace = true
-omegadesk-quicksupport.workspace = true
+omegadesk-protocol.workspace = true
 ring.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
 

@@ -4,6 +4,7 @@
 //! `omegadesk-quicksupport`, which adds the consent prompt through
 //! [`session::SessionGate`] and the auto-rotating temporary password around it.
 
+pub mod access;
 pub mod capture_loop;
 mod channels;
 pub mod password;

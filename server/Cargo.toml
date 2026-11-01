@@ -21,6 +21,7 @@ omegadesk-input.workspace = true
 omegadesk-magicsock.workspace = true
 omegadesk-mesh = { path = "../crates/mesh" }
 omegadesk-noise = { path = "../crates/noise" }
+omegadesk-policy.workspace = true
 omegadesk-protocol.workspace = true
 prost.workspace = true
 omegadesk-relay = { path = "../relay" }

@@ -21,6 +21,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
+use omegadesk_agent::access::{AccessConfig, AccessControl};
 use omegadesk_agent::capture_loop::EncoderChoice;
 use omegadesk_agent::password;
 use omegadesk_agent::session::{self, PeerDescriptor, SessionConfig, SessionGate};
@@ -103,6 +104,7 @@ pub struct QuickSupportHost {
     node: Node,
     identity: Arc<DeviceIdentity>,
     password: Mutex<TemporaryPasswordGuard>,
+    access: Arc<AccessControl>,
     config: HostConfig,
 }
 
@@ -126,10 +128,18 @@ impl QuickSupportHost {
         let node = Node::start(Arc::clone(&identity), node_config).await?;
         let id = node.quicksupport_id().ok_or(HostError::NoId)?;
         info!(%id, fqdn = %node.self_info().fqdn, "QuickSupport host enrolled");
+        let access = Arc::new(AccessControl::new(AccessConfig {
+            agent_name: config.control.hostname.clone(),
+            agent_id: identity.id(),
+            totp_secret: None,
+            recordings_dir: None,
+            audit: None,
+        }));
         Ok(Self {
             node,
             identity,
             password: Mutex::new(TemporaryPasswordGuard::new(config.password_length)),
+            access,
             config,
         })
     }
@@ -222,8 +232,9 @@ impl QuickSupportHost {
                 .contains(ClientPermissions::FILE_UPLOAD),
             receive_dir: omegadesk_session::file_io::default_receive_dir(),
             send_files: Vec::new(),
+            access: Arc::clone(&self.access),
         });
-        match session::run(connection, config).await {
+        match session::run(connection, config, peer.as_deref().cloned()).await {
             Ok(()) => {
                 self.guard().record_success();
                 Ok(SessionOutcome::Served { peer })

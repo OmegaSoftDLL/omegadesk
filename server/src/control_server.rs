@@ -21,6 +21,7 @@ use omegadesk_identity::{DeviceId, DeviceIdentity, DevicePublic};
 use omegadesk_noise::{
     HANDSHAKE_INIT_LEN, MAX_FRAME_CIPHERTEXT_LEN, NoiseReceiver, NoiseSender, ResponderHandshake,
 };
+use omegadesk_policy::{AuditKind, AuditOutcome};
 use omegadesk_protocol::control::CONTROL_PROTOCOL_VERSION;
 use omegadesk_protocol::control::v1 as control;
 use prost::Message;
@@ -255,6 +256,7 @@ pub async fn handle_connection(
     coordinator: Arc<Mutex<Coordinator>>,
 ) -> Result<()> {
     stream.set_nodelay(true)?;
+    let peer_addr = stream.peer_addr()?;
     let (mut reader, mut writer) = stream.into_split();
 
     let (session, request) = tokio::time::timeout(ENROLL_TIMEOUT, async {
@@ -291,6 +293,18 @@ pub async fn handle_connection(
     let bundle = match enroll(&coordinator, &enroll_request, peer) {
         Ok(bundle) => bundle,
         Err(error) => {
+            if let Ok(guard) = coordinator.lock() {
+                let reason = match error.payload.as_ref() {
+                    Some(control::control_envelope::Payload::Error(e)) => e.message.clone(),
+                    _ => "rejected".to_owned(),
+                };
+                guard.audit(
+                    &Coordinator::audit_event(AuditKind::EnrollmentDenied, AuditOutcome::Denied)
+                        .actor(node_id.to_string())
+                        .remote(&peer_addr)
+                        .detail(reason),
+                );
+            }
             let _ = outbound_tx.send(*error).await;
             drop(outbound_tx);
             let _ = writer_task.await;
@@ -299,6 +313,18 @@ pub async fn handle_connection(
     };
     let generation = bundle.generation;
     info!(node = %node_id, fqdn = %bundle.node.fqdn, ipv4 = %bundle.node.ipv4, generation, "node enrolled");
+    if let Ok(guard) = coordinator.lock() {
+        guard.audit(
+            &Coordinator::audit_event(AuditKind::NodeEnrolled, AuditOutcome::Ok)
+                .actor(node_id.to_string())
+                .target(bundle.node.tenant.clone())
+                .remote(&peer_addr)
+                .detail(format!(
+                    "{} ({}) user={:?} tags={:?}",
+                    bundle.node.fqdn, bundle.node.ipv4, bundle.node.user, bundle.node.tags
+                )),
+        );
+    }
     for msg in enrollment_messages(&bundle) {
         outbound_tx.send(msg).await?;
     }
@@ -316,6 +342,15 @@ pub async fn handle_connection(
     writer_task.abort();
     if let Ok(mut guard) = coordinator.lock() {
         guard.handle_disconnect(node_id, generation);
+        guard.audit(
+            &Coordinator::audit_event(AuditKind::NodeDisconnected, AuditOutcome::Ok)
+                .actor(node_id.to_string())
+                .remote(&peer_addr)
+                .detail(match &result {
+                    Ok(()) => "closed".to_owned(),
+                    Err(error) => error.to_string(),
+                }),
+        );
     }
     info!(node = %node_id, generation, "node disconnected");
     result
@@ -437,6 +472,8 @@ mod tests {
             tags: vec![],
             ephemeral: false,
             quicksupport_id: None,
+            user: String::new(),
+            session: None,
         }
     }
 

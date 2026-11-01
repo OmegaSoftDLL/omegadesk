@@ -24,19 +24,31 @@
 //!   already bound to that device, assigns a random free one otherwise, lets
 //!   technicians of the same tenant resolve it ([`Coordinator::lookup_quicksupport`])
 //!   and releases it the moment the node disconnects.
+//! - **Policy-filtered netmaps** (Phase 5, modeled after Headscale's
+//!   `PolicyManager.BuildPeerMap` in `hscontrol/policy/v2/policy.go` and the
+//!   per-node map building of `hscontrol/mapper`): with a `HuJSON` policy loaded
+//!   ([`Coordinator::set_policy`]) every node receives only the peers it may
+//!   reach, each carrying the compiled [`SessionDecision`] for a remote session
+//!   towards the recipient; a policy change reconciles every connected node's
+//!   view and pushes the resulting deltas.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::path::Path;
+use std::sync::Arc;
 
 use data_encoding::HEXLOWER;
 use omegadesk_identity::{
     DeviceId, DevicePublic, IdentityError, QUICKSUPPORT_ID_SPACE, QuickSupportId,
 };
+use omegadesk_policy::{AuditComponent, AuditKind, AuditOutcome, PolicyNode};
+pub use omegadesk_policy::{AuditEvent, AuditLog, HuJsonError, PolicyV2, SessionDecision};
 use omegadesk_protocol::control::v1 as control;
 use omegadesk_relay::{RelayTicket, TicketIssuer};
 use rand_core::{OsRng, RngCore};
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
+use tracing::warn;
 
 pub mod control_server;
 pub mod rmm;
@@ -133,6 +145,9 @@ pub struct PreAuthKey {
     pub secret_hash: [u8; 32],
     /// Tenant identifier that owns this key.
     pub tenant: String,
+    /// User the enrolled machines belong to in the policy (`alice@example.com`);
+    /// empty for tagged or ownerless machines (Headscale `PreAuthKey.User`).
+    pub user: String,
     /// Whether this key can enroll multiple machines.
     pub reusable: bool,
     /// Whether machines enrolled with this key are automatically removed when
@@ -188,6 +203,12 @@ pub struct NodeRecord {
     pub ephemeral: bool,
     /// Nine-digit QuickSupport ID, present only for QuickSupport hosts.
     pub quicksupport_id: Option<QuickSupportId>,
+    /// Owner user in the policy (from the pre-auth key); empty for tagged machines.
+    pub user: String,
+    /// Recipient-relative: in a netmap delivered to node `R`, the decision for
+    /// *this* node opening a remote session on `R`, compiled from the policy.
+    /// `None` in the coordinator's own table and when no policy is loaded.
+    pub session: Option<SessionDecision>,
 }
 
 impl NodeRecord {
@@ -209,6 +230,19 @@ impl NodeRecord {
                 .quicksupport_id
                 .map(QuickSupportId::digits)
                 .unwrap_or_default(),
+            user: self.user.clone(),
+            session: self.session.as_ref().map(SessionDecision::to_proto),
+        }
+    }
+
+    /// The node as the policy compiler sees it: owner, mesh addresses and tags.
+    #[must_use]
+    pub fn policy_node(&self) -> PolicyNode {
+        PolicyNode {
+            id: self.public.id().to_string(),
+            user: self.user.clone(),
+            ips: vec![IpAddr::V4(self.ipv4), IpAddr::V6(self.ipv6)],
+            tags: self.tags.iter().cloned().collect::<HashSet<_>>(),
         }
     }
 
@@ -238,6 +272,8 @@ impl NodeRecord {
             tags: info.tags.clone(),
             ephemeral: info.ephemeral,
             quicksupport_id: parse_quicksupport_id(&info.quicksupport_id)?,
+            user: info.user.clone(),
+            session: info.session.as_ref().map(SessionDecision::from_proto),
         })
     }
 }
@@ -343,13 +379,24 @@ impl NetmapDelta {
     }
 }
 
-/// Coalesces rapid netmap changes and broadcasts batched [`NetmapDelta`] updates
-/// to the connected nodes **of the affected tenant only**, modeled after
-/// Headscale's `Batcher` (`hscontrol/mapper/batcher.go`).
+/// Per-node netmap stream: remembers the view each connected node last received
+/// and, on every [`Self::reconcile`], diffs it against the view the coordinator
+/// wants that node to have, sending one coalesced batch of [`NetmapDelta`]s.
+///
+/// Modeled after Headscale's `Batcher` (`hscontrol/mapper/batcher.go`) for the
+/// coalescing and after its per-node map building (`hscontrol/mapper`, which
+/// runs `policy.ReduceNodes` / `BuildPeerMap` for every recipient) for the
+/// filtering: two nodes of the same tenant may receive different views, so a
+/// change is never broadcast as-is; it is recomputed per recipient.
 #[derive(Default)]
 pub struct NetmapBatcher {
-    pending: Vec<(String, NetmapDelta)>,
-    subscribers: HashMap<DeviceId, (String, mpsc::Sender<Vec<NetmapDelta>>)>,
+    subscribers: HashMap<DeviceId, Subscriber>,
+}
+
+struct Subscriber {
+    tx: mpsc::Sender<Vec<NetmapDelta>>,
+    /// Peers the node currently knows, with the grants it was told.
+    view: HashMap<DeviceId, NodeRecord>,
 }
 
 impl NetmapBatcher {
@@ -359,17 +406,18 @@ impl NetmapBatcher {
         Self::default()
     }
 
-    /// Subscribes `node_id` (member of `tenant`) to receive batched [`NetmapDelta`]
-    /// vectors and immediately queues `initial_snapshot`.
+    /// Subscribes `node_id`, immediately queuing a [`NetmapDelta::FullSnapshot`]
+    /// of `self_node` and `peers`, which becomes the node's known view.
     pub fn subscribe(
         &mut self,
         node_id: DeviceId,
-        tenant: &str,
-        initial_snapshot: NetmapDelta,
+        self_node: NodeRecord,
+        peers: Vec<NodeRecord>,
     ) -> mpsc::Receiver<Vec<NetmapDelta>> {
         let (tx, rx) = mpsc::channel(64);
-        let _ = tx.try_send(vec![initial_snapshot]);
-        self.subscribers.insert(node_id, (tenant.to_owned(), tx));
+        let view = peers.iter().map(|p| (p.public.id(), p.clone())).collect();
+        let _ = tx.try_send(vec![NetmapDelta::FullSnapshot { self_node, peers }]);
+        self.subscribers.insert(node_id, Subscriber { tx, view });
         rx
     }
 
@@ -378,56 +426,79 @@ impl NetmapBatcher {
         self.subscribers.remove(&node_id);
     }
 
-    /// Queues a delta for `tenant`, to be coalesced and broadcast on the next [`Self::flush`].
-    pub fn enqueue(&mut self, tenant: &str, delta: NetmapDelta) {
-        // Coalesce consecutive EndpointUpdated deltas for the same peer.
-        if let NetmapDelta::EndpointUpdated {
-            peer,
-            ref endpoints,
-            ..
-        } = delta
-        {
-            for (_, item) in &mut self.pending {
-                if let NetmapDelta::EndpointUpdated {
-                    peer: existing_peer,
-                    endpoints: existing_eps,
-                    ..
-                } = item
-                    && *existing_peer == peer
-                {
-                    existing_eps.clone_from(endpoints);
-                    return;
-                }
-            }
-        }
-        self.pending.push((tenant.to_owned(), delta));
+    /// Number of connected subscribers.
+    #[must_use]
+    pub fn subscriber_count(&self) -> usize {
+        self.subscribers.len()
     }
 
-    /// Flushes all pending [`NetmapDelta`] items, one batch per tenant, to the
-    /// subscribed nodes of that tenant. Returns the number of deltas flushed.
-    pub fn flush(&mut self) -> usize {
-        if self.pending.is_empty() {
-            return 0;
-        }
-        let pending = std::mem::take(&mut self.pending);
-        let count = pending.len();
-        let mut by_tenant: HashMap<String, Vec<NetmapDelta>> = HashMap::new();
-        for (tenant, delta) in pending {
-            by_tenant.entry(tenant).or_default().push(delta);
-        }
+    /// Brings every subscriber's view in line with `desired(node_id)`: a peer that
+    /// appeared or whose record or grant changed becomes `PeerUpserted`, one whose
+    /// endpoints alone changed becomes the lighter `EndpointUpdated`, and one that
+    /// vanished becomes `PeerRemoved`. `desired` returning `None` (the node is no
+    /// longer enrolled) leaves that view untouched. A subscriber whose channel is
+    /// full or closed is dropped. Returns the number of deltas sent.
+    pub fn reconcile(
+        &mut self,
+        mut desired: impl FnMut(DeviceId) -> Option<Vec<NodeRecord>>,
+    ) -> usize {
+        let mut sent = 0;
         let mut dead = Vec::new();
-        for (node_id, (tenant, tx)) in &self.subscribers {
-            if let Some(batch) = by_tenant.get(tenant)
-                && tx.try_send(batch.clone()).is_err()
-            {
+        for (node_id, subscriber) in &mut self.subscribers {
+            let Some(peers) = desired(*node_id) else {
+                continue;
+            };
+            let deltas = diff_view(&subscriber.view, &peers);
+            if deltas.is_empty() {
+                continue;
+            }
+            sent += deltas.len();
+            subscriber.view = peers.into_iter().map(|p| (p.public.id(), p)).collect();
+            if subscriber.tx.try_send(deltas).is_err() {
                 dead.push(*node_id);
             }
         }
         for node_id in dead {
             self.subscribers.remove(&node_id);
         }
-        count
+        sent
     }
+}
+
+/// Deltas that turn `known` into `desired`.
+fn diff_view(known: &HashMap<DeviceId, NodeRecord>, desired: &[NodeRecord]) -> Vec<NetmapDelta> {
+    let mut deltas = Vec::new();
+    let mut seen = HashSet::with_capacity(desired.len());
+    for peer in desired {
+        let id = peer.public.id();
+        seen.insert(id);
+        match known.get(&id) {
+            Some(old) if old == peer => {}
+            Some(old) => {
+                let mut endpoints_only = old.clone();
+                endpoints_only.endpoints.clone_from(&peer.endpoints);
+                if endpoints_only == *peer {
+                    deltas.push(NetmapDelta::EndpointUpdated {
+                        peer: id,
+                        signing_key: peer.public.signing_key_bytes(),
+                        endpoints: peer.endpoints.clone(),
+                    });
+                } else {
+                    deltas.push(NetmapDelta::PeerUpserted(peer.clone()));
+                }
+            }
+            None => deltas.push(NetmapDelta::PeerUpserted(peer.clone())),
+        }
+    }
+    for (id, old) in known {
+        if !seen.contains(id) {
+            deltas.push(NetmapDelta::PeerRemoved {
+                peer: *id,
+                signing_key: old.public.signing_key_bytes(),
+            });
+        }
+    }
+    deltas
 }
 
 /// Internal `*.omega` `MagicDNS` resolver, modeled after Tailscale's `net/dns`.
@@ -660,6 +731,10 @@ pub struct Coordinator {
     relays: Vec<RelayNode>,
     /// QuickSupport ID registry: which enrolled node currently owns each number.
     quicksupport_ids: HashMap<QuickSupportId, DeviceId>,
+    /// Loaded `HuJSON` policy; `None` keeps the Phase 2 behavior (every peer of
+    /// the tenant is visible, no session grants).
+    policy: Option<PolicyV2>,
+    audit_log: Option<Arc<AuditLog>>,
 }
 
 /// Random draws attempted before giving up on assigning a QuickSupport ID.
@@ -683,7 +758,97 @@ impl Coordinator {
             ticket_issuer: TicketIssuer::new(relay_ticket_secret),
             relays: Vec::new(),
             quicksupport_ids: HashMap::new(),
+            policy: None,
+            audit_log: None,
         }
+    }
+
+    /// Installs (or, with `None`, removes) the tenant policy and immediately
+    /// reconciles every connected node's netmap against it: peers that became
+    /// unreachable are removed, new or changed grants are pushed as upserts.
+    /// Returns the number of deltas sent.
+    pub fn set_policy(&mut self, policy: Option<PolicyV2>) -> usize {
+        self.policy = policy;
+        self.flush_netmap()
+    }
+
+    /// The policy in force, if any.
+    #[must_use]
+    pub const fn policy(&self) -> Option<&PolicyV2> {
+        self.policy.as_ref()
+    }
+
+    /// Routes audit events to `log` (JSON Lines).
+    pub fn set_audit_log(&mut self, log: Arc<AuditLog>) {
+        self.audit_log = Some(log);
+    }
+
+    /// Appends `event` to the audit log, if one is configured. A write failure is
+    /// logged and never fails the operation being audited.
+    pub fn audit(&self, event: &AuditEvent) {
+        if let Some(log) = &self.audit_log
+            && let Err(error) = log.append(event)
+        {
+            warn!(path = log.path(), %error, "audit event not written");
+        }
+    }
+
+    /// Builds a coordinator audit event.
+    #[must_use]
+    pub fn audit_event(kind: AuditKind, outcome: AuditOutcome) -> AuditEvent {
+        AuditEvent::new(AuditComponent::Coordinator, kind, outcome)
+    }
+
+    /// The peers `node_id` must know right now: the nodes of its tenant, filtered
+    /// by the policy when one is loaded, each carrying the [`SessionDecision`] for
+    /// a session *from that peer to `node_id`*. `None` if `node_id` is not enrolled.
+    ///
+    /// A policy evaluation error (an undefined group in a hand-built policy) fails
+    /// closed for that pair: the peer is hidden and the error logged.
+    #[must_use]
+    pub fn visible_peers(&self, node_id: DeviceId) -> Option<Vec<NodeRecord>> {
+        let recipient = self.nodes.get(&node_id)?;
+        let tenant_nodes: Vec<&NodeRecord> = self
+            .nodes
+            .values()
+            .filter(|r| r.tenant == recipient.tenant)
+            .collect();
+        let Some(policy) = &self.policy else {
+            return Some(
+                tenant_nodes
+                    .into_iter()
+                    .filter(|r| r.public.id() != node_id)
+                    .cloned()
+                    .collect(),
+            );
+        };
+        let policy_nodes: Vec<PolicyNode> = tenant_nodes.iter().map(|r| r.policy_node()).collect();
+        let me = recipient.policy_node();
+        let mut peers = Vec::new();
+        for (record, policy_node) in tenant_nodes.iter().zip(&policy_nodes) {
+            if record.public.id() == node_id {
+                continue;
+            }
+            let visible = policy
+                .peers_visible(&me, policy_node, &policy_nodes)
+                .unwrap_or_else(|error| {
+                    warn!(%error, peer = %record.fqdn, node = %recipient.fqdn, "policy evaluation failed; peer hidden");
+                    false
+                });
+            if !visible {
+                continue;
+            }
+            let decision = policy
+                .evaluate_session(policy_node, &me)
+                .unwrap_or_else(|error| {
+                    warn!(%error, peer = %record.fqdn, node = %recipient.fqdn, "session policy evaluation failed; session denied");
+                    SessionDecision::DENIED
+                });
+            let mut visible_record = (*record).clone();
+            visible_record.session = Some(decision);
+            peers.push(visible_record);
+        }
+        Some(peers)
     }
 
     /// Registers a relay node for which tickets are issued at enrollment.
@@ -712,6 +877,33 @@ impl Coordinator {
         tags: Vec<String>,
         expires_at_unix_secs: Option<u64>,
     ) -> Result<String, CoordinatorError> {
+        self.create_preauth_key_for_user(
+            tenant,
+            "",
+            reusable,
+            ephemeral,
+            tags,
+            expires_at_unix_secs,
+        )
+    }
+
+    /// Like [`Self::create_preauth_key`], additionally recording `user` as the
+    /// owner of every machine enrolled with the key, so `group:` and user
+    /// selectors of the policy match them (Headscale `PreAuthKey.User`). Untagged
+    /// machines of the same user form the `autogroup:self` set.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoordinatorError::InvalidAclTag`] if any tag does not start with `"tag:"`.
+    pub fn create_preauth_key_for_user(
+        &mut self,
+        tenant: &str,
+        user: &str,
+        reusable: bool,
+        ephemeral: bool,
+        tags: Vec<String>,
+        expires_at_unix_secs: Option<u64>,
+    ) -> Result<String, CoordinatorError> {
         validate_acl_tags(&tags)?;
 
         let mut prefix_bytes = [0u8; 8];
@@ -730,6 +922,7 @@ impl Coordinator {
             prefix: prefix.clone(),
             secret_hash,
             tenant: tenant.to_owned(),
+            user: user.to_owned(),
             reusable,
             ephemeral,
             used: false,
@@ -934,27 +1127,17 @@ impl Coordinator {
             .ok_or(CoordinatorError::InvalidPreAuthKey)?;
         key.used = true;
         let tenant = key.tenant.clone();
+        let user = key.user.clone();
         let tags = key.tags.clone();
         // A QuickSupport host exists only while its session runs: its ID must
         // expire with it, so the enrollment is ephemeral whatever the key says.
         let ephemeral = key.ephemeral || quicksupport.is_some();
 
-        // Re-enrollment with a new hostname must not leave the old name resolving,
-        // and moving to another tenant must remove the node from the old tenant's
-        // netmaps.
+        // Re-enrollment with a new hostname must not leave the old name resolving.
+        // Moving to another tenant, or changing owner or tags, is reflected in
+        // every other node's view by the reconciliation below.
         if let Some(previous) = self.nodes.get(&node_id) {
             self.dns.unregister(&previous.fqdn);
-            if previous.tenant != tenant {
-                let old_tenant = previous.tenant.clone();
-                let signing_key = previous.public.signing_key_bytes();
-                self.batcher.enqueue(
-                    &old_tenant,
-                    NetmapDelta::PeerRemoved {
-                        peer: node_id,
-                        signing_key,
-                    },
-                );
-            }
         }
         let generation = self.next_generation;
         self.next_generation += 1;
@@ -968,7 +1151,7 @@ impl Coordinator {
         let (sanitized_label, fqdn) = self.dns.register(node_id, hostname, ipv4, ipv6);
         let record = NodeRecord {
             public,
-            tenant: tenant.clone(),
+            tenant,
             hostname: sanitized_label,
             fqdn,
             ipv4,
@@ -977,27 +1160,21 @@ impl Coordinator {
             tags,
             ephemeral,
             quicksupport_id,
+            user,
+            session: None,
         };
-
-        let peers: Vec<NodeRecord> = self
-            .nodes
-            .values()
-            .filter(|r| r.public.id() != node_id && r.tenant == tenant)
-            .cloned()
-            .collect();
         self.nodes.insert(node_id, record.clone());
 
-        // Broadcast `PeerUpserted` to the tenant's connected peers before
-        // subscribing the newly enrolled node (which receives `FullSnapshot`).
-        self.batcher
-            .enqueue(&tenant, NetmapDelta::PeerUpserted(record.clone()));
-        self.batcher.flush();
+        // Push the newcomer to the peers that may see it before subscribing it
+        // (which receives `FullSnapshot`); a previous subscription of the same
+        // node is replaced, never reconciled.
+        self.batcher.unsubscribe(node_id);
+        self.flush_netmap();
 
-        let snapshot = NetmapDelta::FullSnapshot {
-            self_node: record.clone(),
-            peers: peers.clone(),
-        };
-        let netmap_rx = self.batcher.subscribe(node_id, &tenant, snapshot);
+        let peers = self.visible_peers(node_id).unwrap_or_default();
+        let netmap_rx = self
+            .batcher
+            .subscribe(node_id, record.clone(), peers.clone());
         let relays = self.issue_relay_grants(node_id, now_unix_secs)?;
 
         Ok(EnrollmentBundle {
@@ -1009,8 +1186,9 @@ impl Coordinator {
         })
     }
 
-    /// Updates the candidate UDP endpoints of `node_id` and queues a coalesced
-    /// [`NetmapDelta::EndpointUpdated`] delta for its tenant.
+    /// Updates the candidate UDP endpoints of `node_id`. The change reaches the
+    /// peers that see the node as a coalesced [`NetmapDelta::EndpointUpdated`] on
+    /// the next [`Self::flush_netmap`].
     ///
     /// # Errors
     ///
@@ -1024,17 +1202,7 @@ impl Coordinator {
             .nodes
             .get_mut(&node_id)
             .ok_or(CoordinatorError::UnknownNode(node_id))?;
-        node.endpoints.clone_from(&endpoints);
-        let tenant = node.tenant.clone();
-        let signing_key = node.public.signing_key_bytes();
-        self.batcher.enqueue(
-            &tenant,
-            NetmapDelta::EndpointUpdated {
-                peer: node_id,
-                signing_key,
-                endpoints,
-            },
-        );
+        node.endpoints = endpoints;
         Ok(())
     }
 
@@ -1058,20 +1226,20 @@ impl Coordinator {
             self.enrolled_with.remove(&node_id);
             self.release_quicksupport_id(node_id);
             self.dns.unregister(&removed.fqdn);
-            self.batcher.enqueue(
-                &removed.tenant,
-                NetmapDelta::PeerRemoved {
-                    peer: node_id,
-                    signing_key: removed.public.signing_key_bytes(),
-                },
-            );
-            self.batcher.flush();
+            self.flush_netmap();
         }
     }
 
-    /// Flushes any pending netmap deltas to subscribed nodes.
+    /// Reconciles every connected node's netmap with the current nodes and
+    /// policy, pushing the resulting deltas. Returns the number of deltas sent.
     pub fn flush_netmap(&mut self) -> usize {
-        self.batcher.flush()
+        let desired: HashMap<DeviceId, Vec<NodeRecord>> = self
+            .nodes
+            .keys()
+            .filter_map(|id| Some((*id, self.visible_peers(*id)?)))
+            .collect();
+        self.batcher
+            .reconcile(|node_id| desired.get(&node_id).cloned())
     }
 
     /// Looks up an enrolled node.
@@ -1091,6 +1259,27 @@ impl Coordinator {
     pub fn node_count(&self) -> usize {
         self.nodes.len()
     }
+}
+
+/// Reads and parses the `HuJSON` policy file at `path` (`omegadesk-server --policy`).
+///
+/// # Errors
+///
+/// Returns the I/O error or the [`HuJsonError`] naming the offending field.
+pub fn load_policy_file(path: &Path) -> Result<PolicyV2, PolicyLoadError> {
+    let text = std::fs::read_to_string(path).map_err(PolicyLoadError::Io)?;
+    PolicyV2::parse_hujson(&text).map_err(PolicyLoadError::Policy)
+}
+
+/// Why a policy file could not be loaded.
+#[derive(Debug, thiserror::Error)]
+pub enum PolicyLoadError {
+    /// The file could not be read.
+    #[error("cannot read policy file: {0}")]
+    Io(#[from] std::io::Error),
+    /// The document is not a valid policy.
+    #[error(transparent)]
+    Policy(#[from] HuJsonError),
 }
 
 /// Named CIDR subnet carved out of the root `100.64.0.0/10` mesh space (`tonarino/innernet`
@@ -1384,6 +1573,173 @@ mod tests {
         // Deltas convert to the wire representation; snapshots do not.
         assert!(delta[0].to_proto().is_some());
         assert!(snapshot[0].to_proto().is_none());
+    }
+
+    /// Phase 5: with a policy loaded the netmap is filtered per node (Headscale
+    /// `BuildPeerMap`), every visible peer carries the session grant towards the
+    /// recipient, and a policy change pushes exactly the deltas that reconcile
+    /// each connected node's view.
+    #[test]
+    #[allow(clippy::too_many_lines, reason = "one scenario, step by step")]
+    fn policy_filters_the_netmap_per_node_and_pushes_deltas_on_reload() {
+        let mut coord = Coordinator::new([7u8; 32]);
+        let helpdesk_key = coord
+            .create_preauth_key_for_user(
+                "acme",
+                "alice@example.com",
+                true,
+                false,
+                vec!["tag:helpdesk".into()],
+                None,
+            )
+            .unwrap();
+        let server_key = coord
+            .create_preauth_key("acme", true, false, vec!["tag:servers".into()], None)
+            .unwrap();
+        let guest_key = coord
+            .create_preauth_key("acme", true, false, vec!["tag:guest".into()], None)
+            .unwrap();
+        let helpdesk = DeviceIdentity::generate();
+        let server = DeviceIdentity::generate();
+        let guest = DeviceIdentity::generate();
+
+        // Without a policy the tenant is fully meshed (Phase 2 behavior).
+        let mut helpdesk_bundle = coord
+            .enroll_machine(&helpdesk_key, helpdesk.public(), "helpdesk", vec![], 1)
+            .unwrap();
+        let mut server_bundle = coord
+            .enroll_machine(&server_key, server.public(), "server", vec![], 2)
+            .unwrap();
+        let mut guest_bundle = coord
+            .enroll_machine(&guest_key, guest.public(), "guest", vec![], 3)
+            .unwrap();
+        assert_eq!(server_bundle.peers.len(), 1);
+        assert_eq!(guest_bundle.peers.len(), 2);
+        assert!(guest_bundle.peers.iter().all(|p| p.session.is_none()));
+        assert_eq!(server_bundle.node.user, "");
+        assert_eq!(helpdesk_bundle.node.user, "alice@example.com");
+        // Drain the snapshot and the two upserts helpdesk saw so far.
+        let _ = helpdesk_bundle.netmap_rx.try_recv().unwrap();
+        let _ = helpdesk_bundle.netmap_rx.try_recv().unwrap();
+        let _ = helpdesk_bundle.netmap_rx.try_recv().unwrap();
+        let _ = server_bundle.netmap_rx.try_recv().unwrap();
+        let _ = server_bundle.netmap_rx.try_recv().unwrap();
+        let _ = guest_bundle.netmap_rx.try_recv().unwrap();
+
+        // Load a policy: helpdesk may open recorded, MFA-gated sessions on servers;
+        // the guest is granted nothing.
+        let policy = PolicyV2::parse_hujson(
+            r#"{
+                "sessions": [
+                    { "action": "check", "src": ["tag:helpdesk"], "dst": ["tag:servers"],
+                      "record": true, "clipboard": { "paste": 0 }, "watermark": true }
+                ]
+            }"#,
+        )
+        .unwrap();
+        let sent = coord.set_policy(Some(policy));
+        assert!(sent > 0);
+
+        // helpdesk: the guest vanished, the server stayed but now carries a grant
+        // (a session *from the server to helpdesk* is denied).
+        let deltas = helpdesk_bundle.netmap_rx.try_recv().unwrap();
+        assert_eq!(deltas.len(), 2, "{deltas:?}");
+        assert!(
+            deltas
+                .iter()
+                .any(|d| matches!(d, NetmapDelta::PeerRemoved { peer, .. } if *peer == guest.id()))
+        );
+        let server_as_seen = deltas
+            .iter()
+            .find_map(|d| match d {
+                NetmapDelta::PeerUpserted(r) if r.public.id() == server.id() => Some(r),
+                NetmapDelta::FullSnapshot { .. }
+                | NetmapDelta::PeerUpserted(_)
+                | NetmapDelta::EndpointUpdated { .. }
+                | NetmapDelta::PeerRemoved { .. } => None,
+            })
+            .unwrap();
+        assert_eq!(
+            server_as_seen.session,
+            Some(SessionDecision::DENIED),
+            "a server may not open a session on the helpdesk machine"
+        );
+        assert!(helpdesk_bundle.netmap_rx.try_recv().is_err());
+
+        // server: the guest vanished, helpdesk carries the compiled grant.
+        let deltas = server_bundle.netmap_rx.try_recv().unwrap();
+        assert_eq!(deltas.len(), 2, "{deltas:?}");
+        let helpdesk_as_seen = deltas
+            .iter()
+            .find_map(|d| match d {
+                NetmapDelta::PeerUpserted(r) if r.public.id() == helpdesk.id() => Some(r),
+                NetmapDelta::FullSnapshot { .. }
+                | NetmapDelta::PeerUpserted(_)
+                | NetmapDelta::EndpointUpdated { .. }
+                | NetmapDelta::PeerRemoved { .. } => None,
+            })
+            .unwrap();
+        let grant = helpdesk_as_seen.session.clone().unwrap();
+        assert!(grant.allowed && grant.require_mfa && grant.record && grant.watermark);
+        assert_eq!(grant.max_clipboard_paste_bytes, Some(0));
+        assert_eq!(grant.max_clipboard_copy_bytes, None);
+        // The wire form carries the grant too.
+        let proto = helpdesk_as_seen.to_proto();
+        assert!(proto.session.as_ref().unwrap().require_mfa);
+        assert_eq!(proto.user, "alice@example.com");
+        assert_eq!(NodeRecord::from_proto(&proto).unwrap(), *helpdesk_as_seen);
+
+        // guest: both peers removed.
+        let deltas = guest_bundle.netmap_rx.try_recv().unwrap();
+        assert_eq!(deltas.len(), 2);
+        assert!(
+            deltas
+                .iter()
+                .all(|d| matches!(d, NetmapDelta::PeerRemoved { .. }))
+        );
+        assert_eq!(coord.visible_peers(guest.id()).unwrap(), vec![]);
+
+        // A newcomer enrolls into the filtered world: its snapshot is filtered and
+        // only the nodes that may see it are told.
+        let viewer_key = coord
+            .create_preauth_key("acme", true, false, vec!["tag:helpdesk".into()], None)
+            .unwrap();
+        let viewer = DeviceIdentity::generate();
+        let viewer_bundle = coord
+            .enroll_machine(&viewer_key, viewer.public(), "viewer", vec![], 4)
+            .unwrap();
+        assert_eq!(viewer_bundle.peers.len(), 1);
+        assert_eq!(viewer_bundle.peers[0].public.id(), server.id());
+        assert!(guest_bundle.netmap_rx.try_recv().is_err());
+        assert!(helpdesk_bundle.netmap_rx.try_recv().is_err());
+        let deltas = server_bundle.netmap_rx.try_recv().unwrap();
+        assert!(matches!(&deltas[0], NetmapDelta::PeerUpserted(r) if r.public.id() == viewer.id()));
+
+        // Endpoint changes of a visible peer still travel as the light delta, and
+        // those of a hidden peer travel nowhere.
+        coord
+            .update_endpoints(viewer.id(), vec!["203.0.113.9:7070".parse().unwrap()])
+            .unwrap();
+        coord
+            .update_endpoints(guest.id(), vec!["203.0.113.8:7070".parse().unwrap()])
+            .unwrap();
+        coord.flush_netmap();
+        let deltas = server_bundle.netmap_rx.try_recv().unwrap();
+        assert_eq!(deltas.len(), 1);
+        assert!(
+            matches!(&deltas[0], NetmapDelta::EndpointUpdated { peer, .. } if *peer == viewer.id())
+        );
+        assert!(helpdesk_bundle.netmap_rx.try_recv().is_err());
+
+        // Removing the policy restores the full mesh.
+        coord.set_policy(None);
+        let deltas = guest_bundle.netmap_rx.try_recv().unwrap();
+        assert_eq!(deltas.len(), 3);
+        assert!(
+            deltas
+                .iter()
+                .all(|d| matches!(d, NetmapDelta::PeerUpserted(r) if r.session.is_none()))
+        );
     }
 
     #[test]

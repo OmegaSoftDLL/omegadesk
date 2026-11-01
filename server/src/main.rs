@@ -2,17 +2,21 @@
 
 use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result};
 use clap::Parser;
 use omegadesk_control::ControlConfig;
 use omegadesk_identity::{DeviceIdentity, FileStore, KeyStore, default_store};
 use omegadesk_magicsock::{Node, NodeConfig};
-use omegadesk_server::{Coordinator, RelayNode, control_server, web_server, web_session};
+use omegadesk_policy::{AuditKind, AuditOutcome};
+use omegadesk_server::{
+    AuditLog, Coordinator, RelayNode, control_server, load_policy_file, web_server, web_session,
+};
 use tokio::net::TcpListener;
-use tracing::info;
+use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Parser)]
@@ -45,6 +49,22 @@ struct Args {
     /// operating system credential store (account `server`).
     #[arg(long, env = "OMEGADESK_SERVER_KEY_FILE")]
     key_file: Option<PathBuf>,
+
+    /// Owner recorded for machines enrolled with the bootstrap key (a user
+    /// selector in the policy, e.g. `alice@example.com`). Empty: tagged machines.
+    #[arg(long, env = "OMEGADESK_BOOTSTRAP_USER", default_value = "")]
+    bootstrap_user: String,
+
+    /// `HuJSON` `policy/v2` file (Headscale/Tailscale format plus the OmegaDesk
+    /// `sessions` block). Each node then receives only the peers it may reach,
+    /// with its session grants; the file is re-read when it changes on disk.
+    /// Without it every node of a tenant sees every other node.
+    #[arg(long, env = "OMEGADESK_POLICY")]
+    policy: Option<PathBuf>,
+
+    /// Append security audit events (enrollments, policy reloads) as JSON Lines.
+    #[arg(long, env = "OMEGADESK_AUDIT_LOG")]
+    audit_log: Option<PathBuf>,
 
     /// Generate a bootstrap pre-auth key, print the server public key, verify
     /// the configuration, and exit immediately.
@@ -193,6 +213,57 @@ async fn start_web_gateway(
     ))
 }
 
+/// How often the policy file's modification time is checked.
+const POLICY_POLL_INTERVAL: Duration = Duration::from_secs(2);
+
+fn policy_mtime(path: &Path) -> Option<SystemTime> {
+    std::fs::metadata(path).and_then(|m| m.modified()).ok()
+}
+
+/// Re-reads the policy whenever the file changes (modification time or size); a
+/// document that fails to parse is reported and the previous policy stays in
+/// force, as Headscale keeps serving the last good policy on a reload error.
+async fn watch_policy(
+    path: PathBuf,
+    mut last_seen: Option<SystemTime>,
+    coordinator: Arc<Mutex<Coordinator>>,
+) {
+    loop {
+        tokio::time::sleep(POLICY_POLL_INTERVAL).await;
+        let current = policy_mtime(&path);
+        if current == last_seen {
+            continue;
+        }
+        last_seen = current;
+        let (event, outcome) = match load_policy_file(&path) {
+            Ok(policy) => {
+                let Ok(mut guard) = coordinator.lock() else {
+                    continue;
+                };
+                let deltas = guard.set_policy(Some(policy));
+                info!(path = %path.display(), deltas, "policy reloaded");
+                (
+                    Coordinator::audit_event(AuditKind::PolicyLoaded, AuditOutcome::Ok)
+                        .detail(format!("reloaded, {deltas} netmap deltas")),
+                    guard,
+                )
+            }
+            Err(error) => {
+                let Ok(guard) = coordinator.lock() else {
+                    continue;
+                };
+                warn!(path = %path.display(), %error, "policy reload rejected; previous policy kept");
+                (
+                    Coordinator::audit_event(AuditKind::PolicyRejected, AuditOutcome::Failed)
+                        .detail(error.to_string()),
+                    guard,
+                )
+            }
+        };
+        outcome.audit(&event.target(path.display().to_string()));
+    }
+}
+
 fn decode_hex_32(hex: &str) -> Option<[u8; 32]> {
     if hex.len() != 64 {
         return None;
@@ -260,8 +331,9 @@ async fn main() -> Result<()> {
         info!(address = %relay.address, "relay registered");
         coord.add_relay(relay);
     }
-    let bootstrap_key = coord.create_preauth_key(
+    let bootstrap_key = coord.create_preauth_key_for_user(
         &args.tenant,
+        &args.bootstrap_user,
         true,
         false,
         vec!["tag:default".to_owned()],
@@ -277,6 +349,31 @@ async fn main() -> Result<()> {
         vec!["tag:quicksupport".to_owned()],
         None,
     )?;
+    if let Some(path) = &args.audit_log {
+        let log = AuditLog::open(path)
+            .with_context(|| format!("failed to open audit log {}", path.display()))?;
+        info!(path = %path.display(), "audit log enabled");
+        coord.set_audit_log(Arc::new(log));
+    }
+    let policy_mtime = if let Some(path) = &args.policy {
+        let policy = load_policy_file(path)
+            .with_context(|| format!("failed to load policy {}", path.display()))?;
+        info!(
+            path = %path.display(),
+            acls = policy.acls.len(),
+            sessions = policy.sessions.len(),
+            "policy loaded; netmaps are filtered per node"
+        );
+        coord.set_policy(Some(policy));
+        coord.audit(
+            &Coordinator::audit_event(AuditKind::PolicyLoaded, AuditOutcome::Ok)
+                .target(path.display().to_string())
+                .detail("loaded at startup"),
+        );
+        policy_mtime(path)
+    } else {
+        None
+    };
 
     info!(
         id = %server_identity.id(),
@@ -291,6 +388,9 @@ async fn main() -> Result<()> {
     }
 
     let coordinator = Arc::new(Mutex::new(coord));
+    if let Some(path) = args.policy.clone() {
+        tokio::spawn(watch_policy(path, policy_mtime, Arc::clone(&coordinator)));
+    }
     let listener = TcpListener::bind(args.listen).await?;
     info!(listen = %args.listen, "omegadesk-server listening for Noise IK connections");
     let control = tokio::spawn(control_server::serve(

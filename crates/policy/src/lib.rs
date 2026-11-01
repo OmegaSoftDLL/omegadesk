@@ -19,15 +19,19 @@
 use std::collections::{HashMap, HashSet};
 
 use omegadesk_identity::DeviceId;
-use omegadesk_quicksupport::{ConsentFlags, ConsentPolicy};
 use thiserror::Error;
 
+pub mod audit;
+pub mod consent;
 pub mod hujson;
 pub mod mfa;
 pub mod pam;
 pub mod posture;
 pub mod rmm_policy;
+pub mod sessions;
 
+pub use audit::{AuditComponent, AuditEvent, AuditKind, AuditLog, AuditOutcome, unix_millis};
+pub use consent::{ConsentFlags, ConsentPolicy, DEFAULT_CONSENT_TIMEOUT_SECS};
 pub use hujson::{
     AclRuleV2, CompiledFilterRule, FilterProto, HuJsonError, PolicyNode, PolicyV2, SshAclRule,
     SshAction, sanitize_hujson,
@@ -49,6 +53,10 @@ pub use rmm_policy::{
     AlertRecord, AlertSeverity, AlertState, AlertTemplate, CheckEvaluationOutcome, CheckEvaluator,
     CheckKind, EffectiveRmmPolicy, RmmCapabilityFlags, RmmCheck, RmmPolicyLayer, ScopedRmmRole,
     TemplateAction, resolve_effective_rmm_policy,
+};
+pub use sessions::{
+    SessionAction, SessionDecision, SessionPosture, SessionRule, os_family_name, parse_cidr,
+    parse_os_family, parse_os_version,
 };
 
 /// Policy and authorization errors.

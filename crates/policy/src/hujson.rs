@@ -13,11 +13,20 @@
 //! - `juanfont_headscale/hscontrol/policy/v2/compiled.go` (`buildUserNodeIndex`,
 //!   `compileAutogroupSelf`, `filterSourcesToSameUser`): per-node `autogroup:self` expansion
 //!   that intersects every resolved source address with the untagged devices of the target's owner.
+//! - `juanfont_headscale/hscontrol/policy/v2/types.go` (`Policy`, `ACL`, `SSH`, lines
+//!   1840–1970 and 2875–2885): the `HuJSON` field names (`groups`, `hosts`, `tagOwners`,
+//!   `acls[].action/proto/src/dst`, `ssh[].action/src/dst/users/checkPeriod`) that
+//!   [`PolicyV2::parse_hujson`] accepts, so a Tailscale or Headscale policy loads unchanged.
 
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 
+use serde_json::Value;
 use thiserror::Error;
+
+use crate::sessions::{
+    SessionAction, SessionPosture, SessionRule, parse_cidr, parse_os_family, parse_os_version,
+};
 
 /// Errors returned while sanitizing or compiling a `HuJSON` policy document.
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -36,6 +45,16 @@ pub enum HuJsonError {
         /// Tag name (`tag:...`).
         tag: String,
     },
+    /// The document is not valid JSON after `HuJSON` sanitizing.
+    #[error("policy is not valid HuJSON: {0}")]
+    Syntax(String),
+    /// A field has the wrong type or an unsupported value (`"action": "deny"`, a non-string
+    /// selector, an unknown top-level key, ...). The message names the field.
+    #[error("invalid policy field: {0}")]
+    InvalidField(String),
+    /// An IPv4 CIDR (`"networks"`) is malformed.
+    #[error("invalid IPv4 CIDR: {0}")]
+    InvalidCidr(String),
 }
 
 /// Strips `//` line comments, `/* ... */` block comments, and trailing commas before `]` or `}`
@@ -213,7 +232,7 @@ pub struct SshAclRule {
 }
 
 /// Declarative `policy/v2` structure ported from `Headscale/hscontrol/policy/v2/policy.go`.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PolicyV2 {
     /// Named user groups (`"group:devops" -> ["alice@example.com", "bob@example.com"]`).
     pub groups: HashMap<String, HashSet<String>>,
@@ -225,6 +244,8 @@ pub struct PolicyV2 {
     pub acls: Vec<AclRuleV2>,
     /// Ordered Mesh SSH authorization rules (`Tailscale` SSH).
     pub ssh: Vec<SshAclRule>,
+    /// Ordered remote-session rules (OmegaDesk `sessions` block, see [`crate::sessions`]).
+    pub sessions: Vec<SessionRule>,
 }
 
 impl PolicyV2 {
@@ -378,13 +399,26 @@ impl PolicyV2 {
             return Ok(false);
         }
 
+        self.pair_matches(&rule.sources, &rule.destinations, source_node, target_node)
+    }
+
+    /// Returns `true` if `destination` matches one of `destinations` and `source` one of
+    /// `sources`, with the per-destination `autogroup:self` same-owner restriction described
+    /// on [`Self::ssh_rule_matches`]. Shared by the SSH and the session rules.
+    pub(crate) fn pair_matches(
+        &self,
+        sources: &[String],
+        destinations: &[String],
+        source: &PolicyNode,
+        destination: &PolicyNode,
+    ) -> Result<bool, HuJsonError> {
         let mut dst_matches = false;
-        for dst_sel in &rule.destinations {
+        for dst_sel in destinations {
             let is_self = dst_sel == "autogroup:self";
-            if !self.node_matches_selector(target_node, dst_sel, is_self)? {
+            if !self.node_matches_selector(destination, dst_sel, is_self)? {
                 continue;
             }
-            if is_self && !is_same_owner_untagged_pair(source_node, target_node) {
+            if is_self && !is_same_owner_untagged_pair(source, destination) {
                 continue;
             }
             dst_matches = true;
@@ -394,8 +428,8 @@ impl PolicyV2 {
             return Ok(false);
         }
 
-        for src_sel in &rule.sources {
-            if self.node_matches_selector(source_node, src_sel, false)? {
+        for src_sel in sources {
+            if self.node_matches_selector(source, src_sel, false)? {
                 return Ok(true);
             }
         }
@@ -489,6 +523,425 @@ impl PolicyV2 {
         }
         Ok(ips)
     }
+}
+
+impl PolicyV2 {
+    /// Parses a `HuJSON` `policy/v2` document.
+    ///
+    /// Accepts the Headscale/Tailscale fields `groups`, `hosts`, `tagOwners`, `acls` and
+    /// `ssh` (`types.go` in `juanfont_headscale/hscontrol/policy/v2`) plus the OmegaDesk
+    /// `sessions` block. Unknown top-level keys are rejected so a typo (`"session"`) cannot
+    /// silently disable a block, and the Headscale features without an OmegaDesk
+    /// implementation (`grants`, `autoApprovers`, `nodeAttrs`, `tests`, `sshTests`) are
+    /// rejected explicitly rather than ignored.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HuJsonError::Syntax`] for malformed JSON and [`HuJsonError::InvalidField`]
+    /// (or a more specific variant) naming the offending field for schema violations,
+    /// including a `group:` reference that no `groups` entry defines.
+    pub fn parse_hujson(text: &str) -> Result<Self, HuJsonError> {
+        let clean = sanitize_hujson(text);
+        let root: Value =
+            serde_json::from_str(&clean).map_err(|e| HuJsonError::Syntax(e.to_string()))?;
+        let Value::Object(map) = root else {
+            return Err(HuJsonError::InvalidField(
+                "document must be a JSON object".to_owned(),
+            ));
+        };
+        let mut policy = Self::new();
+        for (key, value) in &map {
+            match key.as_str() {
+                "groups" => policy.groups = parse_string_sets(value, "groups", "group:")?,
+                "tagOwners" => policy.tag_owners = parse_string_sets(value, "tagOwners", "tag:")?,
+                "hosts" => policy.hosts = parse_hosts(value)?,
+                "acls" => policy.acls = parse_acls(value)?,
+                "ssh" => policy.ssh = parse_ssh_rules(value)?,
+                "sessions" => policy.sessions = parse_session_rules(value)?,
+                "grants"
+                | "autoApprovers"
+                | "nodeAttrs"
+                | "tests"
+                | "sshTests"
+                | "randomizeClientPort" => {
+                    return Err(HuJsonError::InvalidField(format!(
+                        "'{key}' is not supported by OmegaDesk"
+                    )));
+                }
+                other => {
+                    return Err(HuJsonError::InvalidField(format!(
+                        "unknown top-level key '{other}'"
+                    )));
+                }
+            }
+        }
+        policy.validate_references()?;
+        Ok(policy)
+    }
+
+    /// Fails on the first `group:` selector that `groups` does not define, in any rule, so a
+    /// policy is rejected at load time instead of at the first connection that hits the rule.
+    fn validate_references(&self) -> Result<(), HuJsonError> {
+        let check = |selector: &String| {
+            if selector.starts_with("group:") && !self.groups.contains_key(selector) {
+                return Err(HuJsonError::UndefinedGroup(selector.clone()));
+            }
+            Ok(())
+        };
+        for owners in self.tag_owners.values() {
+            owners.iter().try_for_each(check)?;
+        }
+        for rule in &self.acls {
+            rule.sources.iter().try_for_each(check)?;
+            for dst in &rule.destinations {
+                let (selector, _) = parse_destination_spec(dst)?;
+                check(&selector.to_owned())?;
+            }
+        }
+        for rule in &self.ssh {
+            rule.sources.iter().try_for_each(check)?;
+            rule.destinations.iter().try_for_each(check)?;
+        }
+        for rule in &self.sessions {
+            rule.sources.iter().try_for_each(check)?;
+            rule.destinations.iter().try_for_each(check)?;
+        }
+        Ok(())
+    }
+}
+
+fn field_error(field: &str, what: &str) -> HuJsonError {
+    HuJsonError::InvalidField(format!("{field}: {what}"))
+}
+
+fn string_list(value: &Value, field: &str) -> Result<Vec<String>, HuJsonError> {
+    let Value::Array(items) = value else {
+        return Err(field_error(field, "expected an array of strings"));
+    };
+    items
+        .iter()
+        .map(|item| {
+            item.as_str()
+                .filter(|s| !s.trim().is_empty())
+                .map(|s| s.trim().to_owned())
+                .ok_or_else(|| field_error(field, "expected a non-empty string"))
+        })
+        .collect()
+}
+
+fn required_list(
+    obj: &serde_json::Map<String, Value>,
+    key: &str,
+    field: &str,
+) -> Result<Vec<String>, HuJsonError> {
+    let name = format!("{field}.{key}");
+    let value = obj.get(key).ok_or_else(|| field_error(&name, "missing"))?;
+    let list = string_list(value, &name)?;
+    if list.is_empty() {
+        return Err(field_error(&name, "must not be empty"));
+    }
+    Ok(list)
+}
+
+fn parse_string_sets(
+    value: &Value,
+    field: &str,
+    key_prefix: &str,
+) -> Result<HashMap<String, HashSet<String>>, HuJsonError> {
+    let Value::Object(map) = value else {
+        return Err(field_error(field, "expected an object"));
+    };
+    let mut out = HashMap::new();
+    for (name, members) in map {
+        if !name.starts_with(key_prefix) {
+            return Err(field_error(
+                &format!("{field}.{name}"),
+                &format!("key must start with '{key_prefix}'"),
+            ));
+        }
+        let members = string_list(members, &format!("{field}.{name}"))?;
+        out.insert(name.clone(), members.into_iter().collect());
+    }
+    Ok(out)
+}
+
+fn parse_hosts(value: &Value) -> Result<HashMap<String, IpAddr>, HuJsonError> {
+    let Value::Object(map) = value else {
+        return Err(field_error("hosts", "expected an object"));
+    };
+    let mut out = HashMap::new();
+    for (name, addr) in map {
+        let field = format!("hosts.{name}");
+        let text = addr
+            .as_str()
+            .ok_or_else(|| field_error(&field, "expected an IP address string"))?;
+        // Headscale hosts are prefixes; a single-address prefix is accepted as the address.
+        let bare = text
+            .strip_suffix("/32")
+            .or_else(|| text.strip_suffix("/128"))
+            .unwrap_or(text);
+        let ip: IpAddr = bare.trim().parse().map_err(|_| {
+            field_error(&field, "expected an IP address (ranges are not supported)")
+        })?;
+        out.insert(name.clone(), ip);
+    }
+    Ok(out)
+}
+
+fn parse_proto(value: Option<&Value>, field: &str) -> Result<FilterProto, HuJsonError> {
+    let Some(value) = value else {
+        return Ok(FilterProto::Any);
+    };
+    let text = value
+        .as_str()
+        .ok_or_else(|| field_error(field, "expected a string"))?;
+    match text.trim().to_ascii_lowercase().as_str() {
+        "" | "*" => Ok(FilterProto::Any),
+        "tcp" | "6" => Ok(FilterProto::Tcp),
+        "udp" | "17" => Ok(FilterProto::Udp),
+        "icmp" | "1" | "ipv6-icmp" | "58" => Ok(FilterProto::Icmp),
+        other => Err(field_error(
+            field,
+            &format!("unsupported protocol '{other}'"),
+        )),
+    }
+}
+
+fn rule_objects<'a>(
+    value: &'a Value,
+    field: &str,
+) -> Result<Vec<&'a serde_json::Map<String, Value>>, HuJsonError> {
+    let Value::Array(items) = value else {
+        return Err(field_error(field, "expected an array of rules"));
+    };
+    items
+        .iter()
+        .enumerate()
+        .map(|(i, item)| {
+            item.as_object()
+                .ok_or_else(|| field_error(&format!("{field}[{i}]"), "expected an object"))
+        })
+        .collect()
+}
+
+fn reject_unknown_keys(
+    obj: &serde_json::Map<String, Value>,
+    allowed: &[&str],
+    field: &str,
+) -> Result<(), HuJsonError> {
+    for key in obj.keys() {
+        if !allowed.contains(&key.as_str()) {
+            return Err(field_error(field, &format!("unknown key '{key}'")));
+        }
+    }
+    Ok(())
+}
+
+fn parse_acls(value: &Value) -> Result<Vec<AclRuleV2>, HuJsonError> {
+    let mut out = Vec::new();
+    for (i, obj) in rule_objects(value, "acls")?.into_iter().enumerate() {
+        let field = format!("acls[{i}]");
+        reject_unknown_keys(obj, &["action", "proto", "src", "dst"], &field)?;
+        let action = obj.get("action").and_then(Value::as_str).unwrap_or("");
+        if action != "accept" {
+            return Err(field_error(&field, "action must be \"accept\""));
+        }
+        let destinations = required_list(obj, "dst", &field)?;
+        for dst in &destinations {
+            parse_destination_spec(dst)?;
+        }
+        out.push(AclRuleV2 {
+            sources: required_list(obj, "src", &field)?,
+            destinations,
+            proto: parse_proto(obj.get("proto"), &format!("{field}.proto"))?,
+        });
+    }
+    Ok(out)
+}
+
+/// Parses a Tailscale duration (`"12h"`, `"30m"`, `"90s"`, or a bare number of seconds).
+fn parse_check_period(value: Option<&Value>, field: &str) -> Result<u64, HuJsonError> {
+    const DEFAULT_SECS: u64 = 43_200;
+    let Some(value) = value else {
+        return Ok(DEFAULT_SECS);
+    };
+    if let Some(secs) = value.as_u64() {
+        return Ok(secs);
+    }
+    let text = value
+        .as_str()
+        .map(str::trim)
+        .ok_or_else(|| field_error(field, "expected a duration string"))?;
+    let (digits, unit) = text.split_at(
+        text.find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(text.len()),
+    );
+    let amount: u64 = digits
+        .parse()
+        .map_err(|_| field_error(field, "expected a duration like \"12h\""))?;
+    let multiplier = match unit {
+        "" | "s" => 1,
+        "m" => 60,
+        "h" => 3_600,
+        "d" => 86_400,
+        _ => return Err(field_error(field, "unit must be s, m, h or d")),
+    };
+    amount
+        .checked_mul(multiplier)
+        .filter(|secs| *secs > 0)
+        .ok_or_else(|| field_error(field, "duration out of range"))
+}
+
+fn parse_ssh_rules(value: &Value) -> Result<Vec<SshAclRule>, HuJsonError> {
+    let mut out = Vec::new();
+    for (i, obj) in rule_objects(value, "ssh")?.into_iter().enumerate() {
+        let field = format!("ssh[{i}]");
+        reject_unknown_keys(
+            obj,
+            &["action", "src", "dst", "users", "checkPeriod", "record"],
+            &field,
+        )?;
+        let action = match obj.get("action").and_then(Value::as_str) {
+            Some("accept") => SshAction::Accept,
+            Some("check") => SshAction::Check {
+                check_period_secs: parse_check_period(
+                    obj.get("checkPeriod"),
+                    &format!("{field}.checkPeriod"),
+                )?,
+            },
+            _ => {
+                return Err(field_error(
+                    &field,
+                    "action must be \"accept\" or \"check\"",
+                ));
+            }
+        };
+        out.push(SshAclRule {
+            action,
+            sources: required_list(obj, "src", &field)?,
+            destinations: required_list(obj, "dst", &field)?,
+            users: required_list(obj, "users", &field)?,
+            record_session: parse_bool(obj.get("record"), &format!("{field}.record"))?,
+        });
+    }
+    Ok(out)
+}
+
+fn parse_bool(value: Option<&Value>, field: &str) -> Result<bool, HuJsonError> {
+    value.map_or(Ok(false), |v| {
+        v.as_bool()
+            .ok_or_else(|| field_error(field, "expected true or false"))
+    })
+}
+
+fn parse_clipboard_limit(
+    obj: &serde_json::Map<String, Value>,
+    key: &str,
+    field: &str,
+) -> Result<Option<u64>, HuJsonError> {
+    obj.get(key)
+        .map(|v| {
+            v.as_u64()
+                .ok_or_else(|| field_error(&format!("{field}.{key}"), "expected a byte count"))
+        })
+        .transpose()
+}
+
+fn parse_posture(value: Option<&Value>, field: &str) -> Result<SessionPosture, HuJsonError> {
+    let Some(value) = value else {
+        return Ok(SessionPosture::default());
+    };
+    let obj = value
+        .as_object()
+        .ok_or_else(|| field_error(field, "expected an object"))?;
+    reject_unknown_keys(obj, &["minOs", "networks"], field)?;
+    let mut posture = SessionPosture::default();
+    if let Some(min_os) = obj.get("minOs") {
+        let map = min_os
+            .as_object()
+            .ok_or_else(|| field_error(&format!("{field}.minOs"), "expected an object"))?;
+        for (family, version) in map {
+            let name = format!("{field}.minOs.{family}");
+            let family = parse_os_family(family)
+                .ok_or_else(|| field_error(&name, "family must be windows, linux or macos"))?;
+            let min_version = version
+                .as_str()
+                .and_then(parse_os_version)
+                .ok_or_else(|| field_error(&name, "expected \"major.minor.patch\""))?;
+            posture.min_os.push(crate::posture::OsVersionRequirement {
+                family,
+                min_version,
+            });
+        }
+    }
+    if let Some(networks) = obj.get("networks") {
+        let list = string_list(networks, &format!("{field}.networks"))?;
+        if list.is_empty() {
+            return Err(field_error(
+                &format!("{field}.networks"),
+                "must not be empty (omit it to allow every network)",
+            ));
+        }
+        for cidr in &list {
+            posture.networks.push(parse_cidr(cidr)?);
+        }
+    }
+    Ok(posture)
+}
+
+fn parse_session_rules(value: &Value) -> Result<Vec<SessionRule>, HuJsonError> {
+    let mut out = Vec::new();
+    for (i, obj) in rule_objects(value, "sessions")?.into_iter().enumerate() {
+        let field = format!("sessions[{i}]");
+        reject_unknown_keys(
+            obj,
+            &[
+                "action",
+                "src",
+                "dst",
+                "record",
+                "clipboard",
+                "watermark",
+                "posture",
+            ],
+            &field,
+        )?;
+        let action = match obj.get("action").and_then(Value::as_str) {
+            Some("accept") => SessionAction::Accept,
+            Some("check") => SessionAction::Check,
+            _ => {
+                return Err(field_error(
+                    &field,
+                    "action must be \"accept\" or \"check\"",
+                ));
+            }
+        };
+        let (copy, paste) = match obj.get("clipboard") {
+            None => (None, None),
+            Some(clip) => {
+                let clip_field = format!("{field}.clipboard");
+                let clip_obj = clip
+                    .as_object()
+                    .ok_or_else(|| field_error(&clip_field, "expected an object"))?;
+                reject_unknown_keys(clip_obj, &["copy", "paste"], &clip_field)?;
+                (
+                    parse_clipboard_limit(clip_obj, "copy", &clip_field)?,
+                    parse_clipboard_limit(clip_obj, "paste", &clip_field)?,
+                )
+            }
+        };
+        out.push(SessionRule {
+            action,
+            sources: required_list(obj, "src", &field)?,
+            destinations: required_list(obj, "dst", &field)?,
+            record: parse_bool(obj.get("record"), &format!("{field}.record"))?,
+            max_clipboard_copy_bytes: copy,
+            max_clipboard_paste_bytes: paste,
+            watermark: parse_bool(obj.get("watermark"), &format!("{field}.watermark"))?,
+            posture: parse_posture(obj.get("posture"), &format!("{field}.posture"))?,
+        });
+    }
+    Ok(out)
 }
 
 /// Returns `true` if both nodes are untagged and owned by the same (non-empty) user, which is
@@ -775,5 +1228,116 @@ mod tests {
                 .unwrap(),
             Some((SshAction::Accept, false))
         );
+    }
+
+    /// A Headscale-style document plus the OmegaDesk `sessions` block loads with every field
+    /// mapped, and typos or unsupported blocks are rejected instead of ignored.
+    #[test]
+    fn parse_hujson_loads_headscale_fields_and_sessions_block() {
+        let doc = r#"{
+            // Operators and the machines they own.
+            "groups": { "group:ops": ["alice@example.com", "bob@example.com"], },
+            "tagOwners": { "tag:prod": ["group:ops"], "tag:helpdesk": ["alice@example.com"] },
+            "hosts": { "bastion": "100.64.0.10/32" },
+            "acls": [
+                { "action": "accept", "proto": "tcp", "src": ["group:ops"], "dst": ["tag:prod:22", "bastion:443"] },
+                { "action": "accept", "src": ["*"], "dst": ["autogroup:self:*"] },
+            ],
+            "ssh": [
+                { "action": "check", "checkPeriod": "12h", "src": ["group:ops"], "dst": ["tag:prod"], "users": ["root", "autogroup:nonroot"], "record": true },
+            ],
+            "sessions": [
+                {
+                    "action": "check",
+                    "src": ["tag:helpdesk"],
+                    "dst": ["tag:prod"],
+                    "record": true,
+                    "clipboard": { "copy": 65536, "paste": 0 },
+                    "watermark": true,
+                    "posture": { "minOs": { "windows": "10.0.19045", "linux": "6.1" }, "networks": ["100.64.0.0/10"] },
+                },
+                { "action": "accept", "src": ["group:ops"], "dst": ["autogroup:self"] },
+            ],
+        }"#;
+        let policy = PolicyV2::parse_hujson(doc).unwrap();
+        assert_eq!(policy.groups["group:ops"].len(), 2);
+        assert_eq!(
+            policy.hosts["bastion"],
+            IpAddr::V4(Ipv4Addr::new(100, 64, 0, 10))
+        );
+        assert_eq!(policy.acls.len(), 2);
+        assert_eq!(policy.acls[0].proto, FilterProto::Tcp);
+        assert_eq!(policy.acls[1].proto, FilterProto::Any);
+        assert_eq!(
+            policy.ssh[0].action,
+            SshAction::Check {
+                check_period_secs: 43_200
+            }
+        );
+        assert!(policy.ssh[0].record_session);
+        assert_eq!(policy.sessions.len(), 2);
+        let check = &policy.sessions[0];
+        assert_eq!(check.action, SessionAction::Check);
+        assert!(check.record && check.watermark);
+        assert_eq!(check.max_clipboard_copy_bytes, Some(65_536));
+        assert_eq!(check.max_clipboard_paste_bytes, Some(0));
+        assert_eq!(check.posture.min_os.len(), 2);
+        assert_eq!(check.posture.networks.len(), 1);
+        assert_eq!(policy.sessions[1].action, SessionAction::Accept);
+        assert_eq!(policy.sessions[1].max_clipboard_copy_bytes, None);
+
+        // The compiled result agrees with the hand-built policies of the other tests.
+        let helpdesk = node(
+            "h",
+            "carol@example.com",
+            Ipv4Addr::new(100, 64, 0, 5),
+            &["tag:helpdesk"],
+        );
+        let prod = node("p", "", Ipv4Addr::new(100, 64, 0, 6), &["tag:prod"]);
+        let decision = policy.evaluate_session(&helpdesk, &prod).unwrap();
+        assert!(decision.allowed && decision.require_mfa && decision.record);
+        assert!(!policy.evaluate_session(&prod, &helpdesk).unwrap().allowed);
+
+        // Rejections name the field.
+        let typo = r#"{ "session": [] }"#;
+        assert_eq!(
+            PolicyV2::parse_hujson(typo),
+            Err(HuJsonError::InvalidField(
+                "unknown top-level key 'session'".to_owned()
+            ))
+        );
+        assert!(matches!(
+            PolicyV2::parse_hujson(r#"{ "grants": [] }"#),
+            Err(HuJsonError::InvalidField(msg)) if msg.contains("not supported")
+        ));
+        assert!(matches!(
+            PolicyV2::parse_hujson(
+                r#"{ "acls": [ { "action": "deny", "src": ["*"], "dst": ["*:*"] } ] }"#
+            ),
+            Err(HuJsonError::InvalidField(msg)) if msg.starts_with("acls[0]")
+        ));
+        assert!(matches!(
+            PolicyV2::parse_hujson(
+                r#"{ "sessions": [ { "action": "accept", "src": ["*"], "dst": ["*"], "posture": { "networks": ["10.0.0.0/40"] } } ] }"#
+            ),
+            Err(HuJsonError::InvalidCidr(_))
+        ));
+        assert!(matches!(
+            PolicyV2::parse_hujson(
+                r#"{ "sessions": [ { "action": "accept", "src": ["*"], "dst": ["*"], "clipboard": { "cut": 1 } } ] }"#
+            ),
+            Err(HuJsonError::InvalidField(msg)) if msg.contains("unknown key 'cut'")
+        ));
+        // An undefined group is caught at load time, in every block.
+        assert_eq!(
+            PolicyV2::parse_hujson(
+                r#"{ "sessions": [ { "action": "accept", "src": ["group:nobody"], "dst": ["*"] } ] }"#
+            ),
+            Err(HuJsonError::UndefinedGroup("group:nobody".to_owned()))
+        );
+        assert!(matches!(
+            PolicyV2::parse_hujson("{ not json"),
+            Err(HuJsonError::Syntax(_))
+        ));
     }
 }

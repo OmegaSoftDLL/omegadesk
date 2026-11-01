@@ -14,7 +14,8 @@ use omegadesk_identity::{DeviceIdentity, QuickSupportId};
 use omegadesk_magicsock::{Node, NodeConfig};
 use omegadesk_protocol::PROTOCOL_VERSION;
 use omegadesk_protocol::v1::{
-    Capabilities, Envelope, Hello, Ping, RequestKeyframe, VideoCodec, VideoFrame, envelope::Payload,
+    Capabilities, DevicePosture, Envelope, Hello, MfaResponse, Ping, RequestKeyframe, VideoCodec,
+    VideoFrame, envelope::Payload,
 };
 use omegadesk_session::clipboard_io::ClipboardWorker;
 use omegadesk_transport::{Connection, EnvelopeReader, SendStream, connect, send_envelope};
@@ -96,6 +97,67 @@ pub(crate) struct Target {
     pub(crate) receive_dir: PathBuf,
     /// Files sent to the agent right after the handshake.
     pub(crate) send_files: Vec<PathBuf>,
+    /// TOTP code to answer an `MfaRequired` challenge with (`--totp`); when absent the
+    /// code is read from the terminal.
+    pub(crate) totp: Option<String>,
+}
+
+/// Self-reported posture of this device for the agent's policy checks (Tailscale
+/// `Hostinfo` model): the OS family is the compile target, the version comes from `os_info`.
+fn device_posture() -> DevicePosture {
+    let info = os_info::get();
+    let (os_major, os_minor, os_patch) = match info.version() {
+        os_info::Version::Semantic(major, minor, patch) => (*major, *minor, *patch),
+        os_info::Version::Rolling(_) | os_info::Version::Unknown | os_info::Version::Custom(_) => {
+            parse_version(&info.version().to_string())
+        }
+    };
+    DevicePosture {
+        os_family: std::env::consts::OS.to_owned(),
+        os_major: clamp_u32(os_major),
+        os_minor: clamp_u32(os_minor),
+        os_patch: clamp_u32(os_patch),
+    }
+}
+
+fn clamp_u32(value: u64) -> u32 {
+    u32::try_from(value).unwrap_or(u32::MAX)
+}
+
+/// Parses the leading `major[.minor[.patch]]` of a version string; anything else is `0`.
+fn parse_version(text: &str) -> (u64, u64, u64) {
+    let mut parts = text
+        .split(|c: char| !c.is_ascii_digit())
+        .filter(|p| !p.is_empty())
+        .map(|p| p.parse::<u64>().unwrap_or(0));
+    (
+        parts.next().unwrap_or(0),
+        parts.next().unwrap_or(0),
+        parts.next().unwrap_or(0),
+    )
+}
+
+/// Reads the TOTP code: `--totp` if given, otherwise a prompt on the terminal (the agent
+/// allows two minutes). Runs on a blocking thread so the QUIC runtime keeps servicing pings.
+async fn obtain_totp_code(configured: Option<&str>, attempts_left: u32) -> anyhow::Result<String> {
+    if let Some(code) = configured {
+        return Ok(code.trim().to_owned());
+    }
+    tokio::task::spawn_blocking(move || {
+        use std::io::Write as _;
+        let mut stderr = std::io::stderr().lock();
+        stderr.write_all(
+            format!(
+                "the agent requires a one-time code ({attempts_left} attempts left). TOTP code: "
+            )
+            .as_bytes(),
+        )?;
+        stderr.flush()?;
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line)?;
+        Ok(line.trim().to_owned())
+    })
+    .await?
 }
 
 /// Channels the window uses to talk to the session task.
@@ -273,15 +335,12 @@ fn log_connection(connection: &Connection) {
     );
 }
 
-async fn session(
+async fn negotiate_session(
     connection: &Connection,
     target: &Target,
     shared: &Shared,
     proxy: &EventLoopProxy<UserEvent>,
-    control_rx: &mut mpsc::UnboundedReceiver<Envelope>,
-    requests: mpsc::UnboundedSender<Envelope>,
-    files_rx: mpsc::UnboundedReceiver<PathBuf>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<(SendStream, EnvelopeReader)> {
     let (mut control_send, control_recv) = connection.open_bi().await?;
     let mut control = EnvelopeReader::new(control_recv);
     send_envelope(
@@ -296,19 +355,42 @@ async fn session(
                     encoders: Vec::new(),
                 }),
                 access_password: target.password.clone(),
+                posture: Some(device_posture()),
             })),
         },
     )
     .await?;
 
-    let ack = match control.next().await? {
-        Some(Envelope {
-            payload: Some(Payload::HelloAck(ack)),
-        }) => ack,
-        Some(Envelope {
-            payload: Some(Payload::Error(error)),
-        }) => bail!("agent rejected session: {}", error.message),
-        _ => bail!("unexpected response from agent"),
+    // The agent may interpose a TOTP step-up (policy `"action": "check"`) before HelloAck;
+    // a `--totp` code is used once, after that the terminal is asked.
+    let mut configured_totp = target.totp.as_deref();
+    let ack = loop {
+        match control.next().await? {
+            Some(Envelope {
+                payload: Some(Payload::HelloAck(ack)),
+            }) => break ack,
+            Some(Envelope {
+                payload: Some(Payload::MfaRequired(required)),
+            }) => {
+                shared.set_status("one-time code required…".to_owned());
+                let _ = proxy.send_event(UserEvent::Status);
+                let code = obtain_totp_code(configured_totp.take(), required.attempts_left).await?;
+                send_envelope(
+                    &mut control_send,
+                    &Envelope {
+                        payload: Some(Payload::MfaResponse(MfaResponse {
+                            challenge_id: required.challenge_id,
+                            code,
+                        })),
+                    },
+                )
+                .await?;
+            }
+            Some(Envelope {
+                payload: Some(Payload::Error(error)),
+            }) => bail!("agent rejected session: {}", error.message),
+            _ => bail!("unexpected response from agent"),
+        }
     };
     let agent_id = <[u8; 32]>::try_from(ack.device_public_key.as_ref()).map_or_else(
         |_| "no identity".to_owned(),
@@ -317,6 +399,20 @@ async fn session(
     info!("connected to {:?} (ID {agent_id})", ack.device_name);
     shared.set_status(format!("connected to {}", ack.device_name));
     let _ = proxy.send_event(UserEvent::Status);
+    Ok((control_send, control))
+}
+
+async fn session(
+    connection: &Connection,
+    target: &Target,
+    shared: &Shared,
+    proxy: &EventLoopProxy<UserEvent>,
+    control_rx: &mut mpsc::UnboundedReceiver<Envelope>,
+    requests: mpsc::UnboundedSender<Envelope>,
+    files_rx: mpsc::UnboundedReceiver<PathBuf>,
+) -> anyhow::Result<()> {
+    let (mut control_send, mut control) =
+        negotiate_session(connection, target, shared, proxy).await?;
 
     // Session channels: clipboard worker (text), file transfers in both
     // directions on their own streams, and per-frame acks from the decoder.
