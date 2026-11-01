@@ -4,7 +4,10 @@
 //! does not require an external `protoc` installation.
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let protos = ["proto/omegadesk/v1/session.proto"];
+    let protos = [
+        "proto/omegadesk/v1/session.proto",
+        "proto/omegadesk/control/v1/control.proto",
+    ];
     for proto in protos {
         println!("cargo:rerun-if-changed={proto}");
     }

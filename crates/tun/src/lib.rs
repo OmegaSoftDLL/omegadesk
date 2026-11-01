@@ -43,6 +43,9 @@ const IPV6_HEADER_LEN: usize = 40;
 /// Errors returned when parsing or validating an [`IpPacket`].
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum TunError {
+    /// UDP payload does not fit the 16-bit IPv4 total length field.
+    #[error("UDP payload of {0} bytes exceeds the IPv4 maximum of 65507")]
+    PayloadTooLarge(usize),
     /// Packet is shorter than the minimum IPv4/IPv6 header.
     #[error("packet too short: {0} bytes")]
     PacketTooShort(usize),
@@ -123,20 +126,27 @@ impl IpPacket {
     }
 
     /// Builds a valid IPv4 UDP packet (useful for unit tests and internal DNS replies).
-    #[must_use]
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TunError::PayloadTooLarge`] if the UDP payload exceeds the
+    /// 65,507 bytes that fit an IPv4 total length (RFC 791 §3.1).
     pub fn ipv4_udp(
         src_ip: Ipv4Addr,
         dst_ip: Ipv4Addr,
         src_port: u16,
         dst_port: u16,
         payload: &[u8],
-    ) -> Self {
+    ) -> Result<Self, TunError> {
         let udp_len = 8 + payload.len();
         let total_len = IPV4_MIN_HEADER_LEN + udp_len;
+        let total_u16 =
+            u16::try_from(total_len).map_err(|_| TunError::PayloadTooLarge(payload.len()))?;
+        let udp_u16 =
+            u16::try_from(udp_len).map_err(|_| TunError::PayloadTooLarge(payload.len()))?;
         let mut buf = vec![0u8; total_len];
         buf[0] = 0x45; // IPv4, IHL = 5 (20 bytes)
         buf[1] = 0x00;
-        let total_u16 = u16::try_from(total_len).unwrap_or(u16::MAX);
         buf[2..4].copy_from_slice(&total_u16.to_be_bytes());
         buf[8] = 64; // TTL
         buf[9] = 17; // UDP
@@ -146,7 +156,6 @@ impl IpPacket {
         let csum = ipv4_checksum(&buf[..IPV4_MIN_HEADER_LEN]);
         buf[10..12].copy_from_slice(&csum.to_be_bytes());
 
-        let udp_u16 = u16::try_from(udp_len).unwrap_or(u16::MAX);
         buf[20..22].copy_from_slice(&src_port.to_be_bytes());
         buf[22..24].copy_from_slice(&dst_port.to_be_bytes());
         buf[24..26].copy_from_slice(&udp_u16.to_be_bytes());
@@ -154,9 +163,9 @@ impl IpPacket {
         buf[26..28].copy_from_slice(&0u16.to_be_bytes());
         buf[28..].copy_from_slice(payload);
 
-        Self {
+        Ok(Self {
             raw: Bytes::from(buf),
-        }
+        })
     }
 
     /// IP version (`4` or `6`).
@@ -376,7 +385,7 @@ mod tests {
     fn ipv4_udp_round_trip_and_checksum_validation() {
         let src = Ipv4Addr::new(100, 64, 0, 1);
         let dst = Ipv4Addr::new(100, 64, 0, 2);
-        let pkt = IpPacket::ipv4_udp(src, dst, 51820, 4433, b"hello-mesh");
+        let pkt = IpPacket::ipv4_udp(src, dst, 51820, 4433, b"hello-mesh").unwrap();
 
         let parsed = IpPacket::parse(pkt.as_bytes().to_vec()).unwrap();
         assert_eq!(parsed.version(), 4);
@@ -397,7 +406,8 @@ mod tests {
             1000,
             2000,
             b"x",
-        );
+        )
+        .unwrap();
         let mut batch = PacketBatch::new(sample.clone());
         for _ in 1..MAX_BATCH_SIZE {
             assert!(batch.try_push(sample.clone()).is_ok());
@@ -421,7 +431,8 @@ mod tests {
             1234,
             5678,
             b"ping",
-        );
+        )
+        .unwrap();
         left.sender()
             .send(PacketBatch::new(pkt.clone()))
             .await

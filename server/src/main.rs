@@ -1,17 +1,15 @@
 //! OmegaDesk mesh coordinator binary (`omegadesk-server`).
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use omegadesk_identity::DeviceIdentity;
-use omegadesk_noise::{HANDSHAKE_INIT_LEN, ResponderHandshake};
-use omegadesk_server::Coordinator;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
-use tracing::{info, warn};
+use omegadesk_identity::{DeviceIdentity, FileStore, KeyStore, default_store};
+use omegadesk_server::{Coordinator, RelayNode, control_server};
+use tokio::net::TcpListener;
+use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Parser)]
@@ -30,14 +28,23 @@ struct Args {
     tenant: String,
 
     /// Hex-encoded 32-byte shared HMAC secret used to issue relay tickets.
-    #[arg(
-        long,
-        env = "OMEGADESK_RELAY_TICKET_SECRET",
-        default_value = "4f6d6567614465736b52656c61795469636b6574536563726574563130303030"
-    )]
+    /// Required: there is no default, so tickets can never be forged with a
+    /// publicly known key.
+    #[arg(long, env = "OMEGADESK_RELAY_TICKET_SECRET")]
     ticket_secret_hex: String,
 
-    /// Generate a bootstrap pre-auth key, verify configuration, and exit immediately.
+    /// Relay node to issue tickets for, as `host:port=<relay public key hex>`
+    /// optionally followed by `;stun=host:port`. Repeatable.
+    #[arg(long = "relay", env = "OMEGADESK_RELAYS", value_delimiter = ' ')]
+    relays: Vec<String>,
+
+    /// File holding the coordinator's persistent identity. Defaults to the
+    /// operating system credential store (account `server`).
+    #[arg(long, env = "OMEGADESK_SERVER_KEY_FILE")]
+    key_file: Option<PathBuf>,
+
+    /// Generate a bootstrap pre-auth key, print the server public key, verify
+    /// the configuration, and exit immediately.
     #[arg(long)]
     check_only: bool,
 }
@@ -55,52 +62,40 @@ fn decode_hex_32(hex: &str) -> Option<[u8; 32]> {
     Some(out)
 }
 
-fn unix_now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs())
+/// Parses `host:port=<hex key>[;stun=host:port]`.
+fn parse_relay(spec: &str) -> Result<RelayNode> {
+    let (main, stun) = match spec.split_once(";stun=") {
+        Some((main, stun)) => (main, Some(stun.to_owned())),
+        None => (spec, None),
+    };
+    let (address, key_hex) = main
+        .split_once('=')
+        .context("relay must be host:port=<relay public key hex>")?;
+    let exchange_key =
+        decode_hex_32(key_hex.trim()).context("relay public key must be 64 hex characters")?;
+    Ok(RelayNode {
+        address: address.trim().to_owned(),
+        exchange_key,
+        stun_address: stun,
+    })
 }
 
-async fn handle_noise_connection(
-    mut stream: TcpStream,
-    server_id: Arc<DeviceIdentity>,
-    coordinator: Arc<Mutex<Coordinator>>,
-) -> Result<()> {
-    let mut init_msg = vec![0u8; HANDSHAKE_INIT_LEN];
-    stream.read_exact(&mut init_msg).await?;
-
-    let (mut session, reply) =
-        ResponderHandshake::accept(&server_id, b"omegadesk-control-v1", &init_msg)?;
-    stream.write_all(&reply).await?;
-
-    let mut len_buf = [0u8; 4];
-    stream.read_exact(&mut len_buf).await?;
-    let body_len = usize::try_from(u32::from_be_bytes(len_buf))?;
-    let mut frame = vec![0u8; 4 + body_len];
-    frame[..4].copy_from_slice(&len_buf);
-    stream.read_exact(&mut frame[4..]).await?;
-
-    let plain = session.read_frame(&frame)?;
-    let req_str = String::from_utf8(plain)?;
-    let mut parts = req_str.splitn(2, '\n');
-    let token = parts.next().unwrap_or("");
-    let hostname = parts.next().unwrap_or("node");
-
-    let peer_pub = *session.peer_public();
-    let response_text = {
-        let mut guard = coordinator
-            .lock()
-            .map_err(|_| anyhow::anyhow!("coordinator mutex poisoned"))?;
-        let bundle = guard.enroll_machine(token, peer_pub, hostname, Vec::new(), unix_now())?;
-        format!(
-            "fqdn={}\nipv4={}\nipv6={}",
-            bundle.node.fqdn, bundle.node.ipv4, bundle.node.ipv6
-        )
+fn load_identity(key_file: Option<&PathBuf>) -> Result<DeviceIdentity> {
+    let store: Box<dyn KeyStore> = match key_file {
+        Some(path) => Box::new(FileStore::new(path.clone())),
+        None => default_store("server").context("failed to open the server key store")?,
     };
+    DeviceIdentity::load_or_create(store.as_ref()).context("failed to load the server identity")
+}
 
-    let resp_frame = session.write_frame(response_text.as_bytes())?;
-    stream.write_all(&resp_frame).await?;
-    Ok(())
+/// Formats the coordinator public identity as `<signing hex><exchange hex>`
+/// (128 hex characters), the value nodes pass as `--server-key`.
+fn public_key_hex(identity: &DeviceIdentity) -> String {
+    let public = identity.public();
+    let mut bytes = Vec::with_capacity(64);
+    bytes.extend_from_slice(&public.signing_key_bytes());
+    bytes.extend_from_slice(&public.exchange_key_bytes());
+    data_encoding::HEXLOWER.encode(&bytes)
 }
 
 #[tokio::main]
@@ -114,9 +109,13 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     let secret = decode_hex_32(&args.ticket_secret_hex)
         .context("ticket_secret_hex must be exactly 64 hex characters (32 bytes)")?;
-
-    let server_identity = Arc::new(DeviceIdentity::generate());
+    let server_identity = Arc::new(load_identity(args.key_file.as_ref())?);
     let mut coord = Coordinator::new(secret);
+    for spec in &args.relays {
+        let relay = parse_relay(spec)?;
+        info!(address = %relay.address, "relay registered");
+        coord.add_relay(relay);
+    }
     let bootstrap_key = coord.create_preauth_key(
         &args.tenant,
         true,
@@ -128,10 +127,10 @@ async fn main() -> Result<()> {
     info!(
         id = %server_identity.id(),
         tenant = %args.tenant,
+        server_key = %public_key_hex(&server_identity),
         bootstrap_preauth_key = %bootstrap_key,
-        "omegadesk-server initialized"
+        "omegadesk-server initialized; nodes need --server-key and --preauth-key"
     );
-
     if args.check_only {
         return Ok(());
     }
@@ -139,15 +138,34 @@ async fn main() -> Result<()> {
     let coordinator = Arc::new(Mutex::new(coord));
     let listener = TcpListener::bind(args.listen).await?;
     info!(listen = %args.listen, "omegadesk-server listening for Noise IK connections");
+    control_server::serve(listener, server_identity, coordinator).await
+}
 
-    loop {
-        let (stream, peer_addr) = listener.accept().await?;
-        let id_clone = Arc::clone(&server_identity);
-        let coord_clone = Arc::clone(&coordinator);
-        tokio::spawn(async move {
-            if let Err(err) = handle_noise_connection(stream, id_clone, coord_clone).await {
-                warn!(%peer_addr, error = %err, "control connection closed");
-            }
-        });
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_relay_specs() {
+        let key = "ab".repeat(32);
+        let relay =
+            parse_relay(&format!("relay.example:443={key};stun=relay.example:3478")).unwrap();
+        assert_eq!(relay.address, "relay.example:443");
+        assert_eq!(relay.exchange_key, [0xab; 32]);
+        assert_eq!(relay.stun_address.as_deref(), Some("relay.example:3478"));
+        let plain = parse_relay(&format!("10.0.0.1:8443={key}")).unwrap();
+        assert_eq!(plain.stun_address, None);
+        assert!(parse_relay("relay.example:443").is_err());
+        assert!(parse_relay("relay.example:443=zz").is_err());
+    }
+
+    #[test]
+    fn server_key_is_signing_then_exchange() {
+        let id = DeviceIdentity::generate();
+        let hex = public_key_hex(&id);
+        assert_eq!(hex.len(), 128);
+        let bytes = data_encoding::HEXLOWER.decode(hex.as_bytes()).unwrap();
+        assert_eq!(&bytes[..32], &id.public().signing_key_bytes());
+        assert_eq!(&bytes[32..], &id.public().exchange_key_bytes());
     }
 }

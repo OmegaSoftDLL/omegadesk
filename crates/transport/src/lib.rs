@@ -23,6 +23,7 @@ use sha2::{Digest, Sha256};
 
 pub use quinn::{Connection, Endpoint, RecvStream, SendStream};
 pub use uro::is_broken as is_uro_disabled;
+pub use uro::wrap_udp_socket;
 
 /// Application-Layer Protocol Negotiation identifier.
 pub const ALPN: &[u8] = b"omegadesk/1";

@@ -358,40 +358,6 @@ impl InitiatorHandshake {
         ))
     }
 
-    /// Processes the responder's 176-byte handshake reply (`<- e, ee, se`) and
-    /// transitions into an authenticated [`NoiseSession`].
-    ///
-    /// # Errors
-    ///
-    /// Returns [`NoiseError`] if decryption or identity verification fails.
-    pub fn finalize(mut self, response: &[u8]) -> Result<NoiseSession, NoiseError> {
-        if response.len() != HANDSHAKE_RESPONSE_LEN {
-            return Err(NoiseError::InvalidHandshakeLength {
-                expected: HANDSHAKE_RESPONSE_LEN,
-                actual: response.len(),
-            });
-        }
-
-        let mut re_bytes = [0u8; 32];
-        re_bytes.copy_from_slice(&response[..32]);
-        let enc_payload = &response[32..];
-
-        // `<- e`
-        self.symmetric.mix_hash(&re_bytes);
-
-        // `ee`
-        let mut ee = x25519_dh(&self.local_ephemeral, &re_bytes)?;
-        self.symmetric.mix_key(&ee);
-        ee.zeroize();
-
-        // `se` (initiator static with responder ephemeral)
-        // Wait: in Noise IK (`<- e, ee, se`), `se` is DH(initiator_static, responder_ephemeral).
-        // Because we don't store `DeviceIdentity` inside `InitiatorHandshake`, we take `initiator`
-        // or derive `se` in `finalize_with_identity`.
-        let _ = enc_payload;
-        Err(NoiseError::IdentityMismatch)
-    }
-
     /// Completes the handshake using the initiator's [`DeviceIdentity`] to compute `se`
     /// and verify the responder's signed transcript proof.
     ///
@@ -550,7 +516,112 @@ pub struct NoiseSession {
     recv: CipherState,
 }
 
+/// Send half of a [`NoiseSession`] (see [`NoiseSession::split`]).
+pub struct NoiseSender {
+    peer: DevicePublic,
+    send: CipherState,
+}
+
+/// Receive half of a [`NoiseSession`] (see [`NoiseSession::split`]).
+pub struct NoiseReceiver {
+    peer: DevicePublic,
+    recv: CipherState,
+}
+
+impl NoiseSender {
+    /// Authenticated public identity of the remote peer.
+    #[must_use]
+    pub const fn peer_public(&self) -> &DevicePublic {
+        &self.peer
+    }
+
+    /// Encrypts a control-plane message into a length-prefixed frame; see
+    /// [`NoiseSession::write_frame`].
+    ///
+    /// # Errors
+    ///
+    /// Same as [`NoiseSession::write_frame`].
+    pub fn write_frame(&mut self, plaintext: &[u8]) -> Result<Vec<u8>, NoiseError> {
+        write_frame(&mut self.send, plaintext)
+    }
+}
+
+impl NoiseReceiver {
+    /// Authenticated public identity of the remote peer.
+    #[must_use]
+    pub const fn peer_public(&self) -> &DevicePublic {
+        &self.peer
+    }
+
+    /// Decrypts a length-prefixed frame; see [`NoiseSession::read_frame`].
+    ///
+    /// # Errors
+    ///
+    /// Same as [`NoiseSession::read_frame`].
+    pub fn read_frame(&mut self, frame: &[u8]) -> Result<Vec<u8>, NoiseError> {
+        read_frame(&mut self.recv, frame)
+    }
+
+    /// Decrypts a frame body whose 4-byte length prefix was already consumed
+    /// (for streaming readers that validate the length before allocating).
+    ///
+    /// # Errors
+    ///
+    /// Same as [`NoiseSession::read_frame`].
+    pub fn read_body(&mut self, body: &[u8]) -> Result<Vec<u8>, NoiseError> {
+        if body.len() > MAX_FRAME_BODY_LEN + TAG_LEN {
+            return Err(NoiseError::FrameTooLarge(body.len()));
+        }
+        self.recv.decrypt_with_ad(&[], body)
+    }
+}
+
+fn write_frame(send: &mut CipherState, plaintext: &[u8]) -> Result<Vec<u8>, NoiseError> {
+    if plaintext.len() > MAX_FRAME_BODY_LEN {
+        return Err(NoiseError::FrameTooLarge(plaintext.len()));
+    }
+    let ciphertext = send.encrypt_with_ad(&[], plaintext)?;
+    let len_u32 =
+        u32::try_from(ciphertext.len()).map_err(|_| NoiseError::FrameTooLarge(ciphertext.len()))?;
+    let mut frame = Vec::with_capacity(4 + ciphertext.len());
+    frame.extend_from_slice(&len_u32.to_be_bytes());
+    frame.extend_from_slice(&ciphertext);
+    Ok(frame)
+}
+
+fn read_frame(recv: &mut CipherState, frame: &[u8]) -> Result<Vec<u8>, NoiseError> {
+    if frame.len() < 4 {
+        return Err(NoiseError::AeadFailed);
+    }
+    let mut len_bytes = [0u8; 4];
+    len_bytes.copy_from_slice(&frame[..4]);
+    let declared_len =
+        usize::try_from(u32::from_be_bytes(len_bytes)).map_err(|_| NoiseError::AeadFailed)?;
+    if declared_len > MAX_FRAME_BODY_LEN + TAG_LEN {
+        return Err(NoiseError::FrameTooLarge(declared_len));
+    }
+    let body = &frame[4..];
+    if body.len() != declared_len {
+        return Err(NoiseError::AeadFailed);
+    }
+    recv.decrypt_with_ad(&[], body)
+}
+
+/// Maximum ciphertext length accepted for one control frame body
+/// (plaintext limit plus the AEAD tag).
+pub const MAX_FRAME_CIPHERTEXT_LEN: usize = MAX_FRAME_BODY_LEN + TAG_LEN;
+
 impl NoiseSession {
+    /// Splits the session into independent send and receive halves so one task
+    /// can write while another reads.
+    #[must_use]
+    pub fn split(self) -> (NoiseSender, NoiseReceiver) {
+        let Self {
+            peer, send, recv, ..
+        } = self;
+        (NoiseSender { peer, send }, NoiseReceiver { peer, recv })
+    }
+
     /// Authenticated public identity of the remote peer.
     #[must_use]
     pub const fn peer_public(&self) -> &DevicePublic {
@@ -578,16 +649,7 @@ impl NoiseSession {
     /// Returns [`NoiseError::FrameTooLarge`] if `plaintext` exceeds 1 MiB, or
     /// [`NoiseError::AeadFailed`] on encryption failure.
     pub fn write_frame(&mut self, plaintext: &[u8]) -> Result<Vec<u8>, NoiseError> {
-        if plaintext.len() > MAX_FRAME_BODY_LEN {
-            return Err(NoiseError::FrameTooLarge(plaintext.len()));
-        }
-        let ciphertext = self.send.encrypt_with_ad(&[], plaintext)?;
-        let len_u32 = u32::try_from(ciphertext.len())
-            .map_err(|_| NoiseError::FrameTooLarge(ciphertext.len()))?;
-        let mut frame = Vec::with_capacity(4 + ciphertext.len());
-        frame.extend_from_slice(&len_u32.to_be_bytes());
-        frame.extend_from_slice(&ciphertext);
-        Ok(frame)
+        write_frame(&mut self.send, plaintext)
     }
 
     /// Decrypts a length-prefixed control-plane frame produced by [`Self::write_frame`].
@@ -596,21 +658,7 @@ impl NoiseSession {
     ///
     /// Returns [`NoiseError`] if the frame is truncated, exceeds 1 MiB, or fails AEAD authentication.
     pub fn read_frame(&mut self, frame: &[u8]) -> Result<Vec<u8>, NoiseError> {
-        if frame.len() < 4 {
-            return Err(NoiseError::AeadFailed);
-        }
-        let mut len_bytes = [0u8; 4];
-        len_bytes.copy_from_slice(&frame[..4]);
-        let declared_len =
-            usize::try_from(u32::from_be_bytes(len_bytes)).map_err(|_| NoiseError::AeadFailed)?;
-        if declared_len > MAX_FRAME_BODY_LEN + TAG_LEN {
-            return Err(NoiseError::FrameTooLarge(declared_len));
-        }
-        let body = &frame[4..];
-        if body.len() != declared_len {
-            return Err(NoiseError::AeadFailed);
-        }
-        self.recv.decrypt_with_ad(&[], body)
+        read_frame(&mut self.recv, frame)
     }
 }
 
@@ -692,6 +740,27 @@ mod tests {
         let resp = server_session.write_frame(b"netmap-v1").unwrap();
         let resp_plain = client_session.read_frame(&resp).unwrap();
         assert_eq!(resp_plain, b"netmap-v1");
+    }
+
+    #[test]
+    fn split_halves_interoperate_with_whole_sessions() {
+        let client_id = DeviceIdentity::generate();
+        let server_id = DeviceIdentity::generate();
+        let (initiator, msg1) =
+            InitiatorHandshake::start(&client_id, server_id.public(), b"split").unwrap();
+        let (server_session, msg2) =
+            ResponderHandshake::accept(&server_id, b"split", &msg1).unwrap();
+        let mut client_session = initiator.complete(&client_id, &msg2).unwrap();
+        let (mut tx, mut rx) = server_session.split();
+        assert_eq!(tx.peer_public().id(), client_id.id());
+        assert_eq!(rx.peer_public().id(), client_id.id());
+
+        let frame = client_session.write_frame(b"to-server").unwrap();
+        assert_eq!(rx.read_frame(&frame).unwrap(), b"to-server");
+        let frame = client_session.write_frame(b"second").unwrap();
+        assert_eq!(rx.read_body(&frame[4..]).unwrap(), b"second");
+        let reply = tx.write_frame(b"to-client").unwrap();
+        assert_eq!(client_session.read_frame(&reply).unwrap(), b"to-client");
     }
 
     #[test]

@@ -1762,12 +1762,17 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "data-encoding",
  "omegadesk-identity",
+ "omegadesk-mesh",
+ "rand_core 0.6.4",
  "ring",
+ "sha2",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "x25519-dalek",
 ]
 
 [[package]]
@@ -1781,8 +1786,10 @@ dependencies = [
  "omegadesk-identity",
  "omegadesk-mesh",
  "omegadesk-noise",
+ "omegadesk-protocol",
  "omegadesk-relay",
  "omegadesk-tun",
+ "prost",
  "rand_core 0.6.4",
  "ring",
  "sha2",

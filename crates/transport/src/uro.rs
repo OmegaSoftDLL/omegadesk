@@ -127,7 +127,11 @@ pub(crate) fn detect_broken_coalescing<'a>(
 
 /// Wraps a `std::net::UdpSocket` into a Quinn [`AsyncUdpSocket`] guarded by the
 /// Windows URO kill switch.
-pub(crate) fn wrap_udp_socket(
+///
+/// # Errors
+///
+/// Returns an error if the runtime cannot register the socket.
+pub fn wrap_udp_socket(
     socket: std::net::UdpSocket,
     runtime: &Arc<dyn Runtime>,
 ) -> io::Result<Arc<dyn AsyncUdpSocket>> {

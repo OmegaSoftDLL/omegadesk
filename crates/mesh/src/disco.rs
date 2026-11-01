@@ -3,9 +3,15 @@
 //! Modeled after `tailscale/disco/disco.go` (BSD-3-Clause):
 //! - Every disco packet begins with the 6-byte magic header `b"TS\xf0\x9f\x92\xac"`
 //!   (`"TS💬"`), allowing a single UDP socket ("magicsock") to demultiplex
-//!   discovery frames from encrypted WireGuard/tunnel data packets.
+//!   discovery frames from encrypted tunnel/QUIC data packets.
 //! - Followed by the sender's 32-byte X25519 key, a 12-byte nonce, and the
 //!   ChaCha20-Poly1305 authenticated payload (`Ping`, `Pong`, or `CallMeMaybe`).
+//!
+//! OmegaDesk extension (protocol version `1`): every message carries the
+//! sender's 8-byte **tunnel epoch** for the receiving peer. Both peers learn
+//! each other's epoch through these authenticated messages, and the tunnel
+//! key is derived from both epochs, so a restart on either side yields a fresh
+//! key and old ciphertext can never be replayed into a new session.
 
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 
@@ -18,8 +24,8 @@ use x25519_dalek::{PublicKey as X25519Public, StaticSecret};
 /// matching `disco.Magic` in `tailscale/disco/disco.go`.
 pub const MAGIC: [u8; 6] = [0x54, 0x53, 0xf0, 0x9f, 0x92, 0xac];
 
-/// Current disco wire protocol version (`v0`, matching `tailscale/disco/disco.go`).
-pub const PROTOCOL_VERSION: u8 = 0;
+/// Current disco wire protocol version (`1`: messages carry the tunnel epoch).
+pub const PROTOCOL_VERSION: u8 = 1;
 
 const TYPE_PING: u8 = 0x01;
 const TYPE_PONG: u8 = 0x02;
@@ -27,6 +33,9 @@ const TYPE_CALL_ME_MAYBE: u8 = 0x03;
 
 /// Length of a random Ping/Pong transaction identifier (`[u8; 12]`).
 pub const TX_ID_LEN: usize = 12;
+
+/// Length of a tunnel epoch.
+pub const EPOCH_LEN: usize = 8;
 
 /// Encoded address length (`16B IPv6/IPv4-mapped + 2B little-endian port`),
 /// matching `endpointLen` in `tailscale/disco/disco.go`.
@@ -39,6 +48,9 @@ const TAG_LEN: usize = 16;
 /// with its [`DiscoMessage::Pong`].
 pub type TxId = [u8; TX_ID_LEN];
 
+/// Random 8-byte tunnel epoch chosen by a node for one peer.
+pub type Epoch = [u8; EPOCH_LEN];
+
 /// Generates a fresh random 12-byte [`TxId`].
 #[must_use]
 pub fn random_tx_id() -> TxId {
@@ -47,17 +59,27 @@ pub fn random_tx_id() -> TxId {
     id
 }
 
+/// Generates a fresh random [`Epoch`].
+#[must_use]
+pub fn random_epoch() -> Epoch {
+    let mut epoch = [0u8; EPOCH_LEN];
+    OsRng.fill_bytes(&mut epoch);
+    epoch
+}
+
 /// Discovery message payloads exchanged during NAT hole-punching and direct-path
 /// liveness probing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DiscoMessage {
     /// Direct or relayed probe carrying a 12-byte transaction ID, the sender's
-    /// 32-byte public key, and optional MTU padding bytes.
+    /// 32-byte public key, its tunnel epoch, and optional MTU padding bytes.
     Ping {
         /// Random 12-byte correlation ID echoed in [`DiscoMessage::Pong`].
         tx_id: TxId,
         /// Sender's 32-byte X25519 public key.
         node_key: [u8; 32],
+        /// Sender's tunnel epoch for the receiving peer.
+        epoch: Epoch,
         /// Number of zero padding bytes appended for path MTU probing.
         padding: u16,
     },
@@ -68,12 +90,16 @@ pub enum DiscoMessage {
         tx_id: TxId,
         /// Observed source address of the `Ping` packet.
         src: SocketAddr,
+        /// Sender's tunnel epoch for the receiving peer.
+        epoch: Epoch,
     },
     /// Sent over the relay to invite a peer to simultaneously hole-punch all of
     /// the sender's candidate endpoints.
     CallMeMaybe {
         /// Candidate local and STUN-reflexive endpoints of the sender.
         my_numbers: Vec<SocketAddr>,
+        /// Sender's tunnel epoch for the receiving peer.
+        epoch: Epoch,
     },
 }
 
@@ -100,6 +126,16 @@ pub enum DiscoError {
 }
 
 impl DiscoMessage {
+    /// The sender's tunnel epoch carried by any message.
+    #[must_use]
+    pub const fn epoch(&self) -> Epoch {
+        match self {
+            Self::Ping { epoch, .. }
+            | Self::Pong { epoch, .. }
+            | Self::CallMeMaybe { epoch, .. } => *epoch,
+        }
+    }
+
     /// Serializes this disco message into its cleartext wire representation
     /// (`1B type + 1B version + type-specific body`).
     #[must_use]
@@ -108,29 +144,33 @@ impl DiscoMessage {
             Self::Ping {
                 tx_id,
                 node_key,
+                epoch,
                 padding,
             } => {
                 let pad_len = usize::from(*padding);
-                let mut out = Vec::with_capacity(2 + TX_ID_LEN + 32 + pad_len);
+                let mut out = Vec::with_capacity(2 + TX_ID_LEN + 32 + EPOCH_LEN + pad_len);
                 out.push(TYPE_PING);
                 out.push(PROTOCOL_VERSION);
                 out.extend_from_slice(tx_id);
                 out.extend_from_slice(node_key);
+                out.extend_from_slice(epoch);
                 out.resize(out.len() + pad_len, 0);
                 out
             }
-            Self::Pong { tx_id, src } => {
-                let mut out = Vec::with_capacity(2 + TX_ID_LEN + ADDR_LEN);
+            Self::Pong { tx_id, src, epoch } => {
+                let mut out = Vec::with_capacity(2 + TX_ID_LEN + ADDR_LEN + EPOCH_LEN);
                 out.push(TYPE_PONG);
                 out.push(PROTOCOL_VERSION);
                 out.extend_from_slice(tx_id);
                 append_addr(&mut out, *src);
+                out.extend_from_slice(epoch);
                 out
             }
-            Self::CallMeMaybe { my_numbers } => {
-                let mut out = Vec::with_capacity(2 + my_numbers.len() * ADDR_LEN);
+            Self::CallMeMaybe { my_numbers, epoch } => {
+                let mut out = Vec::with_capacity(2 + EPOCH_LEN + my_numbers.len() * ADDR_LEN);
                 out.push(TYPE_CALL_ME_MAYBE);
                 out.push(PROTOCOL_VERSION);
+                out.extend_from_slice(epoch);
                 for addr in my_numbers {
                     append_addr(&mut out, *addr);
                 }
@@ -156,32 +196,43 @@ impl DiscoMessage {
         let body = &bytes[2..];
         match msg_type {
             TYPE_PING => {
-                if body.len() < TX_ID_LEN + 32 {
+                let fixed = TX_ID_LEN + 32 + EPOCH_LEN;
+                if body.len() < fixed {
                     return Err(DiscoError::MalformedPayload);
                 }
                 let mut tx_id = [0u8; TX_ID_LEN];
                 tx_id.copy_from_slice(&body[..TX_ID_LEN]);
                 let mut node_key = [0u8; 32];
                 node_key.copy_from_slice(&body[TX_ID_LEN..TX_ID_LEN + 32]);
-                let padding = u16::try_from(body.len() - (TX_ID_LEN + 32))
-                    .map_err(|_| DiscoError::MalformedPayload)?;
+                let mut epoch = [0u8; EPOCH_LEN];
+                epoch.copy_from_slice(&body[TX_ID_LEN + 32..fixed]);
+                let padding =
+                    u16::try_from(body.len() - fixed).map_err(|_| DiscoError::MalformedPayload)?;
                 Ok(Self::Ping {
                     tx_id,
                     node_key,
+                    epoch,
                     padding,
                 })
             }
             TYPE_PONG => {
-                if body.len() != TX_ID_LEN + ADDR_LEN {
+                if body.len() != TX_ID_LEN + ADDR_LEN + EPOCH_LEN {
                     return Err(DiscoError::MalformedPayload);
                 }
                 let mut tx_id = [0u8; TX_ID_LEN];
                 tx_id.copy_from_slice(&body[..TX_ID_LEN]);
-                let src = parse_addr(&body[TX_ID_LEN..])?;
-                Ok(Self::Pong { tx_id, src })
+                let src = parse_addr(&body[TX_ID_LEN..TX_ID_LEN + ADDR_LEN])?;
+                let mut epoch = [0u8; EPOCH_LEN];
+                epoch.copy_from_slice(&body[TX_ID_LEN + ADDR_LEN..]);
+                Ok(Self::Pong { tx_id, src, epoch })
             }
             TYPE_CALL_ME_MAYBE => {
-                let (addrs, rem) = body.as_chunks::<ADDR_LEN>();
+                if body.len() < EPOCH_LEN {
+                    return Err(DiscoError::MalformedPayload);
+                }
+                let mut epoch = [0u8; EPOCH_LEN];
+                epoch.copy_from_slice(&body[..EPOCH_LEN]);
+                let (addrs, rem) = body[EPOCH_LEN..].as_chunks::<ADDR_LEN>();
                 if !rem.is_empty() {
                     return Err(DiscoError::MalformedPayload);
                 }
@@ -189,7 +240,7 @@ impl DiscoMessage {
                 for chunk in addrs {
                     my_numbers.push(parse_addr(chunk)?);
                 }
-                Ok(Self::CallMeMaybe { my_numbers })
+                Ok(Self::CallMeMaybe { my_numbers, epoch })
             }
             other => Err(DiscoError::UnsupportedType {
                 msg_type: other,
@@ -335,6 +386,7 @@ mod tests {
         let ping = DiscoMessage::Ping {
             tx_id: [7u8; TX_ID_LEN],
             node_key: alice_pub,
+            epoch: [1u8; EPOCH_LEN],
             padding: 16,
         };
         let sealed = ping.seal(&alice, &bob_pub).unwrap();
@@ -342,10 +394,12 @@ mod tests {
         let (sender, opened) = DiscoMessage::open(&sealed, &bob).unwrap();
         assert_eq!(sender, alice_pub);
         assert_eq!(opened, ping);
+        assert_eq!(opened.epoch(), [1u8; EPOCH_LEN]);
 
         let pong = DiscoMessage::Pong {
             tx_id: [7u8; TX_ID_LEN],
             src: "203.0.113.42:51820".parse().unwrap(),
+            epoch: [2u8; EPOCH_LEN],
         };
         let sealed_pong = pong.seal(&bob, &alice_pub).unwrap();
         let (_, opened_pong) = DiscoMessage::open(&sealed_pong, &alice).unwrap();
@@ -356,9 +410,24 @@ mod tests {
                 "192.168.1.10:51820".parse().unwrap(),
                 "[2001:db8::1]:51820".parse().unwrap(),
             ],
+            epoch: [3u8; EPOCH_LEN],
         };
         let sealed_cmm = cmm.seal(&alice, &bob_pub).unwrap();
         let (_, opened_cmm) = DiscoMessage::open(&sealed_cmm, &bob).unwrap();
         assert_eq!(opened_cmm, cmm);
+
+        // Tampering and the wrong recipient key both fail authentication.
+        let mut tampered = sealed.clone();
+        let last = tampered.len() - 1;
+        tampered[last] ^= 1;
+        assert_eq!(
+            DiscoMessage::open(&tampered, &bob),
+            Err(DiscoError::CryptoFailed)
+        );
+        let eve = StaticSecret::random_from_rng(OsRng);
+        assert_eq!(
+            DiscoMessage::open(&sealed, &eve),
+            Err(DiscoError::CryptoFailed)
+        );
     }
 }
