@@ -97,6 +97,29 @@ cargo run --release -p omegadesk-server -- --listen 0.0.0.0:8080 --ticket-secret
 ```
 
 Open `http://localhost:18123`, type the agent name (`office-pc`) and its access password. The gateway joins the mesh as `web-gateway.omega`, sends the agent the same `Hello` the native client would, and streams H.264 to a `WebCodecs` decoder in the page; keyboard and mouse go back the same way. `WebCodecs` requires a secure context, so for anything other than `localhost` put the gateway behind a TLS-terminating reverse proxy (Caddy, nginx) and pass `--web-behind-tls --web-allowed-host desk.example`. The browser part is WebSocket-only for now.
+### Windows unattended access (service)
+
+On Windows the agent can install itself as a `LocalSystem` service so remote
+access keeps working at the login screen, across the UAC secure desktop, the
+lock screen and session switches, with no one logged in. From an **elevated**
+(Administrator) prompt:
+
+```powershell
+# Register the auto-start service (points at this executable).
+omegadesk-agent service install
+omegadesk-agent service start
+# ... later ...
+omegadesk-agent service stop
+omegadesk-agent service uninstall
+```
+
+The service (SYSTEM) launches a capture/input worker in the active console
+session using that session's `winlogon.exe` token, follows the input desktop so
+it can capture and inject on the secure desktop, and offers a privacy mode that
+blanks the local screen (a fullscreen `WDA_EXCLUDEFROMCAPTURE` overlay) while
+the remote operator keeps working. `service run` is the Service Control Manager
+entry point and is invoked by Windows, not manually. On Linux and macOS these
+subcommands report that the service is Windows-only.
 
 ## Architecture
 
@@ -114,7 +137,7 @@ Open `http://localhost:18123`, type the agent name (`office-pc`) and its access 
 |---|---|
 | [`omegadesk-protocol`](crates/protocol) | Session messages (protobuf), framing, codec negotiation |
 | [`omegadesk-identity`](crates/identity) | Device keys (ed25519/x25519), device ID, OS keychain storage |
-| [`omegadesk-capture`](crates/capture) | Screen capture (DXGI Desktop Duplication) |
+| [`omegadesk-capture`](crates/capture) | Screen capture (`DXGI -> WGC -> GDI` fallback chain) |
 | [`omegadesk-codec`](crates/codec) | H.264 encoders (Media Foundation, OpenH264) and decoder |
 | [`omegadesk-input`](crates/input) | Keyboard and mouse injection (USB HID → scancodes) |
 | [`omegadesk-transport`](crates/transport) | QUIC transport with certificate pinning or identity-bound TLS |
@@ -125,6 +148,7 @@ Open `http://localhost:18123`, type the agent name (`office-pc`) and its access 
 | [`omegadesk-relay`](relay) | DERP-style packet relay with single-use tickets and STUN |
 | [`omegadesk-server`](server) | Coordinator: keys, tenants, netmap stream, `*.omega` names |
 | [`omegadesk-agent`](agent) | The service that shares a machine |
+| [`omegadesk-service`](crates/service) | Windows `LocalSystem` service and per-session worker (unattended access across the login screen and UAC) |
 | [`omegadesk-client`](client) | The app you use to connect |
 
 The full design, from the WireGuard mesh to the web client, is in [docs/plan.md](docs/plan.md). [docs/language.md](docs/language.md) explains why we chose Rust.

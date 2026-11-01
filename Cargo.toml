@@ -27,6 +27,7 @@ omegadesk-magicsock = { path = "crates/magicsock" }
 omegadesk-policy = { path = "crates/policy" }
 omegadesk-rdp = { path = "crates/rdp" }
 omegadesk-recording = { path = "crates/recording" }
+omegadesk-service = { path = "crates/service" }
 omegadesk-session = { path = "crates/session" }
 omegadesk-quicksupport = { path = "quicksupport" }
 omegadesk-relay = { path = "relay" }

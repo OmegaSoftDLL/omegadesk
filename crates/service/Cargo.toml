@@ -1,0 +1,40 @@
+[package]
+name = "omegadesk-service"
+description = "Windows unattended-access service and per-session worker for OmegaDesk"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+bytes.workspace = true
+clap.workspace = true
+omegadesk-capture.workspace = true
+omegadesk-input.workspace = true
+omegadesk-protocol.workspace = true
+prost.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-service = "0.8"
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Environment",
+    "Win32_System_LibraryLoader",
+    "Win32_System_RemoteDesktop",
+    "Win32_System_Threading",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Graphics_Gdi",
+] }
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true

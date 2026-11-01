@@ -16,6 +16,10 @@ pub mod gdi;
 pub mod rotate;
 pub mod service_desktop;
 pub mod virtual_display;
+#[cfg(windows)]
+mod wgc;
+
+use service_desktop::CaptureBackendKind;
 
 /// Screen capture errors.
 #[derive(Debug, thiserror::Error)]
@@ -123,22 +127,57 @@ pub trait Capturer: Send {
 /// Returns an error if the monitor does not exist or if the operating system
 /// denies screen capture.
 pub fn open_display(index: u32) -> Result<Box<dyn Capturer>, CaptureError> {
+    open_display_tracked(index).map(|(capturer, _backend)| capturer)
+}
+
+/// Opens a capturer for monitor `index` and reports which backend of the
+/// `DXGI -> WGC -> GDI` fallback chain succeeded.
+///
+/// The chain matches `docs/plan.md` §2.3 and Sunshine `display_base.cpp`:
+/// DXGI Desktop Duplication is the zero-copy GPU path; Windows Graphics Capture
+/// (`wgc`) is the compositor fallback that still works where duplication
+/// refuses to start (some RDP sessions, mixed-GPU laptops); GDI `BitBlt` is the
+/// universal last resort. `DisplayNotFound` from one backend only means that
+/// index is not attached for *that* backend, so the next backend is still
+/// tried, and the most actionable error is reported when all fail.
+///
+/// # Errors
+///
+/// Returns an error if the monitor does not exist or every backend fails.
+pub fn open_display_tracked(
+    index: u32,
+) -> Result<(Box<dyn Capturer>, CaptureBackendKind), CaptureError> {
     #[cfg(windows)]
     {
         if !service_desktop::input_desktop_selected() {
             let _ = service_desktop::select_input_desktop();
         }
-        // `DisplayNotFound` from DXGI only means that no DXGI output with that
-        // index is attached to the desktop; GDI-only displays (basic display
-        // adapter, nested RDP sessions, some virtual machines) still exist for
-        // `EnumDisplayDevicesW`, so the fallback is tried for every DXGI error
-        // (matching RustDesk `libs/scrap/src/dxgi/mod.rs` `CapturerGDI` fallback).
-        match dxgi::DxgiCapturer::open(index) {
-            Ok(capturer) => Ok(Box::new(capturer)),
-            Err(dxgi_error) => match gdi::GdiCapturer::open(index) {
-                Ok(capturer) => Ok(Box::new(capturer)),
-                Err(gdi_error) => Err(resolve_fallback_error(index, &dxgi_error, &gdi_error)),
-            },
+        let dxgi_error = match dxgi::DxgiCapturer::open(index) {
+            Ok(capturer) => {
+                return Ok((
+                    Box::new(capturer),
+                    CaptureBackendKind::DxgiDesktopDuplication,
+                ));
+            }
+            Err(error) => error,
+        };
+        let wgc_error = match wgc::WgcCapturer::open(index) {
+            Ok(capturer) => {
+                return Ok((
+                    Box::new(capturer),
+                    CaptureBackendKind::WindowsGraphicsCapture,
+                ));
+            }
+            Err(error) => error,
+        };
+        match gdi::GdiCapturer::open(index) {
+            Ok(capturer) => Ok((Box::new(capturer), CaptureBackendKind::GdiBitBlt)),
+            Err(gdi_error) => Err(resolve_fallback_error(
+                index,
+                &dxgi_error,
+                &wgc_error,
+                &gdi_error,
+            )),
         }
     }
     #[cfg(not(windows))]
@@ -227,23 +266,26 @@ pub fn tone_map_hdr_fp16_to_bgra8(rgba_fp16_le: &[u8], sdr_white_nits: f32) -> V
     bgra
 }
 
-/// Chooses the error reported when both the DXGI and the GDI backends failed
-/// to open display `index`: the display is only "not found" when both backends
-/// agree; otherwise both failures are kept so the actionable one is not hidden.
+/// Chooses the error reported when every backend in the `DXGI -> WGC -> GDI`
+/// chain failed to open display `index`: the display is only "not found" when
+/// all three backends agree; otherwise every failure is kept so the actionable
+/// one is not hidden.
 #[must_use]
 pub fn resolve_fallback_error(
     index: u32,
     dxgi_error: &CaptureError,
+    wgc_error: &CaptureError,
     gdi_error: &CaptureError,
 ) -> CaptureError {
-    match (dxgi_error, gdi_error) {
-        (CaptureError::DisplayNotFound(_), CaptureError::DisplayNotFound(_)) => {
-            CaptureError::DisplayNotFound(index)
-        }
-        _ => CaptureError::Os(format!(
-            "display {index}: DXGI failed ({dxgi_error}); GDI failed ({gdi_error})"
-        )),
+    if matches!(dxgi_error, CaptureError::DisplayNotFound(_))
+        && matches!(wgc_error, CaptureError::DisplayNotFound(_))
+        && matches!(gdi_error, CaptureError::DisplayNotFound(_))
+    {
+        return CaptureError::DisplayNotFound(index);
     }
+    CaptureError::Os(format!(
+        "display {index}: DXGI failed ({dxgi_error}); WGC failed ({wgc_error}); GDI failed ({gdi_error})"
+    ))
 }
 
 /// Paces polling backends that cannot signal screen changes (GDI `BitBlt`):
@@ -317,21 +359,24 @@ mod tests {
 
     #[test]
     fn fallback_error_keeps_the_actionable_backend_failure() {
-        let both_missing = resolve_fallback_error(
+        let all_missing = resolve_fallback_error(
             2,
             &CaptureError::DisplayNotFound(2),
             &CaptureError::DisplayNotFound(2),
+            &CaptureError::DisplayNotFound(2),
         );
-        assert!(matches!(both_missing, CaptureError::DisplayNotFound(2)));
+        assert!(matches!(all_missing, CaptureError::DisplayNotFound(2)));
 
         let gdi_failed = resolve_fallback_error(
             0,
+            &CaptureError::DisplayNotFound(0),
             &CaptureError::DisplayNotFound(0),
             &CaptureError::Os("CreateDCW failed for display".into()),
         );
         let text = gdi_failed.to_string();
         assert!(text.contains("CreateDCW failed"), "{text}");
         assert!(text.contains("DXGI failed"), "{text}");
+        assert!(text.contains("WGC failed"), "{text}");
     }
 
     #[test]

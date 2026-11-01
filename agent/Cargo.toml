@@ -18,6 +18,7 @@ omegadesk-identity.workspace = true
 omegadesk-input.workspace = true
 omegadesk-magicsock.workspace = true
 omegadesk-protocol.workspace = true
+omegadesk-service.workspace = true
 omegadesk-transport.workspace = true
 rand_core.workspace = true
 tokio.workspace = true

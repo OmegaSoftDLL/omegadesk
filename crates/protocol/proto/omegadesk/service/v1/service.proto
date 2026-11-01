@@ -1,0 +1,96 @@
+// OmegaDesk Windows service <-> session-worker IPC protocol, version 1.
+//
+// The LocalSystem service (SCM-managed supervisor) and the per-session worker
+// it launches in the active console session exchange these messages over a
+// local named pipe (`\\.\pipe\omegadesk-service`). Every message travels inside
+// a ServiceEnvelope, length-delimited on the wire (see the Rust `ipc` module).
+//
+// New message kinds are added as new fields of the oneof without reusing
+// retired field numbers, matching `omegadesk/v1/session.proto`.
+syntax = "proto3";
+
+package omegadesk.service.v1;
+
+import "omegadesk/v1/session.proto";
+
+// Every IPC message exchanged between the service and a worker.
+message ServiceEnvelope {
+  oneof message {
+    WorkerHello worker_hello = 1;
+    ServiceWelcome service_welcome = 2;
+    DesktopDirective desktop_directive = 3;
+    PrivacyCommand privacy_command = 4;
+    InjectInput inject_input = 5;
+    WorkerStatus worker_status = 6;
+    Shutdown shutdown = 7;
+    Heartbeat heartbeat = 8;
+  }
+}
+
+// Ordered screen capture backends, mirroring
+// `omegadesk_capture::service_desktop::CaptureBackendKind`.
+enum CaptureBackend {
+  CAPTURE_BACKEND_UNSPECIFIED = 0;
+  CAPTURE_BACKEND_DXGI = 1;
+  CAPTURE_BACKEND_WGC = 2;
+  CAPTURE_BACKEND_GDI = 3;
+}
+
+// First message the worker sends after connecting to the service pipe, so the
+// service can confirm the worker runs in the session it launched it into.
+message WorkerHello {
+  uint32 protocol_version = 1;
+  // Windows session id the worker is running in (`ProcessIdToSessionId`).
+  uint32 session_id = 2;
+  // Worker process id, used by the service to track and terminate it.
+  uint32 pid = 3;
+}
+
+// Service acknowledgement of a WorkerHello.
+message ServiceWelcome {
+  uint32 protocol_version = 1;
+  // Rejected: the worker is in the wrong session and should exit.
+  bool accepted = 2;
+}
+
+// Directs the worker to follow the active input desktop (`winsta0\default` or
+// `winsta0\winlogon` for the secure desktop / UAC / lock screen). The worker
+// calls `SetThreadDesktop` on its capture/injection thread.
+message DesktopDirective {
+  string desktop_name = 1;
+}
+
+// Enables or disables privacy mode (local screen blanked, remote still sees the
+// desktop) for one connection. `conn_id` enforces single-owner semantics; a
+// `conn_id` of 0 is the shutdown/reset override.
+message PrivacyCommand {
+  bool enable = 1;
+  int32 conn_id = 2;
+}
+
+// A remote input event forwarded to the worker, which injects it with
+// `omegadesk_input` on the currently selected desktop (SYSTEM worker can inject
+// on the secure desktop). Reuses the session-protocol event messages.
+message InjectInput {
+  oneof event {
+    omegadesk.v1.KeyEvent key = 1;
+    omegadesk.v1.PointerEvent pointer = 2;
+  }
+}
+
+// Periodic worker status report, used by the service for liveness and logging.
+message WorkerStatus {
+  string current_desktop = 1;
+  CaptureBackend backend = 2;
+  bool privacy_active = 3;
+  // Number of frames captured since the previous status, for liveness.
+  uint64 frames_captured = 4;
+}
+
+// Service asks the worker to exit cleanly (service stop/shutdown).
+message Shutdown {}
+
+// Keepalive in either direction; `monotonic_ms` is the sender's clock.
+message Heartbeat {
+  uint64 monotonic_ms = 1;
+}
