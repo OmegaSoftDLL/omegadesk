@@ -1007,12 +1007,15 @@ mod tests {
 
         // Simulate 3 pings with a latency spike (RTT jumps to 150 ms) -> leaves slow start and
         // backs off. Sends stay 50 ms apart (<= 100 ms since the previous send at t=1040) so the
-        // idle reset does not fire and the back-off is exercised on its own.
+        // idle reset does not fire, and all three pongs arrive 150 ms after their ping, after
+        // the last send, so the clock is monotonic.
         for i in 0..3u32 {
             let t_send = 1_100 + u64::from(i) * 50;
             cc.update_position(100_000 + (i + 1) * 40_000, t_send);
             cc.sent_ping(t_send);
-            cc.got_pong(t_send + 150);
+        }
+        for i in 0..3u64 {
+            cc.got_pong(1_250 + i * 50);
         }
         assert!(!cc.in_slow_start());
         assert!(cc.congestion_window() < INITIAL_WINDOW * 2);
@@ -1033,24 +1036,31 @@ mod tests {
         assert_eq!(cc.congestion_window(), INITIAL_WINDOW * 2);
         assert!(cc.in_slow_start());
 
-        // Leave slow start with a mild RTT increase so a reset is observable on both fields.
+        // Leave slow start with a latency spike so a reset is observable on both fields: three
+        // sends 50 ms apart, then their three pongs 150 ms after each ping (monotonic clock).
+        // Small sends between the pongs keep the stream from going idle (> 100 ms) while the
+        // spike is being measured, as a live stream would.
         for i in 0..3u32 {
             let t_send = 1_100 + u64::from(i) * 50;
             cc.update_position(100_000 + (i + 1) * 40_000, t_send);
             cc.sent_ping(t_send);
-            cc.got_pong(t_send + 150);
         }
+        cc.got_pong(1_250);
+        cc.update_position(230_000, 1_250);
+        cc.got_pong(1_300);
+        cc.update_position(240_000, 1_300);
+        cc.got_pong(1_350);
         assert!(!cc.in_slow_start());
         let backed_off = cc.congestion_window();
 
-        // A burst 1 ms after the last send leaves over-buffering bytes in `extra_buffer`.
-        cc.update_position(250_000, 1_201);
+        // A large burst 51 ms after the last send leaves over-buffering bytes in `extra_buffer`.
+        cc.update_position(1_250_000, 1_351);
         assert!(cc.extra_buffer > 0);
 
         // 5 s of silence (> 100 ms and > 2 * base RTT), then data is sent with no zero-byte
         // position update during the pause. This send itself must trigger the idle reset,
         // which also discards the stale over-buffering estimate: the pipe has drained.
-        cc.update_position(300_000, 6_200);
+        cc.update_position(1_300_000, 6_200);
         assert!(cc.in_slow_start());
         assert_eq!(cc.extra_buffer, 0);
         assert_eq!(cc.congestion_window(), INITIAL_WINDOW.min(backed_off));
