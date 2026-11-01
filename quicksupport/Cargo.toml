@@ -10,8 +10,8 @@ description = "Single-executable QuickSupport: joins the mesh as an ephemeral no
 
 [features]
 default = ["host"]
-# The mesh node, the agent session and the console binary. `omegadesk-policy`
-# only needs the permission and consent types, so it turns this off.
+# The mesh node, the agent session and the console binary. Library consumers
+# that only need the permission and consent types can turn this off.
 host = [
     "dep:anyhow",
     "dep:clap",

@@ -29,10 +29,10 @@ omegadesk-rdp = { path = "crates/rdp" }
 omegadesk-recording = { path = "crates/recording" }
 omegadesk-service = { path = "crates/service" }
 omegadesk-session = { path = "crates/session" }
-# Default off at the workspace level so a dependent (e.g. omegadesk-policy)
-# that only needs the permission and consent types does not pull the mesh,
-# the agent session and tokio. The quicksupport package's own binary and
-# tests enable the `host` feature through its own `default = ["host"]`.
+# Default off at the workspace level so library consumers that only need the
+# permission and consent types do not pull the mesh, the agent session and
+# tokio. The quicksupport package's own binary and tests enable the `host`
+# feature through its own `default = ["host"]`.
 omegadesk-quicksupport = { path = "quicksupport", default-features = false }
 omegadesk-relay = { path = "relay" }
 omegadesk-server = { path = "server" }
