@@ -291,10 +291,12 @@ export class SessionRecordingPlayer {
   /**
    * Schedules delivery of the frame after `currentFrameIndex` at its recorded offset from the
    * playback anchor, compensating for time already spent (`continuePlayback()` in
-   * `SessionRecording.js`, lines 857–930). Ends playback when no frame remains.
+   * `SessionRecording.js`, lines 857–930). Ends playback when no frame remains. A no-op while
+   * a frame timer is already pending, so an `onFrame` handler that calls `seek()` cannot cause
+   * the same frame to be scheduled twice.
    */
   private scheduleNextFrame(): void {
-    if (!this.playing) {
+    if (!this.playing || this.timerHandle !== null) {
       return;
     }
     const next = this.frames[this.currentFrameIndex + 1];

@@ -34,6 +34,7 @@ All notable changes to OmegaDesk are documented here. The format follows [Keep a
 
 ### Fixed
 
+- Phase 5 review findings from #29 and #33 (`omegadesk-policy`, `omegadesk-recording`, `web/src/recording-player.ts`): `autogroup:self` ACL sources given as `hosts` aliases or literal IPs are restricted to the untagged devices of the target's owner; SSH `Check` rules take precedence over earlier `Accept` rules and the `autogroup:self` ownership check is applied per destination; per-connection MFA challenges are single-use through `ConnectionMfaVerifier`, which also remembers every accepted TOTP counter per user; `AccessTicket::new` rejects an empty approval workflow instead of auto-approving; share links naming another session are rejected by `LiveSessionController`; a configured `NetworkRangeRule` with an empty allow-list fails closed; `OdrecWriter` indexes only records flagged `KEYFRAME` and `seek_keyframe` never returns a later keyframe; the browser player rejects a trailing partial record header and `play()` actually schedules and delivers frames with pause and end-of-stream handling.
 - GDI capture fallback no longer busy-polls a static desktop: it honors the timeout given by the caller, polls `BitBlt` at 30 Hz, and deselects the bitmap before `GetDIBits` as Win32 requires.
 - GDI capture is tried when DXGI reports no output for the requested display, so GDI-only displays (basic display adapter, nested RDP) can be shared.
 - HDR FP16 tone mapping uses the exact sRGB transfer function instead of a 1/2.2 gamma that lifted dark pixels.

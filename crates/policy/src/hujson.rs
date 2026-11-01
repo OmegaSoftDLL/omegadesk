@@ -444,38 +444,48 @@ impl PolicyV2 {
             return Err(HuJsonError::UndefinedGroup(selector.to_owned()));
         }
 
-        let mut ips = Vec::new();
-        if let Some(host_ip) = self.hosts.get(selector) {
-            ips.push(*host_ip);
-        } else if let Ok(ip) = selector.parse::<IpAddr>() {
-            ips.push(ip);
-        } else {
-            for candidate in all_nodes {
-                if self.node_matches_selector(candidate, selector, false)? {
-                    for ip in &candidate.ips {
-                        if !ips.contains(ip) {
-                            ips.push(*ip);
-                        }
-                    }
-                }
-            }
-        }
-
-        if autogroup_self {
-            // `filterSourcesToSameUser` in `juanfont_headscale/hscontrol/policy/v2/compiled.go`
-            // intersects every resolved source address (including `hosts` aliases and literal
-            // IPs) with the untagged devices owned by the target's user, and
-            // `compileAutogroupSelf` emits nothing for tagged targets. Without this
-            // intersection an ACL from Bob's IP to `autogroup:self:*` would be compiled into
-            // Alice's node and grant Bob access to her devices.
+        // For `autogroup:self` only the untagged devices of the target's owner may ever appear
+        // as sources (`buildUserNodeIndex` + `compileAutogroupSelf` in
+        // `juanfont_headscale/hscontrol/policy/v2/compiled.go`), and a tagged or ownerless
+        // target gets nothing. Narrowing the candidate set first keeps a wildcard self-rule
+        // linear in the owner's device count instead of scanning the whole mesh per address.
+        let candidates: Vec<&PolicyNode> = if autogroup_self {
             if !target_node.tags.is_empty() || target_node.user.is_empty() {
                 return Ok(Vec::new());
             }
-            ips.retain(|ip| {
-                all_nodes.iter().any(|node| {
-                    is_same_owner_untagged_pair(node, target_node) && node.ips.contains(ip)
-                })
-            });
+            all_nodes
+                .iter()
+                .filter(|node| is_same_owner_untagged_pair(node, target_node))
+                .collect()
+        } else {
+            all_nodes.iter().collect()
+        };
+
+        let mut ips = Vec::new();
+        let literal = self
+            .hosts
+            .get(selector)
+            .copied()
+            .or_else(|| selector.parse::<IpAddr>().ok());
+        if let Some(ip) = literal {
+            // `filterSourcesToSameUser` in `compiled.go` intersects every resolved source
+            // address, including `hosts` aliases and literal IPs, with the same-owner devices.
+            // Without this an ACL from Bob's IP to `autogroup:self:*` would be compiled into
+            // Alice's node and grant Bob access to her devices.
+            if !autogroup_self || candidates.iter().any(|node| node.ips.contains(&ip)) {
+                ips.push(ip);
+            }
+            return Ok(ips);
+        }
+
+        for candidate in candidates {
+            if self.node_matches_selector(candidate, selector, false)? {
+                for ip in &candidate.ips {
+                    if !ips.contains(ip) {
+                        ips.push(*ip);
+                    }
+                }
+            }
         }
         Ok(ips)
     }

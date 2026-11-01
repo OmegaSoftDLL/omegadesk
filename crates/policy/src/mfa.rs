@@ -174,27 +174,29 @@ pub fn compute_totp_sha256(shared_key_bytes: &[u8], unix_secs: u64) -> u32 {
     binary % 1_000_000
 }
 
-/// Returns the RFC 6238 time counter (`unix_secs / TOTP_STEP_SECS`) whose code equals `code`,
-/// allowing a `±1` time-step clock skew window (`±30 s`), or `None` if no step matches.
+/// Returns every RFC 6238 time counter (`unix_secs / TOTP_STEP_SECS`) inside the `±1`
+/// time-step clock skew window (`±30 s`) whose code equals `code`, in ascending order. The
+/// vector is empty when no step matches.
 ///
-/// The matched counter is what a caller must remember to refuse replays: RFC 6238 §5.2
+/// All matched counters are what a caller must remember to refuse replays: RFC 6238 §5.2
 /// requires that a verifier "MUST NOT accept the second attempt of the OTP after the
-/// successful validation has been issued for the first OTP".
+/// successful validation has been issued for the first OTP". Two adjacent counters can
+/// legitimately produce the same six-digit code, so remembering only one of them would let
+/// the other re-issue a grant one step later.
 #[must_use]
-pub fn match_totp_counter_sha256(
-    shared_key_bytes: &[u8],
-    code: u32,
-    unix_secs: u64,
-) -> Option<u64> {
+pub fn match_totp_counters_sha256(shared_key_bytes: &[u8], code: u32, unix_secs: u64) -> Vec<u64> {
     let steps = [
         unix_secs.saturating_sub(TOTP_STEP_SECS),
         unix_secs,
         unix_secs.saturating_add(TOTP_STEP_SECS),
     ];
-    steps
+    let mut counters: Vec<u64> = steps
         .into_iter()
-        .find(|ts| compute_totp_sha256(shared_key_bytes, *ts) == code)
+        .filter(|ts| compute_totp_sha256(shared_key_bytes, *ts) == code)
         .map(|ts| ts / TOTP_STEP_SECS)
+        .collect();
+    counters.dedup();
+    counters
 }
 
 /// Verifies a 6-digit TOTP code allowing a `±1` time-step clock skew window (`±30 s`).
@@ -204,7 +206,7 @@ pub fn match_totp_counter_sha256(
 /// and remembers accepted counters per user.
 #[must_use]
 pub fn verify_totp_sha256(shared_key_bytes: &[u8], code: u32, unix_secs: u64) -> bool {
-    match_totp_counter_sha256(shared_key_bytes, code, unix_secs).is_some()
+    !match_totp_counters_sha256(shared_key_bytes, code, unix_secs).is_empty()
 }
 
 /// Per-connection MFA challenge binding an operator, a target [`DeviceId`], and an expiration time.
@@ -232,9 +234,13 @@ pub struct ConnectionMfaChallenge {
 /// storage and is popped once it has been consumed. JumpServer's `MFAOtp._check_code`
 /// (`apps/authentication/mfa/otp.py`) is a stateless code check, so this verifier additionally
 /// remembers the accepted counters per user, as RFC 6238 §5.2 requires. The window of remembered
-/// counters covers the `±1` step skew accepted by [`match_totp_counter_sha256`], so a code that
+/// counters covers the `±1` step skew accepted by [`match_totp_counters_sha256`], so a code that
 /// has issued a grant can never issue another one for the same user.
-#[derive(Debug, Clone, Default)]
+///
+/// The verifier is deliberately not `Clone`: a copy would duplicate the pending challenges and
+/// the replay history, letting the same challenge and code succeed once per copy. Share one
+/// instance (behind a lock when needed) instead.
+#[derive(Debug, Default)]
 pub struct ConnectionMfaVerifier {
     pending: HashMap<String, ConnectionMfaChallenge>,
     accepted_counters: HashMap<String, Vec<u64>>,
@@ -267,8 +273,8 @@ impl ConnectionMfaVerifier {
     }
 
     /// Verifies `code` for the pending challenge `challenge_id` against the operator's TOTP key
-    /// material at `now_ms`, atomically consuming the challenge and recording the accepted
-    /// counter for the operator on success.
+    /// material at `now_ms`, atomically consuming the challenge and recording every counter in
+    /// the skew window that produces `code` for the operator on success.
     ///
     /// On [`MfaError::InvalidCode`] the challenge stays pending so the operator may retry under
     /// the limits of a [`BruteForceGuard`]; every other failure leaves no reusable state.
@@ -278,7 +284,8 @@ impl ConnectionMfaVerifier {
     /// - [`MfaError::UnknownChallenge`] if `challenge_id` was never issued or was already consumed;
     /// - [`MfaError::ChallengeExpired`] if `now_ms > expires_at_ms` (the challenge is dropped);
     /// - [`MfaError::InvalidCode`] if `code` matches no step in the skew window;
-    /// - [`MfaError::CodeAlreadyUsed`] if this code already issued a grant for the same user.
+    /// - [`MfaError::CodeAlreadyUsed`] if this code (through any of its matching counters)
+    ///   already issued a grant for the same user.
     pub fn verify_and_consume(
         &mut self,
         challenge_id: &str,
@@ -294,9 +301,10 @@ impl ConnectionMfaVerifier {
             return Err(MfaError::ChallengeExpired);
         }
         let now_secs = now_ms / 1_000;
-        let Some(counter) = match_totp_counter_sha256(shared_key_bytes, code, now_secs) else {
+        let counters = match_totp_counters_sha256(shared_key_bytes, code, now_secs);
+        if counters.is_empty() {
             return Err(MfaError::InvalidCode);
-        };
+        }
 
         let user_id = challenge.user_id.clone();
         let accepted = self.accepted_counters.entry(user_id.clone()).or_default();
@@ -304,10 +312,12 @@ impl ConnectionMfaVerifier {
         // again, so forgetting them keeps the per-user list bounded.
         let oldest_valid = (now_secs / TOTP_STEP_SECS).saturating_sub(1);
         accepted.retain(|c| *c >= oldest_valid);
-        if accepted.contains(&counter) {
+        // A code that matches two adjacent counters is consumed for both: otherwise the counter
+        // that was not recorded would re-issue a grant for the same digits one step later.
+        if counters.iter().any(|c| accepted.contains(c)) {
             return Err(MfaError::CodeAlreadyUsed { user_id });
         }
-        accepted.push(counter);
+        accepted.extend(counters);
 
         let Some(challenge) = self.pending.remove(challenge_id) else {
             return Err(MfaError::UnknownChallenge(challenge_id.to_owned()));
@@ -562,5 +572,55 @@ mod tests {
             Err(MfaError::ChallengeExpired)
         );
         assert!(!verifier.is_pending("chal-late"));
+    }
+
+    /// PR #36 review: when two adjacent counters inside the skew window produce the same
+    /// six-digit code, both must be consumed by the first grant, otherwise the second counter
+    /// re-issues a grant for the same digits one step later.
+    #[test]
+    fn code_matching_two_counters_is_consumed_for_both() {
+        let key_material = [0x42u8; 32];
+        let now_ms = 1_744_070_490_000u64;
+        let code = 777_880u32;
+
+        // Precondition: this code is produced by two different counters in the ±1 step window.
+        let counters = match_totp_counters_sha256(&key_material, code, now_ms / 1_000);
+        assert_eq!(
+            counters.len(),
+            2,
+            "test vector must collide on two counters"
+        );
+        assert!(verify_totp_sha256(&key_material, code, now_ms / 1_000));
+
+        let device_id = DeviceIdentity::generate().id();
+        let challenge = |id: &str| ConnectionMfaChallenge {
+            challenge_id: id.to_owned(),
+            user_id: "alice".to_owned(),
+            target_device: device_id,
+            expires_at_ms: now_ms + 120_000,
+        };
+        let mut verifier = ConnectionMfaVerifier::new();
+        verifier.issue(challenge("chal-1"));
+        verifier.issue(challenge("chal-2"));
+
+        assert!(
+            verifier
+                .verify_and_consume("chal-1", &key_material, code, now_ms)
+                .is_ok()
+        );
+        // One step later the first counter has been pruned, but the second one still matches
+        // and must also be remembered as consumed.
+        assert_eq!(
+            verifier.verify_and_consume(
+                "chal-2",
+                &key_material,
+                code,
+                now_ms + TOTP_STEP_SECS * 1_000
+            ),
+            Err(MfaError::CodeAlreadyUsed {
+                user_id: "alice".to_owned()
+            })
+        );
+        assert!(verifier.is_pending("chal-2"));
     }
 }

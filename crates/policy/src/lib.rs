@@ -35,7 +35,7 @@ pub use hujson::{
 pub use mfa::{
     BruteForceGuard, ConnectionMfaChallenge, ConnectionMfaVerifier, FederatedIdentityClaim,
     IdentityProviderKind, MfaError, TOTP_STEP_SECS, VerifiedConnectionGrant, WebAuthnPasskeyRecord,
-    compute_totp_sha256, match_totp_counter_sha256, verify_totp_sha256,
+    compute_totp_sha256, match_totp_counters_sha256, verify_totp_sha256,
 };
 pub use pam::{
     AccessTicket, ApprovalStep, GradedAclRule, GradedAction, LiveSessionController, PamError,

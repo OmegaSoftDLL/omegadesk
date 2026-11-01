@@ -309,19 +309,18 @@ impl OdrecWriter {
     /// (`O(log n)`), enabling instant timeline scrubbing (`SessionRecording.js`).
     ///
     /// Every entry returned was explicitly flagged [`RecordFlags::KEYFRAME`] by the producer,
-    /// so decoding can start at it without any earlier record.
+    /// so decoding can start at it without any earlier record. Returns `None` when no keyframe
+    /// exists at or before the target (including a target that precedes the first keyframe),
+    /// never a later one.
     #[must_use]
     pub fn seek_keyframe(&self, target_timestamp_ms: u64) -> Option<KeyframeIndexEntry> {
-        if self.keyframes.is_empty() {
-            return None;
-        }
         match self
             .keyframes
             .binary_search_by_key(&target_timestamp_ms, |entry| entry.timestamp_ms)
         {
-            Ok(idx) => Some(self.keyframes[idx]),
-            Err(0) => Some(self.keyframes[0]),
-            Err(insert_idx) => Some(self.keyframes[insert_idx - 1]),
+            Ok(idx) => self.keyframes.get(idx).copied(),
+            Err(0) => None,
+            Err(insert_idx) => self.keyframes.get(insert_idx - 1).copied(),
         }
     }
 
@@ -677,6 +676,10 @@ mod tests {
         );
         assert_eq!(writer.keyframes().len(), 1);
         assert!(!writer.keyframe_hint_due(1_000));
+        // "At or before": a target before the first keyframe must not get a future keyframe.
+        assert_eq!(writer.seek_keyframe(0), None);
+        assert_eq!(writer.seek_keyframe(999), None);
+        assert_eq!(writer.seek_keyframe(1_000).map(|k| k.record_index), Some(1));
 
         // Far beyond both intervals, a delta frame is still a delta frame.
         let big_delta_len = usize::try_from(KEYFRAME_BYTE_INTERVAL).unwrap() * 2;
