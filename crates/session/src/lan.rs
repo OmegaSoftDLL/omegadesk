@@ -107,23 +107,7 @@ impl LanAnnouncement {
         let device_id = public_identity.id();
         let id_str = device_id.to_string();
         let short_id = id_str.split('-').next().unwrap_or("node");
-        let slug: String = trimmed
-            .chars()
-            .map(|c| {
-                if c.is_ascii_alphanumeric() {
-                    c.to_ascii_lowercase()
-                } else {
-                    '-'
-                }
-            })
-            .collect();
-        let clean_slug = slug.trim_matches('-');
-        let prefix = if clean_slug.is_empty() {
-            "omegadesk"
-        } else {
-            clean_slug
-        };
-        let dns_label = format!("{prefix}-{short_id}");
+        let dns_label = dns_host_label(trimmed, short_id);
 
         Ok(Self {
             display_name: trimmed.to_owned(),
@@ -151,6 +135,37 @@ impl LanAnnouncement {
             ("ver".to_owned(), PROTOCOL_VERSION.to_string()),
         ]
     }
+}
+
+/// Maximum length of a single DNS label in bytes (RFC 1035 §2.3.4).
+pub const MAX_DNS_LABEL_LEN: usize = 63;
+
+/// Builds the collision-safe `<slug>-<short_id>` mDNS host label, following
+/// `dns_host_label` in SubnetDesk's `src/lan_mdns.rs`: the ASCII slug is lower-cased,
+/// runs of non-alphanumerics collapse into a single `-`, and the slug is truncated to
+/// the space left after the `-<short_id>` suffix so the whole label never exceeds
+/// [`MAX_DNS_LABEL_LEN`] bytes (a 64-char display name previously produced a 69-byte label).
+fn dns_host_label(display_name: &str, short_id: &str) -> String {
+    let mut slug = String::with_capacity(display_name.len());
+    let mut last_was_hyphen = false;
+    for byte in display_name.bytes() {
+        if byte.is_ascii_alphanumeric() {
+            slug.push(byte.to_ascii_lowercase() as char);
+            last_was_hyphen = false;
+        } else if !last_was_hyphen {
+            slug.push('-');
+            last_was_hyphen = true;
+        }
+    }
+    let max_slug_len = MAX_DNS_LABEL_LEN.saturating_sub(short_id.len() + 1);
+    let mut prefix: String = slug.trim_matches('-').chars().take(max_slug_len).collect();
+    while prefix.ends_with('-') {
+        prefix.pop();
+    }
+    if prefix.is_empty() {
+        prefix.push_str("omegadesk");
+    }
+    format!("{prefix}-{short_id}")
 }
 
 /// Client hello sent to initiate a serverless LAN handshake (`src/lan_protocol.rs`).
@@ -393,5 +408,55 @@ mod tests {
             tofu.verify_or_pin(&announcement.dns_label, &impostor.public()),
             Err(LanError::TofuKeyConflict { .. })
         ));
+    }
+
+    /// Regression for #27 `lan.rs:126`: a 64-character display name plus `-<short_id>`
+    /// produced a 69-byte label; DNS labels are capped at 63 bytes.
+    #[test]
+    fn dns_label_never_exceeds_63_bytes_for_maximum_length_display_names() {
+        let identity = DeviceIdentity::generate();
+        let public = identity.public();
+        let short_id = public
+            .id()
+            .to_string()
+            .split('-')
+            .next()
+            .unwrap()
+            .to_owned();
+        let suffix = format!("-{short_id}");
+
+        for len in [59usize, 60, 63, MAX_DISPLAY_NAME_LEN] {
+            let name = "a".repeat(len);
+            let announcement =
+                LanAnnouncement::new(&name, "linux", &public, 0, Vec::new()).unwrap();
+            assert!(
+                announcement.dns_label.len() <= MAX_DNS_LABEL_LEN,
+                "{len}-char name produced {}-byte label {}",
+                announcement.dns_label.len(),
+                announcement.dns_label
+            );
+            assert!(announcement.dns_label.ends_with(&suffix));
+            assert!(!announcement.dns_label.starts_with('-'));
+            assert!(!announcement.dns_label.contains("--"));
+            assert!(
+                announcement.dns_label.len() > suffix.len(),
+                "slug must not be truncated to nothing"
+            );
+        }
+
+        // Truncation must not leave a dangling hyphen before the suffix, and runs of
+        // separators collapse into one (`dns_host_label` in SubnetDesk `src/lan_mdns.rs`).
+        let spaced = format!("{} Workstation!!  Lab", "x".repeat(40));
+        let announcement =
+            LanAnnouncement::new(&spaced, "windows", &public, 0, Vec::new()).unwrap();
+        assert!(announcement.dns_label.len() <= MAX_DNS_LABEL_LEN);
+        assert!(!announcement.dns_label.contains("--"));
+        assert!(announcement.dns_label.ends_with(&suffix));
+        assert!(
+            !announcement
+                .dns_label
+                .trim_end_matches(&suffix)
+                .ends_with('-')
+        );
     }
 }

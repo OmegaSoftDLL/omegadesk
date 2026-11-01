@@ -49,15 +49,31 @@ pub enum ChannelError {
     /// Assembled file size or SHA-256 digest did not match the offer.
     #[error("file transfer SHA-256 integrity verification failed")]
     FileIntegrityFailed,
+    /// A chunk (or the offer's resume offset) would push the received bytes past the
+    /// advertised `total_bytes`, so withholding `eof` cannot bypass the size bound.
+    #[error("file transfer chunk ends at {attempted} bytes, exceeding advertised {total_bytes}")]
+    FileSizeExceeded {
+        /// Advertised total file size from the offer.
+        total_bytes: u64,
+        /// End offset the rejected chunk would have reached.
+        attempted: u64,
+    },
+    /// The transfer already completed (verified) or failed; no further chunks are accepted.
+    #[error("file transfer is no longer accepting chunks")]
+    TransferClosed,
     /// Requested display index does not exist in the host's [`MonitorCatalog`].
     #[error("unknown display index: {0}")]
     UnknownDisplayIndex(u32),
 }
 
 /// Deduplicating bidirectional clipboard synchronization state machine.
+///
+/// The dedup key is `(format, SHA-256)`: the same bytes copied as `Utf8Text` and
+/// then as `Html` are different clipboard contents and both reach the peer, while a
+/// true echo (same format, same bytes) is still suppressed.
 #[derive(Debug, Default, Clone)]
 pub struct ClipboardSync {
-    last_digest: Option<[u8; 32]>,
+    last_content: Option<(i32, [u8; 32])>,
 }
 
 impl ClipboardSync {
@@ -82,10 +98,11 @@ impl ClipboardSync {
             return Err(ChannelError::ClipboardTooLarge(data.len()));
         }
         let digest = sha256_bytes(data);
-        if self.last_digest == Some(digest) {
+        let key = (format as i32, digest);
+        if self.last_content == Some(key) {
             return Ok(None);
         }
-        self.last_digest = Some(digest);
+        self.last_content = Some(key);
         Ok(Some(ClipboardEvent {
             format: format as i32,
             data: Bytes::copy_from_slice(data),
@@ -111,10 +128,11 @@ impl ClipboardSync {
         if event.content_sha256.as_ref() != computed {
             return Err(ChannelError::ClipboardDigestMismatch);
         }
-        if self.last_digest == Some(computed) {
+        let key = (event.format, computed);
+        if self.last_content == Some(key) {
             return Ok(None);
         }
-        self.last_digest = Some(computed);
+        self.last_content = Some(key);
         let format =
             ClipboardFormat::try_from(event.format).unwrap_or(ClipboardFormat::Unspecified);
         Ok(Some((format, event.data.to_vec())))
@@ -153,6 +171,10 @@ pub struct FileTransferSender {
     file_sha256: [u8; 32],
     offset: usize,
     chunk_size: usize,
+    /// Set once the single `eof` chunk has been produced, independently of `offset`,
+    /// so a 0-byte file or a transfer resumed at its full length still emits exactly
+    /// one final chunk and then stops.
+    eof_sent: bool,
 }
 
 impl FileTransferSender {
@@ -179,6 +201,7 @@ impl FileTransferSender {
             file_sha256,
             offset: clamped_offset,
             chunk_size: DEFAULT_FILE_CHUNK_SIZE,
+            eof_sent: false,
         })
     }
 
@@ -194,20 +217,25 @@ impl FileTransferSender {
         }
     }
 
-    /// Produces the next [`FileTransferChunk`], or `None` once all bytes have been sent.
+    /// Produces the next [`FileTransferChunk`], or `None` once the `eof` chunk has been sent.
+    ///
+    /// Exactly one chunk carries `eof = true`. For a 0-byte file, or a transfer resumed
+    /// at its full length, that is a single empty chunk so the receiver still verifies
+    /// completion (mirrors the final `FileTransferDone` that RustDesk's
+    /// `src/server/connection.rs` sends after the last block).
     pub fn next_chunk(&mut self) -> Option<FileTransferChunk> {
-        if self.offset >= self.data.len() && !self.data.is_empty() {
+        if self.eof_sent {
             return None;
         }
-        let chunk_offset = u64::try_from(self.offset).unwrap_or(0);
-        let end = (self.offset + self.chunk_size).min(self.data.len());
+        let chunk_offset = u64::try_from(self.offset).unwrap_or(u64::MAX);
+        let end = self
+            .offset
+            .saturating_add(self.chunk_size)
+            .min(self.data.len());
         let slice = self.data.slice(self.offset..end);
         self.offset = end;
         let eof = self.offset >= self.data.len();
-        if slice.is_empty() && eof {
-            // Allow a single empty EOF chunk for 0-byte files, then stop.
-            self.offset = 1;
-        }
+        self.eof_sent = eof;
         Some(FileTransferChunk {
             transfer_id: self.transfer_id,
             offset: chunk_offset,
@@ -217,8 +245,24 @@ impl FileTransferSender {
     }
 }
 
+/// Lifecycle of a [`FileTransferReceiver`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReceiveState {
+    /// Chunks are still being appended.
+    InProgress,
+    /// The `eof` chunk arrived and size + SHA-256 matched the offer.
+    Verified,
+    /// Size or SHA-256 verification failed; the buffer may only be used for resume.
+    Failed,
+}
+
 /// Receiver-side state machine for chunked file transfer with resume and SHA-256
 /// integrity verification.
+///
+/// The advertised `total_bytes` is enforced on **every** chunk (not only at `eof`), the
+/// way RustDesk's `TransferJob::write` in `libs/base/src/fs.rs` bounds each block by the
+/// announced file entry: a peer that offers a tiny file cannot stream unbounded,
+/// correctly offset `eof = false` chunks into memory.
 #[derive(Debug, Clone)]
 pub struct FileTransferReceiver {
     transfer_id: u64,
@@ -226,6 +270,7 @@ pub struct FileTransferReceiver {
     total_bytes: u64,
     expected_sha256: [u8; 32],
     buffer: Vec<u8>,
+    state: ReceiveState,
 }
 
 impl FileTransferReceiver {
@@ -234,7 +279,8 @@ impl FileTransferReceiver {
     ///
     /// # Errors
     ///
-    /// Returns [`ChannelError`] if the path is unsafe or the SHA-256 field is not 32 bytes.
+    /// Returns [`ChannelError`] if the path is unsafe, the SHA-256 field is not 32
+    /// bytes, or `resume_offset` already exceeds `total_bytes`.
     pub fn from_offer(
         offer: &FileTransferOffer,
         existing_partial: Vec<u8>,
@@ -243,6 +289,12 @@ impl FileTransferReceiver {
         let Ok(expected_sha256) = <[u8; 32]>::try_from(offer.file_sha256.as_ref()) else {
             return Err(ChannelError::FileIntegrityFailed);
         };
+        if offer.resume_offset > offer.total_bytes {
+            return Err(ChannelError::FileSizeExceeded {
+                total_bytes: offer.total_bytes,
+                attempted: offer.resume_offset,
+            });
+        }
         let expected_resume = usize::try_from(offer.resume_offset).unwrap_or(0);
         let mut buffer = existing_partial;
         buffer.truncate(expected_resume);
@@ -253,6 +305,7 @@ impl FileTransferReceiver {
             total_bytes: offer.total_bytes,
             expected_sha256,
             buffer,
+            state: ReceiveState::InProgress,
         })
     }
 
@@ -262,19 +315,38 @@ impl FileTransferReceiver {
         &self.relative_path
     }
 
+    /// Returns `true` once the `eof` chunk arrived and size + SHA-256 verified.
+    #[must_use]
+    pub fn is_verified(&self) -> bool {
+        self.state == ReceiveState::Verified
+    }
+
+    /// Bytes received so far (possibly incomplete or unverified), for persisting a
+    /// `.partial` file and resuming via [`FileTransferOffer::resume_offset`].
+    #[must_use]
+    pub fn partial_bytes(&self) -> &[u8] {
+        &self.buffer
+    }
+
     /// Appends a [`FileTransferChunk`] and returns a [`FileTransferAck`].
     ///
-    /// When `chunk.eof` is set, verifies both the total byte count and the
-    /// full-file SHA-256 digest before setting `verified = true`.
+    /// Every chunk is bounded by the offer's `total_bytes`. When `chunk.eof` is set,
+    /// verifies both the total byte count and the full-file SHA-256 digest before
+    /// setting `verified = true`.
     ///
     /// # Errors
     ///
-    /// Returns [`ChannelError`] if the chunk offset is out of order or final
-    /// SHA-256 verification fails.
+    /// Returns [`ChannelError::FileSizeExceeded`] if the chunk would exceed `total_bytes`
+    /// (nothing is buffered), [`ChannelError::UnexpectedFileOffset`] if the offset is out
+    /// of order, [`ChannelError::FileIntegrityFailed`] if final verification fails, and
+    /// [`ChannelError::TransferClosed`] once the transfer has completed or failed.
     pub fn accept_chunk(
         &mut self,
         chunk: &FileTransferChunk,
     ) -> Result<FileTransferAck, ChannelError> {
+        if self.state != ReceiveState::InProgress {
+            return Err(ChannelError::TransferClosed);
+        }
         let expected_offset = u64::try_from(self.buffer.len()).unwrap_or(u64::MAX);
         if chunk.transfer_id != self.transfer_id || chunk.offset != expected_offset {
             return Err(ChannelError::UnexpectedFileOffset {
@@ -282,17 +354,23 @@ impl FileTransferReceiver {
                 actual: chunk.offset,
             });
         }
+        let chunk_len = u64::try_from(chunk.data.len()).unwrap_or(u64::MAX);
+        let end_offset = chunk.offset.saturating_add(chunk_len);
+        if end_offset > self.total_bytes {
+            return Err(ChannelError::FileSizeExceeded {
+                total_bytes: self.total_bytes,
+                attempted: end_offset,
+            });
+        }
         self.buffer.extend_from_slice(&chunk.data);
         let next_offset = u64::try_from(self.buffer.len()).unwrap_or(u64::MAX);
 
         if chunk.eof {
-            if next_offset != self.total_bytes {
-                return Err(ChannelError::FileIntegrityFailed);
+            if let Err(err) = self.verify_complete() {
+                self.state = ReceiveState::Failed;
+                return Err(err);
             }
-            let actual_sha256 = sha256_bytes(&self.buffer);
-            if actual_sha256 != self.expected_sha256 {
-                return Err(ChannelError::FileIntegrityFailed);
-            }
+            self.state = ReceiveState::Verified;
             return Ok(FileTransferAck {
                 transfer_id: self.transfer_id,
                 next_offset,
@@ -309,10 +387,28 @@ impl FileTransferReceiver {
         })
     }
 
-    /// Consumes the receiver and returns the verified file bytes.
-    #[must_use]
-    pub fn into_bytes(self) -> Vec<u8> {
-        self.buffer
+    /// Consumes the receiver and returns the file bytes only if the transfer completed
+    /// and both the size and the SHA-256 digest match the offer.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChannelError::FileIntegrityFailed`] if the transfer is incomplete,
+    /// failed verification, or the buffer no longer matches the offer. Use
+    /// [`Self::partial_bytes`] to persist incomplete data for resume instead.
+    pub fn into_bytes(self) -> Result<Vec<u8>, ChannelError> {
+        if self.state != ReceiveState::Verified {
+            return Err(ChannelError::FileIntegrityFailed);
+        }
+        self.verify_complete()?;
+        Ok(self.buffer)
+    }
+
+    fn verify_complete(&self) -> Result<(), ChannelError> {
+        let received = u64::try_from(self.buffer.len()).unwrap_or(u64::MAX);
+        if received != self.total_bytes || sha256_bytes(&self.buffer) != self.expected_sha256 {
+            return Err(ChannelError::FileIntegrityFailed);
+        }
+        Ok(())
     }
 }
 
@@ -589,7 +685,159 @@ mod tests {
         let final_ack = last_ack.unwrap();
         assert!(final_ack.completed);
         assert!(final_ack.verified);
-        assert_eq!(receiver.into_bytes(), payload);
+        assert!(receiver.is_verified());
+        assert_eq!(receiver.into_bytes().unwrap(), payload);
+    }
+
+    /// Regression for #27 `channels.rs:60`: the dedup key must include the format.
+    #[test]
+    fn clipboard_dedup_tracks_format_together_with_digest() {
+        let mut host = ClipboardSync::new();
+        let mut client = ClipboardSync::new();
+        let text = host
+            .prepare_outbound(ClipboardFormat::Utf8Text, b"<b>same bytes</b>")
+            .unwrap()
+            .expect("first copy is new content");
+        // Same bytes copied again as HTML is a different clipboard content: it must go out.
+        let html = host
+            .prepare_outbound(ClipboardFormat::Html, b"<b>same bytes</b>")
+            .unwrap()
+            .expect("format-only change must reach the peer");
+        assert_eq!(html.format, ClipboardFormat::Html as i32);
+        // A true echo (same format, same bytes) is still suppressed.
+        assert!(
+            host.prepare_outbound(ClipboardFormat::Html, b"<b>same bytes</b>")
+                .unwrap()
+                .is_none()
+        );
+
+        assert!(client.accept_inbound(&text).unwrap().is_some());
+        let (fmt, _) = client
+            .accept_inbound(&html)
+            .unwrap()
+            .expect("inbound format-only change must be applied");
+        assert_eq!(fmt, ClipboardFormat::Html);
+        assert!(client.accept_inbound(&html).unwrap().is_none());
+    }
+
+    /// Regression for #27 `channels.rs:200`: exactly one EOF chunk for a 0-byte file
+    /// (the second `next_chunk()` used to slice `1..0` and panic) and for a transfer
+    /// resumed at its full length (no EOF chunk used to be sent at all).
+    #[test]
+    fn file_sender_emits_exactly_one_eof_chunk_for_empty_and_fully_resumed_files() {
+        let mut empty = FileTransferSender::new(1, "empty.bin", Vec::new(), 0).unwrap();
+        let chunk = empty
+            .next_chunk()
+            .expect("empty file still sends an EOF chunk");
+        assert!(chunk.eof);
+        assert!(chunk.data.is_empty());
+        assert_eq!(chunk.offset, 0);
+        assert!(empty.next_chunk().is_none());
+        assert!(empty.next_chunk().is_none());
+
+        let mut receiver = FileTransferReceiver::from_offer(&empty.offer(), Vec::new()).unwrap();
+        let ack = receiver.accept_chunk(&chunk).unwrap();
+        assert!(ack.completed && ack.verified);
+        assert_eq!(receiver.into_bytes().unwrap(), Vec::<u8>::new());
+
+        let payload = vec![0xA5u8; 1000];
+        let mut resumed =
+            FileTransferSender::new(2, "done.bin", payload.clone(), payload.len()).unwrap();
+        let final_chunk = resumed
+            .next_chunk()
+            .expect("fully resumed transfer must still emit the EOF chunk");
+        assert!(final_chunk.eof);
+        assert!(final_chunk.data.is_empty());
+        assert_eq!(final_chunk.offset, 1000);
+        assert!(resumed.next_chunk().is_none());
+
+        let mut receiver =
+            FileTransferReceiver::from_offer(&resumed.offer(), payload.clone()).unwrap();
+        let ack = receiver.accept_chunk(&final_chunk).unwrap();
+        assert!(ack.completed && ack.verified);
+        assert_eq!(receiver.into_bytes().unwrap(), payload);
+    }
+
+    /// Regression for #27 `channels.rs:285`: chunks past `total_bytes` are rejected
+    /// before buffering even when the peer never sets `eof`.
+    #[test]
+    fn file_receiver_rejects_chunks_beyond_total_bytes_before_eof() {
+        let payload = vec![7u8; 16];
+        let sender = FileTransferSender::new(3, "small.bin", payload.clone(), 0).unwrap();
+        let mut receiver = FileTransferReceiver::from_offer(&sender.offer(), Vec::new()).unwrap();
+
+        // Honest first chunk covering the whole advertised size, but withholding EOF.
+        let first = FileTransferChunk {
+            transfer_id: 3,
+            offset: 0,
+            data: Bytes::from(payload),
+            eof: false,
+        };
+        assert!(receiver.accept_chunk(&first).is_ok());
+
+        // Correctly offset extra chunk: must be rejected and must not be retained.
+        let overflow = FileTransferChunk {
+            transfer_id: 3,
+            offset: 16,
+            data: Bytes::from_static(&[0xFFu8; 64]),
+            eof: false,
+        };
+        assert_eq!(
+            receiver.accept_chunk(&overflow),
+            Err(ChannelError::FileSizeExceeded {
+                total_bytes: 16,
+                attempted: 80,
+            })
+        );
+        assert_eq!(receiver.partial_bytes().len(), 16);
+
+        // An offer whose resume offset already exceeds the file is rejected up front.
+        let mut bad_offer = sender.offer();
+        bad_offer.resume_offset = 17;
+        assert!(matches!(
+            FileTransferReceiver::from_offer(&bad_offer, vec![0u8; 17]),
+            Err(ChannelError::FileSizeExceeded { .. })
+        ));
+    }
+
+    /// Regression for #27 `channels.rs:315`: `into_bytes()` is fallible and never hands
+    /// out incomplete or corrupt bytes; partial bytes stay available for resume.
+    #[test]
+    fn file_receiver_extraction_fails_before_eof_and_after_integrity_failure() {
+        let payload: Vec<u8> = (0..=255u8).collect();
+        let mut sender = FileTransferSender::new(4, "data.bin", payload.clone(), 0).unwrap();
+        let offer = sender.offer();
+
+        // Incomplete: no chunk received yet.
+        let receiver = FileTransferReceiver::from_offer(&offer, Vec::new()).unwrap();
+        assert!(!receiver.is_verified());
+        assert_eq!(
+            receiver.into_bytes(),
+            Err(ChannelError::FileIntegrityFailed)
+        );
+
+        // Corrupt: tamper with the only chunk, keep offset/size/eof consistent.
+        let mut receiver = FileTransferReceiver::from_offer(&offer, Vec::new()).unwrap();
+        let mut chunk = sender.next_chunk().unwrap();
+        let mut tampered = chunk.data.to_vec();
+        tampered[0] ^= 0xFF;
+        chunk.data = Bytes::from(tampered);
+        assert_eq!(
+            receiver.accept_chunk(&chunk),
+            Err(ChannelError::FileIntegrityFailed)
+        );
+        assert!(!receiver.is_verified());
+        // The corrupt buffer is still exposed for resume bookkeeping...
+        assert_eq!(receiver.partial_bytes().len(), payload.len());
+        // ...but the transfer is closed and extraction refuses to return it.
+        assert_eq!(
+            receiver.accept_chunk(&chunk),
+            Err(ChannelError::TransferClosed)
+        );
+        assert_eq!(
+            receiver.into_bytes(),
+            Err(ChannelError::FileIntegrityFailed)
+        );
     }
 
     #[test]

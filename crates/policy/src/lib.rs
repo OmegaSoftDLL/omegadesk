@@ -75,6 +75,21 @@ pub enum PolicyError {
     /// User lacks required permission for the requested session protocol.
     #[error("permission denied for protocol {0:?}")]
     PermissionDenied(SessionProtocol),
+    /// A device group update tried to move the group to another tenant while devices
+    /// are still enrolled in it under the original tenant.
+    #[error(
+        "device group {group_id} cannot move from tenant {from} to {to}: {enrolled_devices} enrolled device(s) would inherit another tenant's consent flags"
+    )]
+    DeviceGroupTenantChange {
+        /// Device group being updated.
+        group_id: String,
+        /// Tenant that currently owns the group.
+        from: String,
+        /// Tenant the update tried to assign.
+        to: String,
+        /// Number of devices still enrolled in the group.
+        enrolled_devices: usize,
+    },
 }
 
 /// Explicit administrative role, never represented as `0xFFFF_FFFF` (`docs/plan.md` §2.7).
@@ -492,7 +507,13 @@ impl TenantDirectory {
     }
 
     /// Registers a [`Tenant`] and indexes its SNI domains (`MeshCentral/webserver.js`).
+    ///
+    /// Like MeshCentral rebuilding `obj.tlsSniCredentials` from scratch for the current
+    /// `config.domains[i].dns` set (`webserver.js`, "Setup DNS domain TLS SNI
+    /// credentials"), every SNI binding previously owned by this tenant is dropped
+    /// before the new ones are indexed, so a removed domain stops routing to it.
     pub fn upsert_tenant(&mut self, tenant: Tenant) {
+        self.sni_index.retain(|_, owner| *owner != tenant.id);
         for binding in &tenant.sni_domains {
             self.sni_index
                 .insert(binding.domain.to_ascii_lowercase(), tenant.id.clone());
@@ -509,12 +530,36 @@ impl TenantDirectory {
 
     /// Registers a [`DeviceGroup`] under an existing tenant.
     ///
+    /// Updating an existing group's `tenant_id` is rejected while devices are still
+    /// enrolled in it: [`Self::resolve_node_access`] applies `group.consent_flags` to
+    /// every device by `group_id`, so silently re-homing the group would let another
+    /// tenant's consent flags (possibly dropping a required prompt) govern those
+    /// devices. Move or remove the devices first, then update the group.
+    ///
     /// # Errors
     ///
-    /// Returns [`PolicyError::UnknownTenant`] if `group.tenant_id` does not exist.
+    /// Returns [`PolicyError::UnknownTenant`] if `group.tenant_id` does not exist, or
+    /// [`PolicyError::DeviceGroupTenantChange`] for a tenant change with enrolled devices.
     pub fn upsert_device_group(&mut self, group: DeviceGroup) -> Result<(), PolicyError> {
         if !self.tenants.contains_key(&group.tenant_id) {
             return Err(PolicyError::UnknownTenant(group.tenant_id));
+        }
+        if let Some(existing) = self.device_groups.get(&group.id)
+            && existing.tenant_id != group.tenant_id
+        {
+            let enrolled_devices = self
+                .devices
+                .values()
+                .filter(|device| device.group_id == group.id)
+                .count();
+            if enrolled_devices > 0 {
+                return Err(PolicyError::DeviceGroupTenantChange {
+                    group_id: group.id,
+                    from: existing.tenant_id.clone(),
+                    to: group.tenant_id,
+                    enrolled_devices,
+                });
+            }
         }
         self.device_groups.insert(group.id.clone(), group);
         Ok(())
@@ -657,6 +702,164 @@ mod tests {
 
     fn sample_device_id(tag: u8) -> DeviceId {
         DeviceId::from_signing_key(&[tag; 32])
+    }
+
+    fn sample_tenant(id: &str, domains: &[&str], consent_flags: ConsentFlags) -> Tenant {
+        Tenant {
+            id: id.to_owned(),
+            name: id.to_uppercase(),
+            consent_flags,
+            consent_timeout_secs: 30,
+            auto_accept_on_timeout: false,
+            auto_accept_if_no_user: false,
+            auto_accept_if_locked: false,
+            sni_domains: domains
+                .iter()
+                .map(|d| TenantDomainBinding {
+                    domain: (*d).to_owned(),
+                    cert_sha256: [0x11; 32],
+                })
+                .collect(),
+        }
+    }
+
+    fn sample_user(id: &str, tenant_id: &str) -> UserAccount {
+        UserAccount {
+            id: id.to_owned(),
+            tenant_id: tenant_id.to_owned(),
+            username: format!("{id}@{tenant_id}"),
+            admin_role: AdminRole::TenantAdmin,
+            site_rights: SiteRights::NONE,
+            consent_flags: ConsentFlags::NONE,
+            device_group_grants: HashMap::new(),
+            device_grants: HashMap::new(),
+        }
+    }
+
+    /// Regression for #28 `policy/src/lib.rs:466`: updating a tenant must drop the SNI
+    /// bindings it no longer declares.
+    #[test]
+    fn tenant_update_removes_previous_sni_bindings() {
+        let mut dir = TenantDirectory::new();
+        dir.upsert_tenant(sample_tenant(
+            "acme",
+            &["old.example", "keep.example"],
+            ConsentFlags::NONE,
+        ));
+        dir.upsert_tenant(sample_tenant(
+            "other",
+            &["other.example"],
+            ConsentFlags::NONE,
+        ));
+        assert!(dir.resolve_tenant_by_sni("old.example").is_some());
+
+        // Replace `old.example` with `new.example`; `keep.example` stays.
+        dir.upsert_tenant(sample_tenant(
+            "acme",
+            &["new.example", "keep.example"],
+            ConsentFlags::NONE,
+        ));
+        assert!(
+            dir.resolve_tenant_by_sni("old.example").is_none(),
+            "removed domain must stop routing to the tenant"
+        );
+        assert!(
+            dir.resolve_tenant_by_sni("NEW.example")
+                .is_some_and(|t| t.id == "acme")
+        );
+        assert!(
+            dir.resolve_tenant_by_sni("keep.example")
+                .is_some_and(|t| t.id == "acme")
+        );
+        // Another tenant's bindings are untouched.
+        assert!(
+            dir.resolve_tenant_by_sni("other.example")
+                .is_some_and(|t| t.id == "other")
+        );
+
+        // Updating to no domains at all clears every binding of that tenant.
+        dir.upsert_tenant(sample_tenant("acme", &[], ConsentFlags::NONE));
+        assert!(dir.resolve_tenant_by_sni("new.example").is_none());
+        assert!(dir.resolve_tenant_by_sni("keep.example").is_none());
+    }
+
+    /// Regression for #28 `policy/src/lib.rs:490`: re-homing a device group to another
+    /// tenant while devices are enrolled would apply that tenant's group consent flags.
+    #[test]
+    fn device_group_tenant_change_is_rejected_while_devices_are_enrolled() {
+        let mut dir = TenantDirectory::new();
+        dir.upsert_tenant(sample_tenant("t1", &[], ConsentFlags::DESKTOP_PROMPT));
+        dir.upsert_tenant(sample_tenant("t2", &[], ConsentFlags::NONE));
+        dir.upsert_device_group(DeviceGroup {
+            id: "shared-id".to_owned(),
+            tenant_id: "t1".to_owned(),
+            name: "T1 Workstations".to_owned(),
+            consent_flags: ConsentFlags::DESKTOP_PROMPT,
+        })
+        .unwrap();
+        let dev_id = sample_device_id(9);
+        dir.upsert_device(DeviceNode {
+            id: dev_id,
+            tenant_id: "t1".to_owned(),
+            group_id: "shared-id".to_owned(),
+            hostname: "ws-09".to_owned(),
+            consent_flags: ConsentFlags::NONE,
+        })
+        .unwrap();
+        dir.upsert_user(sample_user("t1-admin", "t1")).unwrap();
+
+        let hijack = DeviceGroup {
+            id: "shared-id".to_owned(),
+            tenant_id: "t2".to_owned(),
+            name: "T2 Takeover".to_owned(),
+            consent_flags: ConsentFlags::NONE,
+        };
+        assert_eq!(
+            dir.upsert_device_group(hijack),
+            Err(PolicyError::DeviceGroupTenantChange {
+                group_id: "shared-id".to_owned(),
+                from: "t1".to_owned(),
+                to: "t2".to_owned(),
+                enrolled_devices: 1,
+            })
+        );
+
+        // The enrolled device keeps its own tenant's group consent flags.
+        let access = dir.resolve_node_access("t1-admin", dev_id).unwrap();
+        assert!(
+            access
+                .consent_policy
+                .effective_flags()
+                .contains(ConsentFlags::DESKTOP_PROMPT)
+        );
+        assert_eq!(dir.device_groups["shared-id"].tenant_id, "t1");
+
+        // Same-tenant updates and tenant changes of empty groups are still allowed.
+        assert!(
+            dir.upsert_device_group(DeviceGroup {
+                id: "shared-id".to_owned(),
+                tenant_id: "t1".to_owned(),
+                name: "Renamed".to_owned(),
+                consent_flags: ConsentFlags::DESKTOP_PROMPT,
+            })
+            .is_ok()
+        );
+        dir.upsert_device_group(DeviceGroup {
+            id: "empty".to_owned(),
+            tenant_id: "t1".to_owned(),
+            name: "Empty".to_owned(),
+            consent_flags: ConsentFlags::NONE,
+        })
+        .unwrap();
+        assert!(
+            dir.upsert_device_group(DeviceGroup {
+                id: "empty".to_owned(),
+                tenant_id: "t2".to_owned(),
+                name: "Empty".to_owned(),
+                consent_flags: ConsentFlags::NONE,
+            })
+            .is_ok()
+        );
     }
 
     #[test]
