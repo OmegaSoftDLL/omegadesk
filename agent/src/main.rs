@@ -36,6 +36,10 @@ use tracing::{info, warn};
 
 #[derive(Debug, Parser)]
 #[command(version, about = "OmegaDesk remote desktop agent")]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "independent CLI on/off flags"
+)]
 struct Args {
     /// Manage the Windows unattended-access service (install, start, ...).
     #[command(subcommand)]
