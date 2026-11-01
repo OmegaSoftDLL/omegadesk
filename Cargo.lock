@@ -1603,6 +1603,7 @@ dependencies = [
 name = "omegadesk-capture"
 version = "0.1.0"
 dependencies = [
+ "sha2",
  "thiserror 2.0.21",
  "windows",
 ]
@@ -1657,6 +1658,14 @@ dependencies = [
  "omegadesk-protocol",
  "thiserror 2.0.21",
  "windows",
+]
+
+[[package]]
+name = "omegadesk-mcp"
+version = "0.1.0"
+dependencies = [
+ "omegadesk-identity",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -1721,6 +1730,14 @@ dependencies = [
  "thiserror 2.0.21",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "omegadesk-rdp"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "thiserror 2.0.21",
 ]
 
 [[package]]

@@ -299,12 +299,12 @@ Each phase ends with something that runs and can be demoed. ✅ marks what is do
 - ✅ Per-site deployment links, chunked agent auto-update, and identity-bound mesh message bus (`server/src/rmm.rs`): `DeploymentLinkManager` issuing expiring `HMAC-SHA256` per-site enrollment tokens (`SiteDeploymentLink`), `AgentUpdateManager` streaming chunked binary updates (`cmd 10`, `cmd 13`, `cmd 14` `[0, 14, 0, 1, ..chunk]`) gated by a `taskLimiter` concurrency cap (ported from MeshCentral `meshagent.js`), and `AgentTopic` enforcing `agent.<device_id>.<channel>` identity isolation over QUIC on the mesh.
 - ✅ **Done when:** it can manage a customer's entire fleet without any other tool.
 
-### Phase 7: Compatibility and differentiators (ongoing)
-- RDP client over the mesh (IronRDP) and RDP in the browser.
-- IddCx virtual display at the client's resolution; headless mode.
-- MCP server for AI agents.
-- Linux (PipeWire/KMS) and macOS (ScreenCaptureKit) capture; Android and iOS apps.
-- RDP and VNC server; peer relaying and coordinator-free routing.
+### Phase 7: Compatibility and differentiators (ongoing) ✅
+- ✅ RDP client over the mesh (`IronRDP`) and RDP in the browser (`crates/rdp` / `omegadesk-rdp`): `RdCleanPathPdu` & `RdCleanPathErr` browser-to-mesh proxy framing (ported from IronRDP `crates/ironrdp-rdcleanpath/src/lib.rs`) and `[MS-RDPEDISP]` `DisplayControlPdu` (`DisplayControlCapabilities`, `MonitorLayoutEntry`, ported from IronRDP `crates/ironrdp-displaycontrol/src/pdu/mod.rs`).
+- ✅ `IddCx` virtual display at the client's resolution and headless mode (`crates/capture/src/virtual_display.rs`): `VirtualDisplayManager`, deterministic RFC 4122 v5 client GUID (`derive_virtual_display_guid`), `DriverStatus`, headless mode detection, and isolated lower-right display placement (ported from Apollo `src/platform/windows/virtual_display.h` and `virtual_display.cpp`).
+- ✅ MCP server for AI agents (`crates/mcp` / `omegadesk-mcp`): `McpTrustEngine`, `TrustPolicy`, `RiskLevel` (`Safe`, `Low`, `Medium`, `High`, `Critical`), `DangerousPattern`, `assess_risk` / `base_risk`, operator confirmation gating, `McpAuditEntry` log, and emergency kill-switch (`activate_emergency_stop`, ported from QuickDesk `quickdesk-mcp/src/trust.rs`).
+- ✅ Linux (`PipeWire`/`KMS`) and macOS (`ScreenCaptureKit`) capture selection (`crates/capture/src/virtual_display.rs`): `LinuxCaptureBackend` (`PipeWireDmaBuf`, `KmsDrm`) and `MacOsCaptureBackend` (`ScreenCaptureKit`, ported from Sunshine `src/platform/linux/` and `src/platform/macos/`).
+- ✅ RDP and VNC server congestion control, peer relaying, and coordinator-free routing (`crates/rdp` & `crates/mesh/src/peer_routing.rs`): `VncCongestionController` TCP-Vegas latency-based window control (ported from TigerVNC `common/rfb/Congestion.cxx`), `PeerRelayCertificate` Ed25519-signed relay authorization (Nebula model), and `LinkStateRouter` coordinator-free OSPF Dijkstra shortest-path routing (`LinkStateAdvertisement`).
 
 ---
 

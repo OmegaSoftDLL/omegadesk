@@ -15,6 +15,7 @@ mod dxgi;
 pub mod gdi;
 pub mod rotate;
 pub mod service_desktop;
+pub mod virtual_display;
 
 /// Screen capture errors.
 #[derive(Debug, thiserror::Error)]
