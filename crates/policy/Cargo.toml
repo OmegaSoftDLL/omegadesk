@@ -1,0 +1,17 @@
+[package]
+name = "omegadesk-policy"
+description = "Multi-tenant hierarchy (Tenant > DeviceGroup > Device, UserGroups), MeshCentral MESHRIGHT/SITERIGHT bitflag permissions, explicit Admin roles, and 4-layer remote-user consent"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+omegadesk-identity.workspace = true
+omegadesk-quicksupport.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

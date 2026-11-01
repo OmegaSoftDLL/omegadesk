@@ -20,6 +20,7 @@ omegadesk-transport = { path = "crates/transport" }
 omegadesk-noise = { path = "crates/noise" }
 omegadesk-tun = { path = "crates/tun" }
 omegadesk-mesh = { path = "crates/mesh" }
+omegadesk-policy = { path = "crates/policy" }
 omegadesk-session = { path = "crates/session" }
 omegadesk-quicksupport = { path = "quicksupport" }
 omegadesk-relay = { path = "relay" }

@@ -1688,6 +1688,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "omegadesk-policy"
+version = "0.1.0"
+dependencies = [
+ "omegadesk-identity",
+ "omegadesk-quicksupport",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "omegadesk-protocol"
 version = "0.1.0"
 dependencies = [

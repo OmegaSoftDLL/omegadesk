@@ -3,6 +3,7 @@
 //! (`mDNS` + signed transcript + `TOFU`).
 
 pub mod channels;
+pub mod connection_manager;
 pub mod fec;
 pub mod lan;
 pub mod qos;
@@ -11,6 +12,12 @@ pub use channels::{
     ChannelError, ChatChannel, ClipboardSync, DEFAULT_FILE_CHUNK_SIZE, FileTransferReceiver,
     FileTransferSender, MAX_CLIPBOARD_BYTES, MonitorCatalog, OPUS_SAMPLE_RATE, OpusStreamProfile,
     TerminalChannel, validate_relative_path,
+};
+pub use connection_manager::{
+    ConnectionEntry, ConnectionFolder, ConnectionProperties, ConnectionProtocol, ConnectionTree,
+    DecodedQuery, ImportError, InheritanceFlags, KeywordMatcher, TagFilter, TagFilterKind,
+    decode_keyword, import_putty_xml, import_rdcman_rdg, import_rdp_file, rectify_tag_name,
+    split_rdp_full_address,
 };
 pub use fec::{
     DEFAULT_SHARD_SIZE, FecError, MAX_TOTAL_SHARDS, adaptive_parity_count, encode_fec_block,

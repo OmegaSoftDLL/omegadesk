@@ -9,6 +9,7 @@ mod color;
 #[cfg(windows)]
 mod media_foundation;
 mod openh264_codec;
+pub mod video_region;
 
 pub use color::{bgra_to_i420, bgra_to_nv12};
 #[cfg(windows)]
