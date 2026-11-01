@@ -286,12 +286,12 @@ Each phase ends with something that runs and can be demoed. ✅ marks what is do
 - ✅ Reference enrichments for Phases 1 & 2: preferred-direct vs relay transport racer with `500 ms` priority window (`crates/transport/src/race.rs`, ported from RustDesk `src/client.rs` `race_transports_prefer_webrtc`) and dynamic video-region detector with `500 ms` lossless paint-over refresh (`crates/codec/src/video_region.rs`, ported from KasmVNC `common/rfb/EncodeManager.cxx` `updateVideoStats` and Selkies).
 - ✅ **Done when:** full access from the browser with latency at most 15 ms above the native client.
 
-### Phase 5: Security, auditing and PAM (4 weeks)
-- Session recording at the relay (`.odrec` + asciicast) and a player in the browser.
-- HuJSON policies, posture checks, per-connection MFA.
-- Access requests with approval, joining live sessions, locking and terminating sessions.
-- DLP and watermarking; credential vault.
-- **Done when:** every session is recorded and searchable, and access to a critical server requires approval.
+### Phase 5: Security, auditing and PAM (4 weeks) ✅
+- ✅ Session recording at the relay (`crates/recording` / `omegadesk-recording` + `web/src/recording-player.ts`): `.odrec` binary container with 16-byte big-endian TLV + timestamp headers (`Type(2 BE) + Flags(2 BE) + Size(4 BE) + TimestampMs(8 BE)` ported from MeshCentral `meshrelay.js` `recordingEntry`), O(log n) keyframe seek index (`KeyframeIndexEntry` ported from Guacamole `SessionRecording.js` and `recording.c`), `asciicast` v2 (`.cast`) terminal session recording, and indexed shell command storage (`CommandStorage` with risk classification ported from JumpServer `apps/terminal/`).
+- ✅ HuJSON policies, posture checks, per-connection MFA (`crates/policy/src/hujson.rs`, `posture.rs`, `mfa.rs`): `HuJSON` comment/trailing-comma sanitizer and `PolicyV2` per-node filter compiler (`groups`, `tagOwners`, `hosts`, `autogroup:member`, `autogroup:self` ported from Headscale `hscontrol/policy/v2/policy.go` and `filter.go`), endpoint posture evaluator (`OsVersionRequirement`, `ProcessRequirement`, `GeoLocationRule`, `NetworkRangeRule`), and per-connection RFC 6238 TOTP step-up verification with brute-force lockout protection (`BruteForceGuard` ported from JumpServer and Guacamole).
+- ✅ Access requests with approval, joining live sessions, locking and terminating sessions (`crates/policy/src/pam.rs`): multi-level sequential approval tickets (`AccessTicket`, `ApprovalStep` ported from JumpServer `apps/tickets/models/ticket/general.py`), priority-ordered graded ACL evaluator (`GradedAction::Accept | Reject | Review | Warn | NotifyAndWarn` ported from JumpServer `apps/acls/models/base.py`), and live session sharing (`SessionShareLink` with `ReadOnly` / `ReadWrite` permissions, `lock_session`, and `terminate_session` ported from JumpServer `apps/terminal/models/session/sharing.py` and MeshCentral `meshdesktopmultiplex.js`).
+- ✅ DLP and watermarking (`crates/session/src/dlp.rs`) and envelope credential vault (`crates/identity/src/vault.rs`): clipboard direction and byte-size limits, keystroke token-bucket rate limiter, `redact_bgra_region` screen bounding-box redaction, and dynamic `WatermarkOverlay` generator (ported from KasmVNC DLP), plus `PBKDF2-HMAC-SHA256` (`100_000` rounds) 256-bit Master `KEK` wrapping per-entry random 256-bit `DEK`s under `ChaCha20-Poly1305` AEAD with `zeroize` on drop (upgrading Remmina `remmina_crypt.c` and fixing 1Remote `UnSafeStringEncipher.cs`).
+- ✅ **Done when:** every session is recorded and searchable, and access to a critical server requires approval.
 
 ### Phase 6: RMM (4–6 weeks)
 - Inventory, scheduled scripts (PowerShell/bash), checks → alerts → templates.

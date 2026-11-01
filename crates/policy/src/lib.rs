@@ -22,6 +22,27 @@ use omegadesk_identity::DeviceId;
 use omegadesk_quicksupport::{ConsentFlags, ConsentPolicy};
 use thiserror::Error;
 
+pub mod hujson;
+pub mod mfa;
+pub mod pam;
+pub mod posture;
+
+pub use hujson::{
+    AclRuleV2, CompiledFilterRule, FilterProto, HuJsonError, PolicyNode, PolicyV2, sanitize_hujson,
+};
+pub use mfa::{
+    BruteForceGuard, ConnectionMfaChallenge, MfaError, TOTP_STEP_SECS, VerifiedConnectionGrant,
+    compute_totp_sha256, verify_totp_sha256,
+};
+pub use pam::{
+    AccessTicket, ApprovalStep, GradedAclRule, GradedAction, LiveSessionController, PamError,
+    SessionJoinRecord, SessionShareLink, SharePermission, TicketState, evaluate_graded_acls,
+};
+pub use posture::{
+    DevicePostureReport, GeoLocationRule, Ipv4Cidr, NetworkRangeRule, OsFamily,
+    OsVersionRequirement, PosturePolicy, PostureViolation, ProcessRequirement,
+};
+
 /// Policy and authorization errors.
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum PolicyError {

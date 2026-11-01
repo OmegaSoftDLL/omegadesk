@@ -1,0 +1,19 @@
+[package]
+name = "omegadesk-recording"
+description = "Relay-side append-only .odrec session recording (16-byte TLV + timestamp header + keyframe index), asciicast v2 terminal recording, and indexed command audit storage"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+bytes.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true

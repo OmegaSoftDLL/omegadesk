@@ -12,6 +12,7 @@
 //! without possessing the corresponding private key.
 
 mod store;
+pub mod vault;
 
 use std::fmt;
 
@@ -22,6 +23,10 @@ use x25519_dalek::{PublicKey as ExchangePublicKey, StaticSecret};
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 pub use store::{FileStore, KeyStore, KeyringStore, MemoryStore, StoreError, default_store};
+pub use vault::{
+    CredentialVault, EnvelopeRecord, PBKDF2_ITERATIONS, VAULT_KEY_LEN, VaultError,
+    derive_master_kek,
+};
 
 /// Length of serialized secret key material: 32 signing bytes + 32 exchange bytes.
 const SECRET_LEN: usize = 64;

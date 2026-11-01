@@ -1643,6 +1643,7 @@ dependencies = [
  "ed25519-dalek",
  "keyring",
  "rand_core 0.6.4",
+ "ring",
  "sha2",
  "thiserror 2.0.21",
  "x25519-dalek",
@@ -1693,6 +1694,8 @@ version = "0.1.0"
 dependencies = [
  "omegadesk-identity",
  "omegadesk-quicksupport",
+ "ring",
+ "sha2",
  "thiserror 2.0.21",
 ]
 
@@ -1718,6 +1721,15 @@ dependencies = [
  "thiserror 2.0.21",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "omegadesk-recording"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "proptest",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
