@@ -67,6 +67,74 @@ pub struct TargetDisplay {
     pub height: u32,
 }
 
+/// Multi-touch contact lifecycle phase (`POINTER_FLAG_DOWN | UPDATE | UP | CANCELED`
+/// on Windows `InjectSyntheticPointerInput`, `docs/plan.md` §3 line 211).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TouchPhase {
+    /// Finger touched the screen (`POINTER_FLAG_DOWN | POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT`).
+    Down,
+    /// Finger moved across the screen (`POINTER_FLAG_UPDATE | POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT`).
+    Move,
+    /// Finger lifted from the screen (`POINTER_FLAG_UP`).
+    Up,
+    /// Touch contact canceled by the system (`POINTER_FLAG_CANCELED | POINTER_FLAG_UP`).
+    Cancel,
+}
+
+/// Single multi-touch contact point in normalized `0..=65535` target-display coordinates
+/// (`POINTER_TOUCH_INFO`, `docs/plan.md` §3 line 211).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TouchContact {
+    /// Unique touch pointer identifier (`0..255`).
+    pub pointer_id: u32,
+    /// Target monitor index.
+    pub display_index: u32,
+    /// Contact phase.
+    pub phase: TouchPhase,
+    /// Normalized horizontal coordinate (`0..=65535`).
+    pub x: u32,
+    /// Normalized vertical coordinate (`0..=65535`).
+    pub y: u32,
+    /// Normalized contact pressure (`0..=1024`, default `512`).
+    pub pressure: u16,
+    /// Contact bounding-box radius in normalized units.
+    pub radius: u16,
+}
+
+/// Stylus / pen state flags (`PEN_FLAG_BARREL | PEN_FLAG_INVERTED | PEN_FLAG_ERASER`,
+/// `docs/plan.md` §3 line 211).
+pub mod pen_flags {
+    /// Stylus tip is in contact with the digitizer surface (`POINTER_FLAG_INCONTACT`).
+    pub const IN_CONTACT: u32 = 1;
+    /// Barrel button on the side of the stylus is pressed (`PEN_FLAG_BARREL`).
+    pub const BARREL_BUTTON: u32 = 1 << 1;
+    /// Stylus is inverted to the eraser end (`PEN_FLAG_INVERTED`).
+    pub const INVERTED: u32 = 1 << 2;
+    /// Eraser tip is actively erasing (`PEN_FLAG_ERASER`).
+    pub const ERASER: u32 = 1 << 3;
+}
+
+/// Stylus / pen digitizer input event (`POINTER_PEN_INFO`, `docs/plan.md` §3 line 211).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PenStylusEvent {
+    /// Target monitor index.
+    pub display_index: u32,
+    /// Normalized horizontal coordinate (`0..=65535`).
+    pub x: u32,
+    /// Normalized vertical coordinate (`0..=65535`).
+    pub y: u32,
+    /// Bitmask of [`pen_flags`].
+    pub flags: u32,
+    /// Normalized pen tip pressure (`0..=1024`, matching Windows `POINTER_PEN_INFO::pressure`).
+    pub pressure: u16,
+    /// Tilt along the X axis in degrees (`-90..=90`, matching `POINTER_PEN_INFO::tiltX`).
+    pub tilt_x: i8,
+    /// Tilt along the Y axis in degrees (`-90..=90`, matching `POINTER_PEN_INFO::tiltY`).
+    pub tilt_y: i8,
+    /// Pen barrel twist rotation in degrees (`0..=359`, matching `POINTER_PEN_INFO::rotation`).
+    pub rotation: u16,
+}
+
 /// Input injection errors.
 #[derive(Debug, thiserror::Error)]
 pub enum InputError {
@@ -99,6 +167,55 @@ pub trait InputInjector: Send {
     ///
     /// Returns an error if the operating system rejects the event.
     fn pointer(&mut self, event: &PointerEvent) -> Result<(), InputError>;
+
+    /// Injects a frame of simultaneous multi-touch contacts (`POINTER_TOUCH_INFO`).
+    ///
+    /// When the platform injector does not have a synthetic touch digitizer attached,
+    /// falls back to translating the primary contact (`contacts[0]`) into a pointer event.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the operating system rejects the event.
+    fn touch(&mut self, contacts: &[TouchContact]) -> Result<(), InputError> {
+        let Some(primary) = contacts.first() else {
+            return Ok(());
+        };
+        let buttons = match primary.phase {
+            TouchPhase::Down | TouchPhase::Move => buttons::LEFT,
+            TouchPhase::Up | TouchPhase::Cancel => 0,
+        };
+        self.pointer(&PointerEvent {
+            display_index: primary.display_index,
+            x: primary.x,
+            y: primary.y,
+            buttons,
+            wheel_x: 0,
+            wheel_y: 0,
+        })
+    }
+
+    /// Injects a stylus / pen digitizer event (`POINTER_PEN_INFO`).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the operating system rejects the event.
+    fn pen(&mut self, event: &PenStylusEvent) -> Result<(), InputError> {
+        let mut btn = 0;
+        if (event.flags & pen_flags::IN_CONTACT) != 0 {
+            btn |= buttons::LEFT;
+        }
+        if (event.flags & pen_flags::BARREL_BUTTON) != 0 {
+            btn |= buttons::RIGHT;
+        }
+        self.pointer(&PointerEvent {
+            display_index: event.display_index,
+            x: event.x,
+            y: event.y,
+            buttons: btn,
+            wheel_x: 0,
+            wheel_y: 0,
+        })
+    }
 
     /// Releases all keys and mouse buttons currently held down by this injector.
     fn release_all(&mut self);

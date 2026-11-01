@@ -4,6 +4,7 @@
 
 pub mod channels;
 pub mod connection_manager;
+pub mod deskhub;
 pub mod dlp;
 pub mod fec;
 pub mod lan;
@@ -17,8 +18,14 @@ pub use channels::{
 pub use connection_manager::{
     ConnectionEntry, ConnectionFolder, ConnectionProperties, ConnectionProtocol, ConnectionTree,
     DecodedQuery, ImportError, InheritanceFlags, KeywordMatcher, TagFilter, TagFilterKind,
-    decode_keyword, import_putty_xml, import_rdcman_rdg, import_rdp_file, rectify_tag_name,
-    split_rdp_full_address,
+    decode_keyword, import_active_directory_ldif, import_putty_xml, import_rdcman_rdg,
+    import_rdp_file, rectify_tag_name, split_rdp_full_address,
+};
+pub use deskhub::{
+    BASE_VISIBLE_TILE_SHARE_BPS, DEFAULT_DESKHUB_TOTAL_BUDGET_BPS,
+    DEFAULT_THUMBNAIL_DEMAND_CAP_BPS, DeskHubBandwidthAllocator, DeskHubError,
+    DeskHubTileAllocation, DeskHubTileDemand, FOCUSED_TILE_WEIGHT, GroupControlState,
+    MAX_CONCURRENT_BATCH_TASKS, MAX_DESKHUB_BITRATE_BPS, PreviewSubscription, TileVisibility,
 };
 pub use dlp::{
     ClipboardDirection, DlpEnforcer, DlpPolicy, DlpViolation, RedactedRegion, WatermarkConfig,

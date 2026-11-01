@@ -32,8 +32,9 @@ pub use hujson::{
     AclRuleV2, CompiledFilterRule, FilterProto, HuJsonError, PolicyNode, PolicyV2, sanitize_hujson,
 };
 pub use mfa::{
-    BruteForceGuard, ConnectionMfaChallenge, MfaError, TOTP_STEP_SECS, VerifiedConnectionGrant,
-    compute_totp_sha256, verify_totp_sha256,
+    BruteForceGuard, ConnectionMfaChallenge, FederatedIdentityClaim, IdentityProviderKind,
+    MfaError, TOTP_STEP_SECS, VerifiedConnectionGrant, WebAuthnPasskeyRecord, compute_totp_sha256,
+    verify_totp_sha256,
 };
 pub use pam::{
     AccessTicket, ApprovalStep, GradedAclRule, GradedAction, LiveSessionController, PamError,
