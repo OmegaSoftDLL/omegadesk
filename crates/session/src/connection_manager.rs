@@ -840,8 +840,7 @@ fn parse_xml_document(xml: &str) -> Result<XmlElement, ImportError> {
             continue;
         }
 
-        let end = rest
-            .find('>')
+        let end = find_tag_end(rest)
             .ok_or_else(|| ImportError::InvalidXml("unterminated tag".to_owned()))?;
         let tag = &rest[1..end];
         rest = &rest[end + 1..];
@@ -881,6 +880,21 @@ fn parse_xml_document(xml: &str) -> Result<XmlElement, ImportError> {
         )));
     }
     root.ok_or_else(|| ImportError::InvalidXml("document has no root element".to_owned()))
+}
+
+/// Byte index of the `>` that closes the tag starting at `tag[0] == '<'`, skipping any
+/// `>` inside single- or double-quoted attribute values (`name="Ops > Lab"`).
+fn find_tag_end(tag: &str) -> Option<usize> {
+    let mut quote: Option<char> = None;
+    for (idx, ch) in tag.char_indices().skip(1) {
+        match (quote, ch) {
+            (Some(open), c) if c == open => quote = None,
+            (None, '"' | '\'') => quote = Some(ch),
+            (None, '>') => return Some(idx),
+            _ => {}
+        }
+    }
+    None
 }
 
 fn attach_element(
@@ -960,13 +974,27 @@ struct RdgConnectionInfo {
     display_name: Option<String>,
 }
 
-fn rdg_connection_info(node: &XmlElement, schema_v1: bool) -> RdgConnectionInfo {
-    // Version 2.2 (schema 1) stores the name at the element root; 2.7 (schema 3) wraps it in <properties>.
-    let props_node = if schema_v1 {
+/// `is_container` is true for `<file>` / `<group>` elements. In schema 1 (`RDCMan` 2.2) a
+/// container wraps *all* of its settings (name, `logonCredentials`, ...) in `<properties>`
+/// (`ImportContainer`: `containerPropertiesNode = node.SelectSingleNode("./properties")`),
+/// while a schema-1 server keeps them at its own root; in schema 3 (`RDCMan` 2.7) only
+/// `name` / `displayName` live in `<properties>` and the settings sections are direct children.
+fn rdg_connection_info(
+    node: &XmlElement,
+    schema_v1: bool,
+    is_container: bool,
+) -> RdgConnectionInfo {
+    let settings_node = if schema_v1 && is_container {
+        node.child("properties").unwrap_or(node)
+    } else {
         node
+    };
+    let props_node = if schema_v1 {
+        settings_node
     } else {
         node.child("properties").unwrap_or(node)
     };
+    let node = settings_node;
     let hostname = props_node.child_text("name");
     let display_name = props_node
         .child_text("displayName")
@@ -1063,7 +1091,7 @@ impl RdgImporter {
     ) -> Result<(), ImportError> {
         self.group_counter += 1;
         let folder_id = format!("rdg-group-{}", self.group_counter);
-        let info = rdg_connection_info(node, self.schema_v1);
+        let info = rdg_connection_info(node, self.schema_v1, true);
         let name = info
             .display_name
             .or(info.hostname)
@@ -1093,7 +1121,7 @@ impl RdgImporter {
         parent_id: Option<&str>,
     ) -> Result<(), ImportError> {
         self.server_counter += 1;
-        let info = rdg_connection_info(node, self.schema_v1);
+        let info = rdg_connection_info(node, self.schema_v1, false);
         let hostname = info
             .hostname
             .filter(|h| !h.is_empty())
@@ -1931,6 +1959,112 @@ dNSHostName: sql01.omega.local
                 .name,
             "R&D Lab"
         );
+    }
+
+    /// Regression for the PR #38 review: `>` inside a quoted attribute value is not the
+    /// end of the tag.
+    #[test]
+    fn xml_parser_allows_greater_than_inside_quoted_attributes() {
+        let putty_xml = r#"
+<configuration>
+  <root type="database" name="Ops > Lab">
+    <container type="folder" name='a > "b" > c'>
+      <connection type="PuTTY" name="x">
+        <connection_info><name>x</name><protocol>SSH</protocol><host>x.example</host><port>22</port></connection_info>
+      </connection>
+    </container>
+  </root>
+</configuration>
+"#;
+        let tree = import_putty_xml(putty_xml).unwrap();
+        let conn = &tree.entries()[0];
+        let folder = tree
+            .folder(conn.parent_folder_id.as_deref().unwrap())
+            .unwrap();
+        assert_eq!(folder.name, "a > \"b\" > c");
+        let root = tree.folder(folder.parent_id.as_deref().unwrap()).unwrap();
+        assert_eq!(root.name, "Ops > Lab");
+        // An unterminated quote is still an error, not a panic.
+        assert!(matches!(
+            import_putty_xml(
+                r#"<configuration><root type="database" name="x></root></configuration>"#
+            ),
+            Err(ImportError::InvalidXml(_))
+        ));
+    }
+
+    /// Regression for the PR #38 review: `RDCMan` schema 1 (v2.2) containers wrap their
+    /// name and settings sections in `<properties>`; servers keep them at the root.
+    #[test]
+    fn rdcman_schema_1_containers_read_settings_from_properties() {
+        let rdg_xml = r#"
+<RDCMan schemaVersion="1">
+  <version>2.2</version>
+  <file>
+    <properties>
+      <name>Legacy File</name>
+      <logonCredentials inherit="None">
+        <userName>file_admin</userName>
+        <domain>LEGACY</domain>
+      </logonCredentials>
+    </properties>
+    <group>
+      <properties>
+        <name>Legacy Group</name>
+        <connectionSettings inherit="None">
+          <connectToConsole>True</connectToConsole>
+          <port>3391</port>
+        </connectionSettings>
+      </properties>
+      <server>
+        <name>legacy-01</name>
+        <displayName>Legacy 01</displayName>
+        <logonCredentials inherit="None">
+          <userName>server_user</userName>
+        </logonCredentials>
+      </server>
+      <server>
+        <name>legacy-02</name>
+      </server>
+    </group>
+  </file>
+</RDCMan>
+"#;
+        let tree = import_rdcman_rdg(rdg_xml).unwrap();
+        assert_eq!(tree.entries().len(), 2);
+        let srv1 = tree
+            .entries()
+            .iter()
+            .find(|e| e.hostname == "legacy-01")
+            .unwrap();
+        let srv2 = tree
+            .entries()
+            .iter()
+            .find(|e| e.hostname == "legacy-02")
+            .unwrap();
+        assert_eq!(srv1.display_name, "Legacy 01");
+
+        let group = tree
+            .folder(srv1.parent_folder_id.as_deref().unwrap())
+            .unwrap();
+        assert_eq!(group.name, "Legacy Group");
+        assert!(group.properties.use_console_session);
+        assert_eq!(group.properties.port, 3391);
+        let file = tree.folder(group.parent_id.as_deref().unwrap()).unwrap();
+        assert_eq!(file.name, "Legacy File");
+        assert_eq!(file.properties.username, "file_admin");
+
+        // Server 1 overrides the user; server 2 inherits the file's credentials and the
+        // group's console/port settings through the hierarchy.
+        assert_eq!(
+            tree.effective_entry_properties(srv1).username,
+            "server_user"
+        );
+        let eff2 = tree.effective_entry_properties(srv2);
+        assert_eq!(eff2.username, "file_admin");
+        assert_eq!(eff2.domain, "LEGACY");
+        assert!(eff2.use_console_session);
+        assert_eq!(eff2.port, 3391);
     }
 
     #[test]

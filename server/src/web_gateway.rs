@@ -640,25 +640,38 @@ impl FrameBackpressureGate {
         self.in_flight.push_back((frame_id, now));
     }
 
-    /// Processes a `CLIENT_FRAME_ACK` for `acked_id` at `now` (`websockets_mode.py:34-39, 156`).
+    /// Number of transmitted frames not yet acknowledged.
+    #[must_use]
+    pub fn in_flight_len(&self) -> usize {
+        self.in_flight.len()
+    }
+
+    /// Processes a browser frame ACK (`0x06`, see [`WEB_VIDEO_PROTOCOL`]) for `acked_id` at `now`.
+    ///
+    /// ACKs are **per frame**, not cumulative: `web/src/video-worker.ts` acknowledges every
+    /// frame it receives, after rendering it or immediately when it discards it. Only the
+    /// matching in-flight entry is removed, so a discard ACK for frame 7 while frames 1–6
+    /// are still inside the decoder leaves that backlog visible to
+    /// [`Self::should_drop_delta_frame`] (Selkies' newest-id cumulative ACK would hide it).
+    /// The RTT sample comes from the matched send time (`websockets_mode.py:156`); an ACK
+    /// for an unknown id still counts as a liveness signal.
     pub fn record_frame_ack(&mut self, acked_id: u16, now: Instant) {
         self.last_ack_at = Some(now);
         self.last_acked_id = Some(acked_id);
 
-        while let Some(&(sent_id, sent_at)) = self.in_flight.front() {
-            let diff = acked_id.wrapping_sub(sent_id);
-            if diff > FRAME_ID_SUSPICIOUS_GAP_THRESHOLD {
-                break;
-            }
-            self.in_flight.pop_front();
-            if sent_id == acked_id {
-                #[allow(clippy::cast_possible_truncation)]
-                let sample_ms = now.saturating_duration_since(sent_at).as_millis() as u64;
-                if sample_ms <= RTT_SAMPLE_SANE_MAX_MS {
-                    // EWMA smoothing (7/8 old + 1/8 new).
-                    self.smoothed_rtt_ms = (self.smoothed_rtt_ms * 7 + sample_ms) / 8;
-                }
-                break;
+        let Some(index) = self
+            .in_flight
+            .iter()
+            .position(|&(sent_id, _)| sent_id == acked_id)
+        else {
+            return;
+        };
+        if let Some((_, sent_at)) = self.in_flight.remove(index) {
+            #[allow(clippy::cast_possible_truncation)]
+            let sample_ms = now.saturating_duration_since(sent_at).as_millis() as u64;
+            if sample_ms <= RTT_SAMPLE_SANE_MAX_MS {
+                // EWMA smoothing (7/8 old + 1/8 new).
+                self.smoothed_rtt_ms = (self.smoothed_rtt_ms * 7 + sample_ms) / 8;
             }
         }
     }
@@ -862,6 +875,7 @@ fn named_keysym(code: &str, key: &str) -> Option<u32> {
         "NumLock" => 0xFF7F,
         "PrintScreen" => 0xFF61,
         "ContextMenu" => 0xFF67,
+        "KanaMode" => 0xFF2E, // XK_Kana_Shift (noVNC `domkeytable.js`)
         "Home" if numpad => 0xFF95,
         "Home" => 0xFF50,
         "ArrowLeft" if numpad => 0xFF96,
@@ -1113,6 +1127,41 @@ mod tests {
         assert!(gate.is_client_stalled(resume + STALLED_CLIENT_TIMEOUT));
     }
 
+    /// Regression for the PR #38 review: a discard ACK for a newer frame must not clear
+    /// the older frames still inside the browser decoder from the in-flight queue.
+    #[test]
+    fn frame_acks_are_per_frame_and_keep_decoder_backlog_visible() {
+        let mut gate = FrameBackpressureGate::new();
+        let t0 = Instant::now();
+        for id in 1..=7u16 {
+            gate.record_frame_sent(id, t0 + Duration::from_millis(u64::from(id) * 10));
+        }
+        assert_eq!(gate.in_flight_len(), 7);
+
+        // Frame 7 is discarded by the worker (queue overflow) and ACKed at once.
+        gate.record_frame_ack(7, t0 + Duration::from_millis(75));
+        assert_eq!(
+            gate.in_flight_len(),
+            6,
+            "frames 1-6 are still decoding and must stay in flight"
+        );
+        assert!(gate.should_drop_delta_frame(t0 + Duration::from_secs(1)));
+
+        // Out-of-order and duplicate ACKs only touch their own entry.
+        gate.record_frame_ack(3, t0 + Duration::from_millis(80));
+        gate.record_frame_ack(3, t0 + Duration::from_millis(81));
+        assert_eq!(gate.in_flight_len(), 5);
+        gate.record_frame_ack(42, t0 + Duration::from_millis(82)); // unknown id: liveness only
+        assert_eq!(gate.in_flight_len(), 5);
+        assert!(!gate.is_client_stalled(t0 + Duration::from_secs(4)));
+
+        for id in [1u16, 2, 4, 5, 6] {
+            gate.record_frame_ack(id, t0 + Duration::from_millis(90));
+        }
+        assert_eq!(gate.in_flight_len(), 0);
+        assert!(!gate.should_drop_delta_frame(t0 + Duration::from_secs(1)));
+    }
+
     /// Regression for #28 `video.ts:68`: one video/ACK contract for both sides, pinned
     /// by fixtures that `web/src/video.ts` (`VIDEO_FRAME_FIXTURE`, `FRAME_ACK_FIXTURE`)
     /// decodes and encodes identically.
@@ -1224,6 +1273,7 @@ mod tests {
         expect("ScrollLock", "ScrollLock", 0x47, 0x46, 0xFF14);
         expect("PrintScreen", "PrintScreen", 0x46, 0x137, 0xFF61);
         expect("ContextMenu", "ContextMenu", 0x65, 0x15D, 0xFF67);
+        expect("KanaMode", "KanaMode", 0x88, 0x70, 0xFF2E);
         // Numpad: XK_KP_* keysyms (noVNC `domkeytable.js` addNumpad).
         expect("Numpad0", "0", 0x62, 0x52, 0xFFB0);
         expect("Numpad9", "9", 0x61, 0x49, 0xFFB9);

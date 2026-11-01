@@ -15,7 +15,9 @@
  *   (waiting for a keyframe, decode-queue overflow, decoder not configured, decoder
  *   reset) is ACKed **immediately** with `discarded: true` so it leaves the
  *   gateway's in-flight queue instead of being counted as decode backlog or
- *   mistaken for a stalled client.
+ *   mistaken for a stalled client. ACKs are per frame: the gateway's
+ *   `FrameBackpressureGate::record_frame_ack` removes only the acknowledged id, so a
+ *   discard ACK for frame 7 never hides frames 1–6 that are still decoding.
  * - A recoverable decoder error recreates and configures the decoder from the
  *   captured configuration and asks for a keyframe; an unsupported configuration
  *   (or repeated failures without a single decoded frame) is reported as `fatal`.
