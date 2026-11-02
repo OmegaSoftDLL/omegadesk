@@ -54,7 +54,7 @@ openh264 = "0.9"
 prost = "0.13"
 prost-build = "0.13"
 proptest = "1"
-protox = "0.7"
+protox = "0.10"
 quinn = { version = "0.11", default-features = false, features = ["log", "runtime-tokio", "rustls-ring"] }
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring"] }
 ring = "0.17"
