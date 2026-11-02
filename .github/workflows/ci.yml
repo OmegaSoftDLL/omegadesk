@@ -60,11 +60,35 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # Linux screen capture links libpipewire (pipewire-sys runs bindgen), and the
+      # capture smoke test needs a virtual X server (Xvfb). See docs/plan.md Phase 7.
+      - name: Install Linux capture dependencies
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libpipewire-0.3-dev clang libclang-dev pkg-config xvfb
       # Installs the toolchain pinned in rust-toolchain.toml.
       - run: rustup toolchain install
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: cargo clippy --workspace --all-targets --all-features --locked
-      - run: cargo test --workspace --all-features --locked
+      # On Linux the capture smoke test runs against a disposable virtual display.
+      - name: Test (Linux, under Xvfb)
+        if: matrix.os == 'ubuntu-latest'
+        env:
+          CARGO_BUILD_JOBS: "2"
+          OMEGADESK_CAPTURE_BACKEND: x11
+        run: |
+          Xvfb :99 -screen 0 1280x720x24 -ac -nolisten unix -listen tcp &
+          xvfb_pid=$!
+          trap 'kill "$xvfb_pid" 2>/dev/null || true' EXIT
+          sleep 2
+          DISPLAY=localhost:99 timeout --signal=TERM --kill-after=10s 15m cargo test --workspace --all-features --locked -- --test-threads=2 --nocapture
+      - name: Test (Windows and macOS)
+        if: matrix.os != 'ubuntu-latest'
+        run: cargo test --workspace --all-features --locked
+      - name: Agent starts on every platform
+        run: cargo run -p omegadesk-agent --locked -- --help
 
   web:
     name: Browser client
@@ -98,6 +122,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Install Linux capture dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libpipewire-0.3-dev clang libclang-dev pkg-config
       - run: rustup toolchain install "$MSRV" --profile minimal
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: cargo +"$MSRV" check --workspace --all-targets --locked
@@ -113,6 +142,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Install Linux capture dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libpipewire-0.3-dev clang libclang-dev pkg-config
       - run: rustup toolchain install
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: cargo doc --workspace --no-deps --all-features --locked

@@ -41,40 +41,71 @@ omegadesk-server = { path = "server" }
 anyhow = "1"
 # Text-only OS clipboard (MIT OR Apache-2.0); `image-data` would pull the `image` crate.
 arboard = { version = "3.7", default-features = false }
+# Linux screen capture: xdg-desktop-portal ScreenCast negotiation (MIT).
+ashpd = { version = "0.13", default-features = false, features = ["tokio", "screencast"] }
+async-trait = "0.1"
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "ws"] }
+block2 = "0.6"
 bytes = "1"
 clap = { version = "4", features = ["derive", "env"] }
 data-encoding = "2"
+dispatch2 = "0.3"
 if-addrs = "0.13"
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 ed25519-dalek = { version = "2", features = ["rand_core", "zeroize", "pkcs8"] }
+# IronRDP (MIT OR Apache-2.0). The API is still 0.x, so every crate is pinned
+# exactly (docs/plan.md §2.6); the set below is the last one whose `rust-version`
+# is within our MSRV.
+ironrdp-bulk = "=0.1.1"
+ironrdp-connector = "=0.10.0"
+ironrdp-core = "=0.2.1"
+ironrdp-displaycontrol = "=0.8.0"
+ironrdp-graphics = "=0.9.0"
+ironrdp-pdu = "=0.9.0"
+ironrdp-rdcleanpath = "=0.2.2"
+ironrdp-server = { version = "=0.13.0", default-features = false }
+ironrdp-session = "=0.11.0"
+ironrdp-tokio = "=0.10.0"
 keyring = { version = "3", features = ["apple-native", "windows-native"] }
 libc = "0.2"
+# macOS screen capture: CoreGraphics display capture (MIT OR Apache-2.0 OR Zlib).
+objc2-core-foundation = "0.3"
+objc2-core-graphics = { version = "0.3", features = ["objc2-io-surface"] }
+objc2-io-surface = "0.3"
 openh264 = "0.9"
+# Linux screen capture: PipeWire client library bindings (MIT).
+pipewire = "0.10"
 prost = "0.13"
 prost-build = "0.13"
 proptest = "1"
 protox = "0.7"
 quinn = { version = "0.11", default-features = false, features = ["log", "runtime-tokio", "rustls-ring"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring"] }
 ring = "0.17"
+# Model Context Protocol SDK (Apache-2.0).
+rmcp = { version = "3.8", default-features = false, features = ["server", "macros", "transport-io", "elicitation"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 os_info = { version = "3", default-features = false }
-softbuffer = "0.4"
-rand_core = { version = "0.6", features = ["getrandom"] }
+schemars = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
+softbuffer = "0.4"
 sysinfo = { version = "0.38", default-features = false, features = ["system", "disk", "network", "user"] }
 tempfile = "3"
 tokio-tungstenite = "0.29"
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 windows = "0.62"
 winit = { version = "0.30", default-features = false, features = ["rwh_06", "x11", "wayland", "wayland-dlopen"] }
+# Linux screen capture: X11 fallback, pure Rust (MIT OR Apache-2.0).
+x11rb = { version = "0.14", features = ["randr"] }
 x25519-dalek = { version = "2", features = ["static_secrets", "zeroize"] }
+x509-cert = { version = "0.2", features = ["std"] }
 zeroize = { version = "1", features = ["derive"] }
 
 [workspace.lints.rust]

@@ -11,6 +11,20 @@ publish.workspace = true
 [dependencies]
 sha2.workspace = true
 thiserror.workspace = true
+tracing.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+ashpd.workspace = true
+pipewire.workspace = true
+tokio = { workspace = true, features = ["rt", "time"] }
+x11rb.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+block2.workspace = true
+dispatch2.workspace = true
+objc2-core-foundation.workspace = true
+objc2-core-graphics.workspace = true
+objc2-io-surface.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows = { workspace = true, features = [

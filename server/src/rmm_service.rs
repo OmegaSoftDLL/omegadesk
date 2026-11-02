@@ -1959,7 +1959,7 @@ mod tests {
         );
         let mut forged = token.to_owned();
         forged.pop();
-        forged.push('0');
+        forged.push(if forged.ends_with('0') { '1' } else { '0' });
         assert!(
             service
                 .redeem_deployment_token(installer, &forged, 100)

@@ -102,7 +102,7 @@ This plan brings together the code analysis of the 39 reference repositories (li
 | Congestion algorithm and per-region encoder selection | TigerVNC `Congestion.cxx`, `EncodeManager.cxx` |
 | VNC/RFB compatibility mode | TigerVNC (later phase) |
 
-IronRDP versions are pinned exactly (the API is still 0.x).
+IronRDP versions are pinned exactly (the API is still 0.x). Implemented in Phase 7: `omegadesk-rdp` depends on `ironrdp-connector`/`-session`/`-tokio`/`-pdu`/`-core`/`-graphics`/`-bulk`/`-rdcleanpath`/`-displaycontrol` and terminates RDP to an existing server, feeding the OmegaDesk video pipeline (see Phase 7). `ironrdp-server` is used server-side only by the loopback test for now.
 
 ### 2.7 Management, permissions and multi-tenancy
 
@@ -253,6 +253,7 @@ Each phase ends with something that runs and can be demoed.
 Status legend:
 
 - ✅ implemented, wired into a binary and verified;
+- 🔶 implemented, field validation pending;
 - 🧩 library code exists but is not wired into any binary, or has the known defects listed below;
 - ⬜ not started.
 
@@ -321,12 +322,12 @@ Phases 2–7 were marked complete on 2026-11-01 by an automated agent; the audit
 - ⬜ Field validation on a real fleet, Windows Update counts, webhook delivery, agent self-update over the mesh.
 - ⬜ **Done when:** it can manage a customer's entire fleet without any other tool.
 
-### Phase 7: Compatibility and differentiators (ongoing) ⬜
-- 🧩 `crates/rdp`: `RDCleanPath` and `DisplayControl` structures were re-typed from IronRDP with a custom byte encoding instead of IronRDP's DER, so they do not interoperate with Devolutions Gateway; `omegadesk-rdp` does not depend on any `ironrdp-*` crate and there is no RDP client or server.
+### Phase 7: Compatibility and differentiators (ongoing) 🔶
+- 🔶 **RDP bridge on IronRDP** (`crates/rdp`): `omegadesk-rdp` now depends on the real `ironrdp-*` crates (pinned exactly, the API is 0.x). The hand-rolled PDU encoders are gone: `RDCleanPath` and `[MS-RDPEDISP]` DisplayControl are re-exported from `ironrdp-rdcleanpath`/`ironrdp-displaycontrol` (DER, so they interoperate with Devolutions Gateway and the IronRDP web client). `RdpBridge` terminates an existing RDP server (Windows Remote Desktop, xrdp, `ironrdp-server`) with `ironrdp-connector` + `ironrdp-session` over TLS + CredSSP/NLA, pins the server certificate (trust-on-first-use or an explicit SHA-256), composites the framebuffer into an `omegadesk-capture::Capturer`, and forwards fast-path keyboard/mouse input — so the regular capture → `omegadesk-codec` → QUIC pipeline streams an RDP machine unchanged. Scope: output + fast-path input over TLS+NLA with lossless 32-bit bitmap updates (no Kerberos, EGFX/RemoteFX, audio, clipboard or drive redirection yet). Verified in-process against `ironrdp-server` (`crates/rdp/tests/bridge_loopback.rs`: framebuffer, input, certificate pinning, wrong-password failure). The tested `VncCongestionController` (TigerVNC TCP-Vegas) is kept. **Done when:** wired into the agent/web gateway as a selectable session type and tested against a real Windows host.
+- 🔶 **MCP server** (`crates/mcp`): `omegadesk-mcp` is a real Model Context Protocol server over stdio (`rmcp`). Read-only tools (`list_devices` from the coordinator netmap, `session_status`, `assess_risk`, `audit_log`) answer immediately; guarded actions (`start_session`/`stop_session` launching `omegadesk-client`, `run_script` on the host) are gated by the existing `McpTrustEngine` — risk classification, operator confirmation through the MCP protocol (elicitation on ≤2025-11-25, `input_required` on 2026-07-28), audit trail and emergency kill-switch. Verified with an in-process `rmcp` client (`crates/mcp/tests/mcp_inprocess.rs`: tool listing, read-only tools, a guarded tool confirmed/declined through the trust engine on both confirmation paths, kill-switch). **Done when:** the coordinator exposes device credentials to the server so `start_session` needs no separately supplied password.
+- 🔶 **Linux and macOS capture** (`crates/capture`): real backends behind the same `Capturer`/`Frame` contract, so `agent/src/capture_loop.rs` is unchanged. Linux: PipeWire via the `xdg-desktop-portal` ScreenCast portal (`ashpd` + `pipewire`), with a pure-Rust X11 `GetImage` fallback (`x11rb`) for headless CI. macOS: `CGDisplayStream` (`objc2-core-graphics` + `IOSurface`) on a serial dispatch queue, gated on the Screen Recording permission. The agent builds and `--help` runs on all three OSes in CI; a capture smoke test runs on Linux CI under `xvfb-run` (`crates/capture/tests/linux_smoke.rs`). **Done when:** validated on a real Wayland session (PipeWire) and a macOS host with `CGDisplayStream`.
 - ✅ `drivers/idd`: a real, working IddCx virtual display. The MIT-licensed QuickDesk driver is vendored under `drivers/idd/vendor/` — the kernel driver ships **prebuilt and signed** (`quickdesk_display.dll/.cat/.inf`, not built in CI since it needs the WDK) and `build.rs` compiles the user-mode controller with the normal Windows SDK. `omegadesk-idd` exposes a safe API (`VirtualDisplay::install`/`open`/`is_installed`/`uninstall`, `plug_monitor`, `MonitorHandle::set_mode`/`unplug`) installed via the bundled `nefconw.exe`; Windows-only, with a clear `Unsupported` error elsewhere. Wired into the agent as `--virtual-display <WxH@hz>` (headless hosts) and a `--privacy` mode that blanks the physical monitor, backing the `crates/capture/src/virtual_display.rs` placement model with the driver.
-- 🧩 `crates/mcp`: only QuickDesk's trust policy was ported; there is no MCP server, transport or JSON-RPC.
-- ⬜ Linux (PipeWire/KMS) and macOS (ScreenCaptureKit) capture: only backend-selection enums exist; `open_display` returns `Unsupported` off Windows.
-- 🧩 `crates/mesh/src/peer_routing.rs` (link-state routing, relay certificates) and `VncCongestionController` are libraries with no consumer.
+- 🧩 `crates/mesh/src/peer_routing.rs` (link-state routing, relay certificates) is a library with no consumer.
 - ⬜ Mobile apps, VNC/RFB compatibility mode and coordinator-free operation are not started.
 - 🧩 Items added by the 2026-11-01 "audit" PRs (`NodeKeyCertificate`, `UnattendedVerifier`, SSO/WebAuthn records, LDIF import, `DeskHub`, webhooks, touch/pen types, DERP region selector, lazy connections, HDR tone mapping, SSH ACL rules, hierarchical CIDRs) are unwired library code. The dead `client/src/pacer.rs` was removed: the client already bounds latency with a 3-frame decode queue and latest-frame presentation (`client/src/network.rs`).
 

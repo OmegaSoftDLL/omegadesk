@@ -1,6 +1,6 @@
 [package]
 name = "omegadesk-rdp"
-description = "RDP over the mesh (IronRDP DisplayControl & browser RDCleanPath) and TigerVNC TCP-Vegas RFB congestion control"
+description = "RDP bridge on IronRDP: terminates RDP to an existing server and feeds the OmegaDesk video pipeline; RDCleanPath and DisplayControl re-exports; TigerVNC congestion control"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,8 +9,32 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
-bytes.workspace = true
+data-encoding.workspace = true
+ironrdp-bulk.workspace = true
+ironrdp-connector.workspace = true
+ironrdp-core.workspace = true
+ironrdp-displaycontrol.workspace = true
+ironrdp-graphics.workspace = true
+ironrdp-pdu.workspace = true
+ironrdp-rdcleanpath.workspace = true
+ironrdp-session.workspace = true
+ironrdp-tokio.workspace = true
+omegadesk-capture.workspace = true
+rustls.workspace = true
+sha2.workspace = true
 thiserror.workspace = true
+tokio.workspace = true
+tokio-rustls.workspace = true
+tracing.workspace = true
+x509-cert.workspace = true
+
+[dev-dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+ironrdp-server.workspace = true
+rcgen.workspace = true
+tracing-subscriber.workspace = true
 
 [lints]
 workspace = true
