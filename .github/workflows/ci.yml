@@ -72,13 +72,18 @@ jobs:
       - run: rustup toolchain install
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: cargo clippy --workspace --all-targets --all-features --locked
-      # On Linux the capture smoke test runs against a virtual display under xvfb-run.
+      # On Linux the capture smoke test runs against a disposable virtual display.
       - name: Test (Linux, under Xvfb)
         if: matrix.os == 'ubuntu-latest'
         env:
           CARGO_BUILD_JOBS: "2"
           OMEGADESK_CAPTURE_BACKEND: x11
-        run: timeout --signal=TERM --kill-after=10s 15m xvfb-run -a cargo test --workspace --all-features --locked -- --test-threads=2 --nocapture
+        run: |
+          Xvfb :99 -screen 0 1280x720x24 -ac -nolisten unix -listen tcp &
+          xvfb_pid=$!
+          trap 'kill "$xvfb_pid" 2>/dev/null || true' EXIT
+          sleep 2
+          DISPLAY=localhost:99 timeout --signal=TERM --kill-after=10s 15m cargo test --workspace --all-features --locked -- --test-threads=2 --nocapture
       - name: Test (Windows and macOS)
         if: matrix.os != 'ubuntu-latest'
         run: cargo test --workspace --all-features --locked
