@@ -1070,7 +1070,11 @@ mod tests {
         // Give the agent time to process the control messages, then end the session.
         tokio::time::sleep(Duration::from_millis(300)).await;
         connection.close(0u32.into(), b"done");
-        let _ = tokio::time::timeout(Duration::from_secs(10), agent).await;
+        tokio::time::timeout(Duration::from_secs(45), agent)
+            .await
+            .expect("agent session did not stop")
+            .expect("agent task panicked")
+            .expect("agent session failed");
 
         let kinds = audit_kinds(&dir);
         assert_eq!(
