@@ -1,0 +1,17 @@
+{
+  "name": "OmegaDesk Rust 1.90+ Sovereign Development Environment",
+  "image": "mcr.microsoft.com/devcontainers/rust:1-1-bookworm",
+  "postCreateCommand": "rustup toolchain install 1.90.0 && rustup default 1.90.0 && cargo --version",
+  "customizations": {
+    "vscode": {
+      "settings": {
+        "files.eol": "\n",
+        "rust-analyzer.check.command": "clippy"
+      },
+      "extensions": [
+        "rust-lang.rust-analyzer",
+        "tamasfe.even-better-toml"
+      ]
+    }
+  }
+}

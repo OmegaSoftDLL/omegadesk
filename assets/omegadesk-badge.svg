@@ -1,0 +1,88 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="13 13 134 134" width="160" height="160" role="img" aria-labelledby="odBadgeTitle odBadgeDesc">
+  <title id="odBadgeTitle">OmegaDesk — Sovereign Low-Latency Remote Desktop Emblem</title>
+  <desc id="odBadgeDesc">Animated circular medallion featuring the glowing cyan and electric-blue OmegaDesk (Ω) + QUIC lightning + zero-copy screen capture frame.</desc>
+
+  <defs>
+    <radialGradient id="odAura" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#00D2FF" stop-opacity="0.34"/>
+      <stop offset="60%" stop-color="#2563EB" stop-opacity="0.14"/>
+      <stop offset="100%" stop-color="#050811" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="odMedallion" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0A1328"/>
+      <stop offset="55%" stop-color="#060B18"/>
+      <stop offset="100%" stop-color="#0F1B36"/>
+    </linearGradient>
+    <linearGradient id="odRim" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#00F5D4"/>
+      <stop offset="45%" stop-color="#00D2FF"/>
+      <stop offset="80%" stop-color="#3B82F6"/>
+      <stop offset="100%" stop-color="#F97316"/>
+    </linearGradient>
+    <linearGradient id="odOmega" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#F8FAFC"/>
+      <stop offset="50%" stop-color="#38BDF8"/>
+      <stop offset="100%" stop-color="#00F5D4"/>
+    </linearGradient>
+    <linearGradient id="odBolt" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#FDE047"/>
+      <stop offset="100%" stop-color="#F97316"/>
+    </linearGradient>
+    <filter id="odGlow" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur stdDeviation="2.2" result="blur"/>
+      <feComposite in="SourceGraphic" in2="blur" operator="over"/>
+    </filter>
+    <style>
+      @keyframes odPulse {
+        0%, 100% { opacity: 0.93; transform: scale(1); }
+        50% { opacity: 1; transform: scale(1.025); }
+      }
+      @keyframes odOrbit {
+        to { stroke-dashoffset: -32; }
+      }
+      .od-core {
+        transform-box: fill-box;
+        transform-origin: center;
+        animation: odPulse 3.6s ease-in-out infinite;
+      }
+      .od-ring {
+        stroke-dasharray: 5 3;
+        animation: odOrbit 2.2s linear infinite;
+      }
+      @media (prefers-reduced-motion: reduce) {
+        .od-core, .od-ring { animation: none !important; }
+      }
+    </style>
+  </defs>
+
+  <!-- Feathered Bioluminescent Aura -->
+  <circle cx="80" cy="80" r="66" fill="url(#odAura)"/>
+
+  <!-- Obsidian Medallion & Prismatic Rim -->
+  <circle cx="80" cy="80" r="61" fill="url(#odMedallion)" stroke="url(#odRim)" stroke-width="2.6"/>
+  <circle cx="80" cy="80" r="55" fill="none" stroke="#1E3A8A" stroke-width="1.1" class="od-ring"/>
+
+  <!-- Screen Capture Corner Brackets -->
+  <g stroke="#38BDF8" stroke-width="2.2" stroke-linecap="round" fill="none" opacity="0.85">
+    <path d="M 42 52 L 42 42 L 52 42"/>
+    <path d="M 108 42 L 118 42 L 118 52"/>
+    <path d="M 42 108 L 42 118 L 52 118"/>
+    <path d="M 108 118 L 118 118 L 118 108"/>
+  </g>
+
+  <!-- Central Omega (Ω) + QUIC Lightning Core -->
+  <g class="od-core" filter="url(#odGlow)">
+    <!-- Sculpted Omega (Ω) Arch -->
+    <path d="M 52 104 L 66 104 L 66 95 C 55 89, 50 77, 52 65 C 55 51, 67 43, 80 43 C 93 43, 105 51, 108 65 C 110 77, 105 89, 94 95 L 94 104 L 108 104"
+          fill="none" stroke="url(#odOmega)" stroke-width="8.5" stroke-linecap="round" stroke-linejoin="round"/>
+
+    <!-- QUIC Sub-8ms Lightning Bolt Through Center -->
+    <polygon points="84,52 69,79 80,79 75,107 93,76 81,76" fill="url(#odBolt)" stroke="#FFFBEB" stroke-width="0.9"/>
+
+    <!-- Mesh Node Telemetry Dots -->
+    <circle cx="80" cy="31" r="2.4" fill="#00F5D4"/>
+    <circle cx="31" cy="80" r="2.4" fill="#38BDF8"/>
+    <circle cx="129" cy="80" r="2.4" fill="#38BDF8"/>
+    <circle cx="80" cy="129" r="2.4" fill="#F97316"/>
+  </g>
+</svg>

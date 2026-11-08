@@ -1,0 +1,25 @@
+cff-version: 1.2.0
+title: "OmegaDesk: Sovereign Self-Hosted Low-Latency Remote Desktop, Zero-Trust Mesh, and RMM in Pure Rust"
+message: "If you use OmegaDesk or its zero-copy hardware video, magicsock QUIC mesh, or HuJSON zero-trust policy architecture in your research or infrastructure, please cite it using the metadata below."
+type: software
+authors:
+  - family-names: "Bueno"
+    given-names: "Ricardo"
+    alias: "OmegaSoftDLL"
+    affiliation: "Omega DeepTech Systems Inc. (ODSI)"
+version: "0.1.0"
+date-released: "2026-11-08"
+license: "AGPL-3.0-only"
+repository-code: "https://github.com/OmegaSoftDLL/omegadesk"
+url: "https://omegasoftdll.github.io/omegadesk/"
+keywords:
+  - rust
+  - remote-desktop
+  - quic
+  - wireguard
+  - webrtc
+  - h264
+  - av1
+  - self-hosted
+  - zero-trust
+  - rmm

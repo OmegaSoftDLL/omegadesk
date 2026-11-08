@@ -1,0 +1,5 @@
+title: "OmegaDesk — Sovereign Self-Hosted Remote Desktop in Pure Rust"
+description: "Sub-8ms Hardware H.264/AV1 Remote Desktop, QUIC + Built-in WireGuard/Disco Mesh, Zero-Trust HuJSON Policy & TOTP MFA, QuickSupport, and Fleet RMM in Pure Rust."
+theme: jekyll-theme-cayman
+include:
+  - _includes

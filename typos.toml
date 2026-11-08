@@ -18,3 +18,11 @@ extend-ignore-re = [
     # Git commit hashes in documentation and changelogs.
     "\\b[0-9a-f]{7,40}\\b",
 ]
+
+[default.extend-words]
+# Valid Portuguese (pt-BR) words in bilingual documentation sections.
+oficial = "oficial"
+participe = "participe"
+fases = "fases"
+cliente = "cliente"
+

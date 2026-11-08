@@ -1,24 +1,56 @@
+<h1>
+  <img src="docs/assets/omegadesk-badge.svg" alt="OmegaDesk — Sovereign Low-Latency Remote Desktop Emblem" width="92" height="92" align="left" />
+  OmegaDesk — Sovereign Self-Hosted Remote Desktop in Pure Rust
+</h1>
+
+**Zero-Copy Hardware H.264/AV1 · QUIC TLS 1.3 + Built-in WireGuard/Disco Mesh · Zero-Trust `HuJSON` Policy & TOTP MFA · QuickSupport & Fleet RMM**
+
+<br clear="left"/>
+
 <div align="center">
-
-# OmegaDesk
-
-**Open source, self-hosted remote desktop. Low latency, end-to-end encrypted, written in Rust.**
 
 [![CI](https://github.com/OmegaSoftDLL/omegadesk/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/OmegaSoftDLL/omegadesk/actions/workflows/ci.yml)
 [![CodeQL](https://github.com/OmegaSoftDLL/omegadesk/actions/workflows/codeql.yml/badge.svg?branch=main)](https://github.com/OmegaSoftDLL/omegadesk/actions/workflows/codeql.yml)
 [![Release](https://github.com/OmegaSoftDLL/omegadesk/actions/workflows/release.yml/badge.svg)](https://github.com/OmegaSoftDLL/omegadesk/actions/workflows/release.yml)
 [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/OmegaSoftDLL/omegadesk/badge)](https://scorecard.dev/viewer/?uri=github.com/OmegaSoftDLL/omegadesk)
+[![Open in GitHub Codespaces](https://img.shields.io/badge/Codespaces-Open%201--Click-181717?logo=github)](https://codespaces.new/OmegaSoftDLL/omegadesk)
+[![Wiki](https://img.shields.io/badge/Wiki-7%20Official%20Pages-00d2ff)](https://github.com/OmegaSoftDLL/omegadesk/wiki)
+[![Projects & Roadmap](https://img.shields.io/badge/Projects-Phases%200--7%20Board-10b981)](PROJECTS.md)
+[![Community & Discussions](https://img.shields.io/badge/Community-EN%20%26%20PT--BR-8b5cf6)](COMMUNITY.md)
 [![License: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](LICENSE)
 [![MSRV](https://img.shields.io/badge/rustc-1.90%2B-orange.svg)](Cargo.toml)
 
-[Status](#status) · [Quick start](#quick-start) · [Architecture](#architecture) · [Roadmap](docs/plan.md) · [Contributing](CONTRIBUTING.md) · [Security](SECURITY.md)
+[**About / Sobre (`EN` / `PT-BR`)**](#-about-omegadesk--sobre-o-omegadesk) · [**Status**](#status) · [**Quick start**](#quick-start) · [**Architecture**](#architecture) · [**Projects & Roadmap (`PROJECTS.md`)**](PROJECTS.md) · [**Detailed Plan (`docs/plan.md`)**](docs/plan.md) · [**Official Wiki**](https://github.com/OmegaSoftDLL/omegadesk/wiki) · [**Community (`COMMUNITY.md`)**](COMMUNITY.md) · [**Discussions**](https://github.com/OmegaSoftDLL/omegadesk/discussions) · [**Contributing**](CONTRIBUTING.md) · [**Security**](SECURITY.md)
 
+<br/>
+
+![OmegaDesk Zero-Copy Capture, Hardware Video & Zero-Trust QUIC Mesh Pipeline](docs/assets/omegadesk-hero-animated.svg)
 
 </div>
 
 ---
 
-OmegaDesk is a remote desktop you run on your own infrastructure, as an alternative to TeamViewer and AnyDesk. It is written from scratch in Rust and brings together the best ideas of the open source remote access ecosystem: RustDesk's connection model, Sunshine's low-latency video pipeline, Tailscale's mesh networking, MeshCentral's device management and JumpServer's auditing. [docs/references.md](docs/references.md) lists the projects we study and what we take from each one.
+## 🌐 About OmegaDesk · Sobre o OmegaDesk
+
+**🇬🇧 English:** **OmegaDesk** is a sovereign, self-hosted remote desktop, zero-trust mesh access, and fleet RMM platform written from scratch in **100% safe, modular Rust (`17` workspace crates)**. Designed as a full-stack open-source replacement for **TeamViewer**, **AnyDesk**, **BeyondTrust**, and **ScreenConnect**, OmegaDesk unifies five proven architectural pillars in a single cohesive codebase:
+1. **Sunshine-Grade Zero-Copy GPU Video Pipeline:** Captures frames via `DXGI Desktop Duplication` (`WGC -> GDI` fallback) and encodes H.264 directly from GPU resident textures (`ID3D11VideoProcessor` + `MFCreateDXGISurfaceBuffer` across Intel Quick Sync, NVIDIA NVENC, and AMD AMF), achieving **60 FPS at 24.5 ms end-to-end latency** (`11 ms` hardware encode).
+2. **Tailscale-Style Magicsock & DERP Relay Mesh:** Nodes enroll with `omegadesk-server`, resolve peers by human-readable `*.omega` names (`office-pc.omega`), punch through NATs via STUN + `disco`, fall back to `omegadesk-relay` in `1.5 s`, and bind QUIC TLS 1.3 directly to Ed25519/X25519 device identities.
+3. **Headscale/Tailscale `HuJSON` Zero-Trust Policy & PAM Gate:** Enforces identity-filtered netmaps, per-session TOTP MFA (`"action": "check"`), `.odrec` session recording, dynamic video watermarks, clipboard byte quotas, OS posture checks, and JSON Lines security audit logs.
+4. **TeamViewer-Style 9-Digit QuickSupport & Windows `LocalSystem` Service:** Single-executable `omegadesk-quicksupport` (`123 456 789` + ephemeral password + console consent prompt), plus `omegadesk-service` for unattended access across Windows Session 0, login screens, UAC prompts, and privacy blanking (`WDA_EXCLUDEFROMCAPTURE` + `IddCx` virtual displays).
+5. **MeshCentral/TacticalRMM-Style Fleet Management & WebCodecs Browser Gateway:** Built-in `WebCodecs` H.264 browser access (`--web-listen`) and CLI fleet RMM (`omegadesk-server admin`) with 15-minute hardware/OS/process inventory, automated threshold alerts, and remote PowerShell/`sh` script scheduling.
+
+**🇧🇷 Português (`pt-BR`):** O **OmegaDesk** é uma plataforma soberana e auto-hospedada (`self-hosted`) de acesso remoto de baixa latência, rede mesh Zero-Trust e gerenciamento de frota (RMM) escrita do zero em **Rust puro (`17` crates)**. Projetado como alternativa aberta e auditável ao **TeamViewer** e **AnyDesk**, o OmegaDesk combina captura de tela via hardware (`DXGI` + codificação GPU zero-copy `NVENC`/`QuickSync`/`AMF` a **60 FPS e 24,5 ms de latência ponta a ponta**), transporte **QUIC (TLS 1.3)** sobre malha **STUN/Disco + Relay DERP** (`*.omega`), políticas Zero-Trust em `HuJSON` com MFA TOTP por sessão e gravação `.odrec`, executável único **QuickSupport** de 9 dígitos, serviço Windows `LocalSystem` (tela de login/UAC e monitor virtual `IddCx`), cliente nativo + navegador (`WebCodecs`) e RMM integrado.
+
+### 6-Pillar Architecture Comparison · Matriz Comparativa de 6 Pilares
+
+| Pillar / Capability | **OmegaDesk (`Rust 1.90+`)** | TeamViewer / AnyDesk | RustDesk (OSS Core) | Sunshine / Moonlight |
+| :--- | :--- | :--- | :--- | :--- |
+| **1. Licensing & Sovereignty** | **100% Open Source (`AGPL-3.0`), full self-hosted server, relay, ACLs & RMM included** | Proprietary SaaS, cloud-tethered control plane | OSS core (`AGPL-3.0`), enterprise ACL/web console in commercial Pro tier | Open source (`GPL-3.0`), single-host game streaming |
+| **2. Video & Capture Pipeline** | **Zero-Copy D3D11 GPU texture -> Hardware H.264 (`NVENC`/`QSV`/`AMF`) + Adaptive QoS (`24.5 ms` E2E)** | Proprietary desk codec | Hardware/software H.264/H.265/AV1 | Zero-copy GPU game capture |
+| **3. Transport & NAT Mesh** | **QUIC (TLS 1.3) + Noise `IK` + Tailscale-style `magicsock` (`STUN` + `disco` + 1.5s DERP relay + `*.omega` DNS)** | Proprietary TCP/UDP cloud routers | Custom TCP/UDP (`hbbs`/`hbbr` ID/relay servers) | Raw UDP + RTSP (manual port forwarding or external VPN) |
+| **4. Zero-Trust Policy & PAM** | **Built-in `HuJSON` policy engine (`groups`, `tagOwners`, netmap filtering, TOTP MFA, `.odrec` recording, DLP, watermark)** | Enterprise conditional access add-on | Commercial Pro console | Host PIN pairing only |
+| **5. QuickSupport & Service** | **`omegadesk-quicksupport` (9-digit ID + consent) + Windows `LocalSystem` UAC/Login worker + `IddCx` virtual display** | QuickSupport executable + service | Client/host mode + service | Service mode |
+| **6. Built-In Fleet RMM & Web** | **Native `omegadesk-server admin` RMM (inventory, alerts, remote scripts, schedules) + `WebCodecs` browser gateway** | Separate paid RMM add-on | Separate commercial console | Configuration web UI only |
 
 ## Status
 
@@ -244,7 +276,13 @@ The full design, from the WireGuard mesh to the web client, is in [docs/plan.md]
 
 ## Contributing
 
-Contributions are welcome. Every change goes through a pull request and is reviewed by the maintainer. Read [CONTRIBUTING.md](CONTRIBUTING.md) before you start. It covers the workflow, the commit sign-off (DCO) and the code standards. Please follow our [Code of Conduct](CODE_OF_CONDUCT.md).
+<div align="center">
+
+![OmegaDesk Official Social Banner](docs/assets/omegadesk-social-banner.jpg)
+
+</div>
+
+Contributions are welcome. Every change goes through a pull request and is reviewed by the maintainer. Read [CONTRIBUTING.md](CONTRIBUTING.md) before you start. It covers the workflow, the commit sign-off (DCO) and the code standards. Please follow our [Code of Conduct](CODE_OF_CONDUCT.md). See also [COMMUNITY.md](COMMUNITY.md) and [PROJECTS.md](PROJECTS.md).
 
 ## Security
 

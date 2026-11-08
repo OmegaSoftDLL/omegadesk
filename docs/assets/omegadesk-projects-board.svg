@@ -1,0 +1,63 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 860 240" width="100%" height="100%" role="img" aria-labelledby="odBoardTitle odBoardDesc">
+  <title id="odBoardTitle">OmegaDesk — Engineering Project Board &amp; 8-Phase Roadmap</title>
+  <desc id="odBoardDesc">Visual engineering board tracking OmegaDesk Phases 0–1 (Shipped), Phases 2–6 (Implemented &amp; Verified In-Process), and Phase 7 (Virtual Displays, Cross-Platform &amp; Field Validation).</desc>
+
+  <defs>
+    <linearGradient id="bgOdBoard" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#050811"/>
+      <stop offset="100%" stop-color="#0A1326"/>
+    </linearGradient>
+    <linearGradient id="colBg" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#0E182E"/>
+      <stop offset="100%" stop-color="#080E1C"/>
+    </linearGradient>
+    <style>
+      .sans { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, Roboto, Helvetica, Arial, sans-serif; }
+      .mono { font-family: 'JetBrains Mono', 'Fira Code', Consolas, monospace; }
+    </style>
+  </defs>
+
+  <rect width="860" height="240" rx="14" fill="url(#bgOdBoard)" stroke="#1E293B" stroke-width="1.8"/>
+
+  <g class="sans">
+    <text x="20" y="28" fill="#F8FAFC" font-size="15" font-weight="900">
+      OmegaDesk Engineering Roadmap &amp; Milestone Board (Phases 0–7)
+    </text>
+    <text x="840" y="28" text-anchor="end" fill="#38BDF8" class="mono" font-size="10.5" font-weight="700">
+      17 Workspace Crates · Rust 1.90+ · CI + CodeQL + OpenSSF
+    </text>
+
+    <!-- Column 1: Shipped Core -->
+    <rect x="18" y="42" width="266" height="182" rx="10" fill="url(#colBg)" stroke="#10B981" stroke-width="1.3"/>
+    <text x="32" y="63" fill="#34D399" class="mono" font-size="10.5" font-weight="800">✅ SHIPPED CORE (PHASES 0–1)</text>
+    <text x="32" y="85" fill="#E2E8F0" font-size="11" font-weight="700">• Phase 0: Workspace &amp; Crypto Identity</text>
+    <text x="32" y="102" fill="#94A3B8" class="mono" font-size="9.5">  Ed25519/X25519, Protobuf, cargo-deny</text>
+    <text x="32" y="124" fill="#E2E8F0" font-size="11" font-weight="700">• Phase 1: Zero-Copy LAN Desktop</text>
+    <text x="32" y="141" fill="#94A3B8" class="mono" font-size="9.5">  DXGI + D3D11 NVENC/QSV/AMF H.264</text>
+    <text x="32" y="158" fill="#94A3B8" class="mono" font-size="9.5">  QUIC TLS 1.3 + HID Scancode Input</text>
+    <text x="32" y="178" fill="#34D399" class="mono" font-size="9.5" font-weight="700">  Verified: 60 FPS · 24.5ms E2E Latency</text>
+    <text x="32" y="198" fill="#34D399" class="mono" font-size="9.5" font-weight="700">  Multi-Monitor + Rotated Display</text>
+
+    <!-- Column 2: End-to-End Wired -->
+    <rect x="297" y="42" width="266" height="182" rx="10" fill="url(#colBg)" stroke="#00D2FF" stroke-width="1.3"/>
+    <text x="311" y="63" fill="#38BDF8" class="mono" font-size="10.5" font-weight="800">🔶 WIRED END-TO-END (PHASES 2–6)</text>
+    <text x="311" y="85" fill="#E2E8F0" font-size="11" font-weight="700">• Phase 2: Coordinator, STUN &amp; Relay</text>
+    <text x="311" y="102" fill="#94A3B8" class="mono" font-size="9.5">  *.omega DNS, Disco NAT, 1.5s DERP</text>
+    <text x="311" y="122" fill="#E2E8F0" font-size="11" font-weight="700">• Phase 3–4: QuickSupport &amp; WebCodecs</text>
+    <text x="311" y="139" fill="#94A3B8" class="mono" font-size="9.5">  9-Digit ID, Clipboard, SHA-256 Files</text>
+    <text x="311" y="159" fill="#E2E8F0" font-size="11" font-weight="700">• Phase 5–6: Zero-Trust &amp; Fleet RMM</text>
+    <text x="311" y="176" fill="#94A3B8" class="mono" font-size="9.5">  HuJSON ACL, TOTP MFA, .odrec, Alerts</text>
+    <text x="311" y="198" fill="#7DD3FC" class="mono" font-size="9.5" font-weight="700">  In-Process + 2-Machine Verified</text>
+
+    <!-- Column 3: Active R&D Horizon -->
+    <rect x="576" y="42" width="266" height="182" rx="10" fill="url(#colBg)" stroke="#A855F7" stroke-width="1.3"/>
+    <text x="590" y="63" fill="#C084FC" class="mono" font-size="10.5" font-weight="800">🔬 ACTIVE R&amp;D (PHASE 7 &amp; FIELD)</text>
+    <text x="590" y="85" fill="#E2E8F0" font-size="11" font-weight="700">• IddCx Virtual Display &amp; Privacy</text>
+    <text x="590" y="102" fill="#94A3B8" class="mono" font-size="9.5">  drivers/idd (--virtual-display WxH@hz)</text>
+    <text x="590" y="122" fill="#E2E8F0" font-size="11" font-weight="700">• Service Worker QUIC Session Route</text>
+    <text x="590" y="139" fill="#94A3B8" class="mono" font-size="9.5">  Issues #27, #28, #31, #33</text>
+    <text x="590" y="159" fill="#E2E8F0" font-size="11" font-weight="700">• Linux PipeWire / macOS ScreenCaptureKit</text>
+    <text x="590" y="176" fill="#94A3B8" class="mono" font-size="9.5">  Audio, WebTransport &amp; RMM Web UI</text>
+    <text x="590" y="198" fill="#FDE047" class="mono" font-size="9.5" font-weight="700">  Public 2-NAT Field Validation</text>
+  </g>
+</svg>
