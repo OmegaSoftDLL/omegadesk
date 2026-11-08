@@ -87,7 +87,7 @@
     <text x="454" y="180" fill="#CBD5E1" class="mono" font-size="9.5">• *.omega Internal DNS</text>
     <text x="454" y="198" fill="#34D399" class="mono" font-size="9" font-weight="700">Ed25519 / X25519 Bound</text>
 
-    <!-- STAGE 4: NATIVE & WEB CLIENT -->
+    <!-- STAGE 4: NATIVE &amp; WEB CLIENT -->
     <rect x="654" y="52" width="188" height="156" rx="10" fill="url(#stageCard)" stroke="#F97316" stroke-width="1.3"/>
     <text x="666" y="73" fill="#FB923C" class="mono" font-size="10" font-weight="800">04 · CLIENT &amp; RMM</text>
     <text x="666" y="92" fill="#F8FAFC" font-size="12" font-weight="800">Native, Web &amp; Fleet</text>

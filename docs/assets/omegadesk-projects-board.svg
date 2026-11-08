@@ -49,7 +49,7 @@
     <text x="311" y="176" fill="#94A3B8" class="mono" font-size="9.5">  HuJSON ACL, TOTP MFA, .odrec, Alerts</text>
     <text x="311" y="198" fill="#7DD3FC" class="mono" font-size="9.5" font-weight="700">  In-Process + 2-Machine Verified</text>
 
-    <!-- Column 3: Active R&D Horizon -->
+    <!-- Column 3: Active R&amp;D Horizon -->
     <rect x="576" y="42" width="266" height="182" rx="10" fill="url(#colBg)" stroke="#A855F7" stroke-width="1.3"/>
     <text x="590" y="63" fill="#C084FC" class="mono" font-size="10.5" font-weight="800">🔬 ACTIVE R&amp;D (PHASE 7 &amp; FIELD)</text>
     <text x="590" y="85" fill="#E2E8F0" font-size="11" font-weight="700">• IddCx Virtual Display &amp; Privacy</text>

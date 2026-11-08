@@ -58,7 +58,7 @@
   <!-- Feathered Bioluminescent Aura -->
   <circle cx="80" cy="80" r="66" fill="url(#odAura)"/>
 
-  <!-- Obsidian Medallion & Prismatic Rim -->
+  <!-- Obsidian Medallion &amp; Prismatic Rim -->
   <circle cx="80" cy="80" r="61" fill="url(#odMedallion)" stroke="url(#odRim)" stroke-width="2.6"/>
   <circle cx="80" cy="80" r="55" fill="none" stroke="#1E3A8A" stroke-width="1.1" class="od-ring"/>
 
