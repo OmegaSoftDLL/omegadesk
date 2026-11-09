@@ -64,7 +64,7 @@ softbuffer = "0.4"
 rand_core = { version = "0.6", features = ["getrandom"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sha2 = "0.10"
+sha2 = "0.11"
 sysinfo = { version = "0.38", default-features = false, features = ["system", "disk", "network", "user"] }
 tempfile = "3"
 tokio-tungstenite = "0.29"
