@@ -45,7 +45,7 @@ axum = { version = "0.8", default-features = false, features = ["http1", "tokio"
 bytes = "1"
 clap = { version = "4", features = ["derive", "env"] }
 data-encoding = "2"
-if-addrs = "0.13"
+if-addrs = "0.15"
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 ed25519-dalek = { version = "2", features = ["rand_core", "zeroize", "pkcs8"] }
 keyring = { version = "3", features = ["apple-native", "windows-native"] }
